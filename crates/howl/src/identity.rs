@@ -57,6 +57,10 @@ impl LocalIdentity {
         })
     }
 
+    pub(crate) fn sign(&self, message: &[u8]) -> [u8; 64] {
+        self.signing.sign(message).to_bytes()
+    }
+
     pub fn transport_key(&self) -> &SecretKey {
         &self.transport
     }
@@ -123,6 +127,10 @@ impl PeerCertificate {
         self.endpoint
     }
 
+    pub(crate) fn verify_signature(&self, message: &[u8], signature: &[u8; 64]) -> io::Result<()> {
+        verify(field(&self.bytes, 33), message, signature)
+    }
+
     pub fn fingerprint(&self) -> [u8; 32] {
         Sha256::digest(&self.bytes[..BODY_LEN]).into()
     }
@@ -146,7 +154,7 @@ impl PeerTrust {
         if self.parent.write(&filename, certificate.as_bytes())? {
             return Ok(());
         }
-        let existing = self.read(certificate.device_id())?;
+        let existing = self.pinned(certificate.device_id())?;
         if existing.as_bytes() != certificate.as_bytes() {
             return Err(denied("a different peer certificate is already pinned"));
         }
@@ -158,7 +166,7 @@ impl PeerTrust {
         device_id: &[u8; 32],
         endpoint: EndpointId,
     ) -> io::Result<PeerCertificate> {
-        let certificate = self.read(device_id)?;
+        let certificate = self.pinned(device_id)?;
         if certificate.endpoint() != endpoint {
             return Err(denied(
                 "peer endpoint does not match the pinned certificate",
@@ -167,7 +175,7 @@ impl PeerTrust {
         Ok(certificate)
     }
 
-    fn read(&self, device_id: &[u8; 32]) -> io::Result<PeerCertificate> {
+    pub fn pinned(&self, device_id: &[u8; 32]) -> io::Result<PeerCertificate> {
         let filename = hex::encode(device_id);
         let mut bytes = [0; CERTIFICATE_LEN];
         self.parent.read(&filename, &mut bytes).map_err(|error| {
@@ -207,13 +215,13 @@ fn field<const N: usize>(bytes: &[u8], offset: usize) -> &[u8; N] {
     bytes[offset..].first_chunk().expect("fixed record layout")
 }
 
-struct StateDirectory {
+pub(crate) struct StateDirectory {
     path: PathBuf,
     handle: File,
 }
 
 impl StateDirectory {
-    fn open(path: &Path) -> io::Result<Self> {
+    pub(crate) fn open(path: &Path) -> io::Result<Self> {
         match std::fs::DirBuilder::new().mode(0o700).create(path) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
@@ -234,13 +242,7 @@ impl StateDirectory {
     }
 
     fn read(&self, filename: &str, bytes: &mut [u8]) -> io::Result<()> {
-        let mut file = File::from(openat(
-            &self.handle,
-            filename,
-            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )?);
-        check_private(&file, &self.path.join(filename), false)?;
+        let mut file = self.open_private(filename)?;
         file.read_exact(bytes)?;
         if file.read(&mut [0; 1])? != 0 {
             return Err(invalid_data("unexpected state file length"));
@@ -248,7 +250,30 @@ impl StateDirectory {
         self.handle.sync_all()
     }
 
-    fn write(&self, filename: &str, bytes: &[u8]) -> io::Result<bool> {
+    pub(crate) fn read_bounded(&self, filename: &str, maximum: u64) -> io::Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        self.open_private(filename)?
+            .take(maximum + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > maximum {
+            return Err(invalid_data("state file is too large"));
+        }
+        self.handle.sync_all()?;
+        Ok(bytes)
+    }
+
+    fn open_private(&self, filename: &str) -> io::Result<File> {
+        let file = File::from(openat(
+            &self.handle,
+            filename,
+            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?);
+        check_private(&file, &self.path.join(filename), false)?;
+        Ok(file)
+    }
+
+    pub(crate) fn write(&self, filename: &str, bytes: &[u8]) -> io::Result<bool> {
         let mut nonce = [0; 16];
         getrandom::fill(&mut nonce).map_err(io::Error::other)?;
         let staged_name = format!(".howl-{}", hex::encode(nonce));

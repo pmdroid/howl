@@ -5,9 +5,11 @@
 /// ```
 /// assert!(howl::HELP.contains("Usage: howl"));
 /// ```
-pub const HELP: &str = "Howl - agent collaboration\n\nUsage: howl [--help | --version]\n       howl identity show STATE_DIR\n       howl peer trust STATE_DIR CERTIFICATE_HEX CONFIRMED_FINGERPRINT_HEX";
+pub const HELP: &str = "Howl - agent collaboration\n\nUsage: howl [--help | --version]\n       howl identity show STATE_DIR\n       howl peer trust STATE_DIR CERTIFICATE_HEX CONFIRMED_FINGERPRINT_HEX\n       howl channel create STATE_DIR [PEER_DEVICE_ID ...]\n       howl channel join STATE_DIR MANIFEST_HEX";
 
 pub mod identity;
 pub mod transport;
+
+pub mod channel;
 
 pub mod delivery;

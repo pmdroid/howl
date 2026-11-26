@@ -2,6 +2,7 @@ use std::{env, io, path::Path, process::ExitCode};
 
 use howl::{
     HELP,
+    channel::{Channel, MAX_MANIFEST_LEN},
     identity::{LocalIdentity, PeerCertificate, PeerTrust},
 };
 
@@ -20,7 +21,10 @@ fn main() -> ExitCode {
             println!("howl {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
-        [group, action, state] if group == "identity" && action == "show" => {
+        [group, action, state]
+            if (group == "identity" && action == "show")
+                || (group == "mesh" && action == "init") =>
+        {
             show_identity(Path::new(state))
         }
         [group, action, state, certificate, fingerprint]
@@ -33,6 +37,15 @@ fn main() -> ExitCode {
                 return invalid_arguments();
             };
             pin_peer(Path::new(state), certificate, fingerprint)
+        }
+        [group, action, state, peer_ids @ ..] if group == "channel" && action == "create" => {
+            create_channel(Path::new(state), peer_ids)
+        }
+        [group, action, state, manifest] if group == "channel" && action == "join" => {
+            let Some(manifest) = manifest.to_str() else {
+                return invalid_arguments();
+            };
+            join_channel(Path::new(state), manifest)
         }
         _ => return invalid_arguments(),
     };
@@ -50,6 +63,7 @@ fn show_identity(state: &Path) -> io::Result<()> {
     let certificate = LocalIdentity::load_or_create(state)?.certificate();
     println!("Certificate {}", hex::encode(certificate.as_bytes()));
     println!("Fingerprint {}", hex::encode(certificate.fingerprint()));
+    println!("Device {}", hex::encode(certificate.device_id()));
     Ok(())
 }
 
@@ -64,6 +78,40 @@ fn pin_peer(state: &Path, certificate: &str, fingerprint: &str) -> io::Result<()
     PeerTrust::open(state)?.pin(&certificate, &confirmed)?;
     println!("Peer trusted.");
     Ok(())
+}
+
+fn create_channel(state: &Path, peers: &[std::ffi::OsString]) -> io::Result<()> {
+    let peers = peers
+        .iter()
+        .map(|peer| parse_id(peer))
+        .collect::<io::Result<Vec<_>>>()?;
+    let identity = LocalIdentity::load_or_create(state)?;
+    let channel = Channel::create(state, &identity, &peers)?;
+    println!("Channel {}", hex::encode(channel.id()));
+    println!("Manifest {}", hex::encode(channel.manifest()));
+    Ok(())
+}
+
+fn join_channel(state: &Path, manifest: &str) -> io::Result<()> {
+    if manifest.len() > MAX_MANIFEST_LEN * 2 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "channel manifest is too large",
+        ));
+    }
+    let manifest = hex::decode(manifest)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid channel manifest hex"))?;
+    let identity = LocalIdentity::load_or_create(state)?;
+    let channel = Channel::join(state, &identity, &manifest)?;
+    println!("Channel {}", hex::encode(channel.id()));
+    Ok(())
+}
+
+fn parse_id(value: &std::ffi::OsStr) -> io::Result<[u8; 32]> {
+    let mut id = [0; 32];
+    hex::decode_to_slice(value.as_encoded_bytes(), &mut id)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid hex ID"))?;
+    Ok(id)
 }
 
 fn invalid_arguments() -> ExitCode {
