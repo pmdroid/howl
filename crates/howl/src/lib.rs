@@ -8,3 +8,4 @@
 pub const HELP: &str = "Howl - agent collaboration\n\nUsage: howl [--help | --version]\n       howl identity show STATE_DIR\n       howl peer trust STATE_DIR CERTIFICATE_HEX CONFIRMED_FINGERPRINT_HEX";
 
 pub mod identity;
+pub mod transport;

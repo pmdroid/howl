@@ -1,0 +1,434 @@
+use std::{collections::VecDeque, future::Future, io, net::SocketAddr, sync::Arc, time::Duration};
+
+use iroh::{
+    Endpoint, EndpointId, RelayConfig,
+    endpoint::{Connection, QuicTransportConfig, RelayMode, presets},
+};
+pub use iroh::{EndpointAddr, RelayUrl};
+use tokio::{
+    sync::{Mutex, Semaphore, mpsc},
+    task::{JoinHandle, JoinSet},
+    time::timeout,
+};
+
+use crate::identity::{LocalIdentity, PeerCertificate, PeerTrust};
+
+const ALPN: &[u8] = b"howl/mesh/1";
+pub const MAX_FRAME_BYTES: usize = 77_112;
+const FRAME_PREFIX_BYTES: usize = 4;
+const CONNECTION_LIMIT: usize = 32;
+const RECEIVE_QUEUE_LEN: usize = 32;
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+const STREAM_TIMEOUT: Duration = Duration::from_secs(10);
+
+pub enum Network {
+    Direct,
+    Automatic(RelayUrl),
+    RelayOnly(RelayUrl),
+}
+
+pub struct ReceivedFrame {
+    pub peer: PeerCertificate,
+    pub bytes: Vec<u8>,
+    connection: Connection,
+    trust: Arc<PeerTrust>,
+}
+
+impl ReceivedFrame {
+    pub async fn reply(&self, bytes: &[u8]) -> io::Result<()> {
+        validate_frame(bytes)?;
+        self.trust
+            .authorize(self.peer.device_id(), self.connection.remote_id())?;
+        let stream = open_frame(&self.connection).await?;
+        write_frame(&self.connection, stream, bytes).await
+    }
+}
+
+pub struct Transport {
+    endpoint: Endpoint,
+    device_id: [u8; 32],
+    trust: Arc<PeerTrust>,
+    outgoing: Mutex<VecDeque<CachedConnection>>,
+    send_slots: Semaphore,
+    frames: mpsc::Sender<ReceivedFrame>,
+    received: Mutex<mpsc::Receiver<ReceivedFrame>>,
+    accepting: JoinHandle<()>,
+}
+
+struct CachedConnection {
+    device_id: [u8; 32],
+    endpoint: EndpointId,
+    connection: Arc<Mutex<Option<CachedSession>>>,
+}
+
+struct CachedSession {
+    connection: Connection,
+    receiving: JoinHandle<()>,
+}
+
+impl Drop for CachedSession {
+    fn drop(&mut self) {
+        self.receiving.abort();
+        self.connection
+            .close(0u32.into(), b"transport cache released");
+    }
+}
+
+impl Transport {
+    pub async fn bind(
+        identity: &LocalIdentity,
+        trust: PeerTrust,
+        network: Network,
+        bind_address: Option<SocketAddr>,
+    ) -> io::Result<Self> {
+        let window = (MAX_FRAME_BYTES + FRAME_PREFIX_BYTES + 1) as u32;
+        let config = QuicTransportConfig::builder()
+            .max_concurrent_uni_streams(1u32.into())
+            .max_concurrent_bidi_streams(1u32.into())
+            .stream_receive_window(window.into())
+            .receive_window((2 * window).into())
+            .send_window(u64::from(2 * window))
+            .datagram_receive_buffer_size(None)
+            .build();
+        let mut builder = Endpoint::builder(presets::Minimal)
+            .secret_key(identity.transport_key().clone())
+            .alpns(vec![ALPN.to_vec()])
+            .transport_config(config);
+        match network {
+            Network::Direct => {}
+            Network::Automatic(url) => {
+                builder = builder.relay_mode(RelayMode::custom([url]));
+            }
+            Network::RelayOnly(url) => {
+                if bind_address.is_some() {
+                    return Err(invalid_input(
+                        "relay-only transport cannot bind a UDP address",
+                    ));
+                }
+                let relay = RelayConfig::new(url, None);
+                builder = builder
+                    .relay_mode(RelayMode::Custom([relay].into_iter().collect()))
+                    .clear_ip_transports();
+            }
+        }
+        if let Some(address) = bind_address {
+            builder = builder
+                .clear_ip_transports()
+                .bind_addr(address)
+                .map_err(io::Error::other)?;
+        }
+        let endpoint = builder.bind().await.map_err(io::Error::other)?;
+        let device_id = *identity.certificate().device_id();
+        let trust = Arc::new(trust);
+        let (sender, received) = mpsc::channel(RECEIVE_QUEUE_LEN);
+        let accepting = tokio::spawn(accept_connections(
+            endpoint.clone(),
+            device_id,
+            trust.clone(),
+            sender.clone(),
+        ));
+        Ok(Self {
+            endpoint,
+            device_id,
+            trust,
+            outgoing: Mutex::new(VecDeque::new()),
+            send_slots: Semaphore::new(CONNECTION_LIMIT),
+            frames: sender,
+            received: Mutex::new(received),
+            accepting,
+        })
+    }
+
+    pub fn address(&self) -> EndpointAddr {
+        let address = self.endpoint.addr();
+        let loopback = self
+            .endpoint
+            .bound_sockets()
+            .into_iter()
+            .filter(|address| address.ip().is_loopback())
+            .map(iroh::TransportAddr::Ip);
+        address.with_addrs(loopback)
+    }
+
+    pub async fn wait_for_relay(&self) -> io::Result<()> {
+        within(CONNECT_TIMEOUT, async {
+            self.endpoint.online().await;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn send(
+        &self,
+        peer_device_id: &[u8; 32],
+        address: EndpointAddr,
+        frame: &[u8],
+    ) -> io::Result<()> {
+        validate_frame(frame)?;
+        let _slot = within(STREAM_TIMEOUT, async {
+            self.send_slots.acquire().await.map_err(io::Error::other)
+        })
+        .await?;
+        let mut connection = self.connect(peer_device_id, address.clone()).await?;
+        let stream = match open_frame(&connection).await {
+            Ok(stream) => stream,
+            Err(_) if connection.close_reason().is_some() => {
+                connection = self.connect(peer_device_id, address).await?;
+                open_frame(&connection).await?
+            }
+            Err(error) => {
+                connection.close(1u32.into(), b"transport stream unavailable");
+                return Err(error);
+            }
+        };
+        write_frame(&connection, stream, frame).await
+    }
+
+    pub async fn receive(&self) -> Option<ReceivedFrame> {
+        self.received.lock().await.recv().await
+    }
+
+    pub async fn close(self) {
+        self.endpoint.close().await;
+        self.accepting.abort();
+    }
+
+    async fn connect(&self, device_id: &[u8; 32], address: EndpointAddr) -> io::Result<Connection> {
+        self.trust.authorize(device_id, address.id)?;
+        let slot = {
+            let mut cache = self.outgoing.lock().await;
+            let entry = if let Some(index) = cache
+                .iter()
+                .position(|entry| entry.device_id == *device_id && entry.endpoint == address.id)
+            {
+                cache.remove(index).expect("cache entry exists")
+            } else {
+                if cache.len() == CONNECTION_LIMIT {
+                    let index = cache
+                        .iter()
+                        .position(|entry| Arc::strong_count(&entry.connection) == 1)
+                        .ok_or_else(|| io::Error::other("transport connection cache is busy"))?;
+                    cache.remove(index);
+                }
+                CachedConnection {
+                    device_id: *device_id,
+                    endpoint: address.id,
+                    connection: Arc::new(Mutex::new(None)),
+                }
+            };
+            let slot = entry.connection.clone();
+            cache.push_back(entry);
+            slot
+        };
+        let mut entry = within(CONNECT_TIMEOUT, async { Ok(slot.lock().await) }).await?;
+        if let Some(session) = &*entry
+            && session.connection.close_reason().is_none()
+        {
+            return Ok(session.connection.clone());
+        }
+
+        let connection = within(CONNECT_TIMEOUT, async {
+            let connection = self
+                .endpoint
+                .connect(address, ALPN)
+                .await
+                .map_err(io::Error::other)?;
+            let (mut send, mut receive) = connection.open_bi().await.map_err(io::Error::other)?;
+            send.write_all(&self.device_id)
+                .await
+                .map_err(io::Error::other)?;
+            send.finish().map_err(io::Error::other)?;
+            let claimed = read_device_id(&mut receive).await?;
+            if claimed != *device_id {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "peer claimed an unexpected device ID",
+                ));
+            }
+            self.trust.authorize(&claimed, connection.remote_id())?;
+            Ok(connection)
+        })
+        .await?;
+
+        let receiving = tokio::spawn(read_frames(
+            connection.clone(),
+            *device_id,
+            self.trust.clone(),
+            self.frames.clone(),
+        ));
+        *entry = Some(CachedSession {
+            connection: connection.clone(),
+            receiving,
+        });
+        Ok(connection)
+    }
+}
+
+impl Drop for Transport {
+    fn drop(&mut self) {
+        self.accepting.abort();
+    }
+}
+
+async fn accept_connections(
+    endpoint: Endpoint,
+    device_id: [u8; 32],
+    trust: Arc<PeerTrust>,
+    frames: mpsc::Sender<ReceivedFrame>,
+) {
+    let mut connections = JoinSet::new();
+    loop {
+        tokio::select! {
+            Some(_) = connections.join_next(), if !connections.is_empty() => {}
+            incoming = endpoint.accept() => {
+                let Some(incoming) = incoming else {
+                    break;
+                };
+                if connections.len() >= CONNECTION_LIMIT {
+                    incoming.refuse();
+                    continue;
+                }
+                let frames = frames.clone();
+                let trust = trust.clone();
+                connections.spawn(async move {
+                    let connection = within(CONNECT_TIMEOUT, async {
+                        incoming.await.map_err(io::Error::other)
+                    }).await?;
+                    match accept_peer(&connection, &device_id, &trust).await {
+                        Ok(peer) => read_frames(connection, peer, trust, frames).await,
+                        Err(_) => connection.close(1u32.into(), b"transport peer rejected"),
+                    }
+                    Ok::<_, io::Error>(())
+                });
+            }
+        }
+    }
+}
+
+async fn accept_peer(
+    connection: &Connection,
+    device_id: &[u8; 32],
+    trust: &PeerTrust,
+) -> io::Result<[u8; 32]> {
+    within(CONNECT_TIMEOUT, async {
+        let (mut send, mut receive) = connection.accept_bi().await.map_err(io::Error::other)?;
+        let peer_device_id = read_device_id(&mut receive).await?;
+        trust.authorize(&peer_device_id, connection.remote_id())?;
+        send.write_all(device_id).await.map_err(io::Error::other)?;
+        send.finish().map_err(io::Error::other)?;
+        Ok(peer_device_id)
+    })
+    .await
+}
+
+async fn read_frames(
+    connection: Connection,
+    peer_device_id: [u8; 32],
+    trust: Arc<PeerTrust>,
+    frames: mpsc::Sender<ReceivedFrame>,
+) {
+    let endpoint = connection.remote_id();
+    while let Ok(mut stream) = connection.accept_uni().await {
+        let result = within(STREAM_TIMEOUT, async {
+            let reserve = frames.reserve();
+            let permit = tokio::select! {
+                result = reserve => result.map_err(io::Error::other)?,
+                error = connection.closed() => return Err(io::Error::other(error)),
+            };
+            trust.authorize(&peer_device_id, endpoint)?;
+            let mut length = [0; FRAME_PREFIX_BYTES];
+            stream
+                .read_exact(&mut length)
+                .await
+                .map_err(io::Error::other)?;
+            let length = u32::from_be_bytes(length) as usize;
+            if length == 0 || length > MAX_FRAME_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid transport frame length",
+                ));
+            }
+            let bytes = stream.read_to_end(length).await.map_err(io::Error::other)?;
+            if bytes.len() != length {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "incomplete transport frame",
+                ));
+            }
+            let peer = trust.authorize(&peer_device_id, endpoint)?;
+            permit.send(ReceivedFrame {
+                peer,
+                bytes,
+                connection: connection.clone(),
+                trust: trust.clone(),
+            });
+            Ok(())
+        })
+        .await;
+        if result.is_err() {
+            connection.close(1u32.into(), b"transport frame rejected");
+            return;
+        }
+    }
+}
+
+async fn open_frame(connection: &Connection) -> io::Result<iroh::endpoint::SendStream> {
+    within(STREAM_TIMEOUT, async {
+        connection.open_uni().await.map_err(io::Error::other)
+    })
+    .await
+}
+
+async fn write_frame(
+    connection: &Connection,
+    mut stream: iroh::endpoint::SendStream,
+    frame: &[u8],
+) -> io::Result<()> {
+    let result = within(STREAM_TIMEOUT, async {
+        let length = (frame.len() as u32).to_be_bytes();
+        stream.write_all(&length).await.map_err(io::Error::other)?;
+        stream.write_all(frame).await.map_err(io::Error::other)?;
+        stream.finish().map_err(io::Error::other)?;
+        if stream.stopped().await.map_err(io::Error::other)?.is_some() {
+            return Err(io::Error::other("peer stopped the transport frame"));
+        }
+        Ok(())
+    })
+    .await;
+    if result.is_err() {
+        connection.close(1u32.into(), b"transport frame failed");
+    }
+    result
+}
+
+fn validate_frame(frame: &[u8]) -> io::Result<()> {
+    if frame.is_empty() || frame.len() > MAX_FRAME_BYTES {
+        return Err(invalid_input("invalid transport frame length"));
+    }
+    Ok(())
+}
+
+async fn read_device_id(receive: &mut iroh::endpoint::RecvStream) -> io::Result<[u8; 32]> {
+    receive
+        .read_to_end(32)
+        .await
+        .map_err(io::Error::other)?
+        .try_into()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "malformed transport identity"))
+}
+
+async fn within<T>(
+    deadline: Duration,
+    operation: impl Future<Output = io::Result<T>>,
+) -> io::Result<T> {
+    timeout(deadline, operation)
+        .await
+        .map_err(|error| io::Error::new(io::ErrorKind::TimedOut, error))?
+}
+
+fn invalid_input(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, message)
+}
+
+#[cfg(test)]
+mod tests;
