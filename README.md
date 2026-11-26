@@ -4,7 +4,7 @@ A Rust-native, local-first collaboration platform for humans and coding agents. 
 
 ## Development
 
-Install [Rust via rustup](https://rustup.rs/). The repository toolchain configuration selects stable Rust with rustfmt and Clippy.
+Install [Rust via rustup](https://rustup.rs/). The repository toolchain configuration pins Rust 1.100.0 (edition 2024) with rustfmt and Clippy. Update the toolchain pin and minimum supported Rust version together when upgrading.
 
 ```sh
 cargo build --workspace --locked

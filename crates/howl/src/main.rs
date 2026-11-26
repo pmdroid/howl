@@ -1,6 +1,6 @@
 use std::{env, process::ExitCode};
 
-const HELP: &str = "Howl - agent collaboration\n\nUsage: howl [--help | --version]";
+use howl::HELP;
 
 fn main() -> ExitCode {
     let mut args = env::args_os().skip(1);
