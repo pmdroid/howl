@@ -1,0 +1,17 @@
+[workspace]
+resolver = "3"
+
+[package]
+name = "howl-observer-packaging"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.100"
+publish = false
+
+[dependencies]
+rusqlite = { version = "=0.43.0", default-features = false, features = ["bundled-sqlcipher-vendored-openssl"] }
+tempfile = "=3.27.0"
+
+[[bin]]
+name = "sqlcipher-probe"
+path = "sqlcipher.rs"
