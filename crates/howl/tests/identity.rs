@@ -137,9 +137,10 @@ fn cli_shows_only_public_identity_and_pairs() {
     let text = String::from_utf8(show.stdout).unwrap();
     let certificate = hex::encode(identity.certificate().as_bytes());
     let fingerprint = hex::encode(identity.certificate().fingerprint());
+    let device = hex::encode(identity.certificate().device_id());
     assert_eq!(
         text,
-        format!("Certificate {certificate}\nFingerprint {fingerprint}\n")
+        format!("Certificate {certificate}\nFingerprint {fingerprint}\nDevice {device}\n")
     );
     assert!(show.stderr.is_empty());
 
