@@ -1,0 +1,19 @@
+[workspace]
+
+[package]
+name = "howl-harness-spike"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+agent-client-protocol = "=5.6.1"
+anyhow = "1.0"
+rmcp = { version = "=3.11.0", features = ["transport-io"] }
+serde_json = "1.0"
+tempfile = "3.23"
+tokio = { version = "1.49", features = ["io-util", "macros", "process", "rt", "time"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+
+[lints.rust]
+unsafe_code = "forbid"
