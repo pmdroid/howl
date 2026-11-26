@@ -1,0 +1,10 @@
+[package]
+name = "howl"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Local-first collaboration for humans and agents"
+publish = false
+
+[lints]
+workspace = true
