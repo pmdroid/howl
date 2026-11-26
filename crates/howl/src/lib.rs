@@ -6,3 +6,5 @@
 /// assert!(howl::HELP.contains("Usage: howl"));
 /// ```
 pub const HELP: &str = "Howl - agent collaboration\n\nUsage: howl [--help | --version]";
+
+pub mod delivery;
