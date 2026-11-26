@@ -69,8 +69,8 @@ pair() {
     bob_device=$(field Device <<< "$b")
     [ "${#alice_device}" -eq 64 ]
     [ "${#bob_device}" -eq 64 ]
-    alice peer add "$alice_state" "$(field Certificate <<< "$b")" "$(field Fingerprint <<< "$b")" >/dev/null
-    bob peer add "$bob_state" "$(field Certificate <<< "$a")" "$(field Fingerprint <<< "$a")" >/dev/null
+    alice peer trust "$alice_state" "$(field Certificate <<< "$b")" "$(field Fingerprint <<< "$b")" >/dev/null
+    bob peer trust "$bob_state" "$(field Certificate <<< "$a")" "$(field Fingerprint <<< "$a")" >/dev/null
     record=$(alice channel create "$alice_state" "$bob_device")
     channel=$(field Channel <<< "$record")
     manifest=$(field Manifest <<< "$record")
