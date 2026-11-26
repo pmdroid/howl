@@ -1,3 +1,6 @@
+mod wake;
+pub use wake::{WakeClaim, WakeJob, WakeState};
+
 use std::{fs::File, io, ops::RangeInclusive, path::Path, time::Duration};
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
@@ -105,6 +108,8 @@ pub enum Error {
     Expired,
     #[error("wake time has not been established or moved backward")]
     WakeClock,
+    #[error("invalid or revoked wake grant generation")]
+    WakeGrant,
     #[error("delivery acknowledgment is invalid")]
     Ack,
 }
@@ -507,14 +512,7 @@ impl DeliveryStore {
     }
 
     pub fn observe_wake_time(&self, now: u64) -> Result<()> {
-        let changed = self.connection.execute(
-            "UPDATE store SET wake_clock = ?1 WHERE wake_clock <= ?1",
-            [now.to_be_bytes()],
-        )?;
-        if changed == 0 {
-            return Err(Error::WakeClock);
-        }
-        Ok(())
+        wake::record_wake_time(&self.connection, now)
     }
 
     pub fn accept_authenticated(
@@ -610,6 +608,12 @@ impl DeliveryStore {
                 tx.execute(
                     "INSERT INTO chat_search (rowid, body) VALUES (?1, ?2)",
                     params![tx.last_insert_rowid(), body],
+                )?;
+            } else {
+                tx.execute(
+                    "INSERT INTO wake_queue (cursor, generation, state)
+                     SELECT ?1, generation, 0 FROM wake_targets WHERE channel = ?2 AND target = ?3 AND status = 1",
+                    params![tx.last_insert_rowid(), frame.stream.channel, target],
                 )?;
             }
         }

@@ -2,7 +2,7 @@ use std::{fs, path::Path, process::Command, thread};
 
 use ed25519_dalek::SigningKey;
 use howl::delivery::{
-    ACK_TAG, Acknowledgment, DeliveryStore, Device, Error, Frame, Payload, Stream,
+    ACK_TAG, Acknowledgment, DeliveryStore, Device, Error, Frame, Id, Payload, Stream,
 };
 
 const STORE_KEY: [u8; 32] = [91; 32];
@@ -350,4 +350,479 @@ fn database_wal_fts_and_backup_keep_plaintext_encrypted() {
         DeliveryStore::open(&database, &STORE_KEY, ALICE),
         Err(Error::Device)
     ));
+}
+
+#[test]
+fn a_claimed_wake_is_not_repeated_after_restart_or_replay() {
+    use howl::delivery::WakeState;
+
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("wakes");
+    let target = [43; 32];
+    let wake = Payload::Wake {
+        target,
+        text: "review the plan",
+    };
+    let signer = bob_signer();
+    let mut receiver = open(&path, BOB);
+    receiver.establish_wake_time(10).unwrap();
+    receiver
+        .accept_authenticated(
+            frame(1, 20),
+            b"ordinary chat",
+            Payload::Chat("review the plan"),
+            10,
+            &signer,
+        )
+        .unwrap();
+    let preapproval = Frame {
+        expires_at: 30,
+        ..frame(2, 21)
+    };
+    assert!(
+        receiver
+            .accept_authenticated(preapproval, b"before approval", wake, 10, &signer)
+            .unwrap()
+            .inserted
+    );
+    receiver
+        .enable_wake_target(STREAM.channel, target, 1)
+        .unwrap();
+    assert!(
+        receiver
+            .claim_wake(STREAM.channel, target, 11)
+            .unwrap()
+            .is_none()
+    );
+
+    let allowed = Frame {
+        expires_at: 30,
+        ..frame(3, 22)
+    };
+    let receipt = receiver
+        .accept_authenticated(allowed, b"allowed wake", wake, 11, &signer)
+        .unwrap();
+    let claimed = receiver
+        .claim_wake(STREAM.channel, target, 12)
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed.message, allowed.message);
+    assert_eq!(claimed.target, target);
+    assert_eq!(claimed.stream, STREAM);
+    assert_eq!(claimed.epoch, allowed.epoch);
+    assert_eq!(claimed.grant_generation, 1);
+    assert!(claimed.cursor > 0);
+    assert_eq!(
+        receiver.wake_state(claimed.execution).unwrap(),
+        Some(WakeState::Claimed)
+    );
+    let job = receiver
+        .start_wake(claimed.execution, || Ok(12), |_| true)
+        .unwrap()
+        .unwrap();
+    assert_eq!(job.claim, claimed);
+    assert_eq!(job.text, "review the plan");
+    assert_eq!(
+        receiver.wake_state(claimed.execution).unwrap(),
+        Some(WakeState::Running)
+    );
+    let duplicate = receiver
+        .accept_authenticated(allowed, b"allowed wake", wake, 13, &signer)
+        .unwrap();
+    assert!(!duplicate.inserted);
+    assert_eq!(duplicate.acknowledgment, receipt.acknowledgment);
+    assert!(
+        receiver
+            .claim_wake(STREAM.channel, target, 13)
+            .unwrap()
+            .is_none()
+    );
+    drop(receiver);
+
+    let mut reopened = open(&path, BOB);
+    assert_eq!(reopened.recover_wakes().unwrap(), 1);
+    assert_eq!(
+        reopened.wake_state(claimed.execution).unwrap(),
+        Some(WakeState::Uncertain)
+    );
+    reopened
+        .enable_wake_target(STREAM.channel, target, 1)
+        .unwrap();
+    let repeated = reopened
+        .accept_authenticated(allowed, b"allowed wake", wake, 14, &signer)
+        .unwrap();
+    assert!(!repeated.inserted);
+    assert!(
+        reopened
+            .claim_wake(STREAM.channel, target, 14)
+            .unwrap()
+            .is_none()
+    );
+    assert!(!reopened.finish_wake(claimed.execution).unwrap());
+}
+
+#[test]
+fn expiry_revocation_and_epoch_change_are_checked_at_wake_dispatch() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("wakes");
+    let target = [44; 32];
+    let wake = Payload::Wake {
+        target,
+        text: "look at the plan",
+    };
+    let signer = bob_signer();
+    let mut receiver = open(&path, BOB);
+    receiver.establish_wake_time(10).unwrap();
+    receiver
+        .enable_wake_target(STREAM.channel, target, 1)
+        .unwrap();
+    let expiring = Frame {
+        expires_at: 12,
+        ..frame(1, 20)
+    };
+    receiver
+        .accept_authenticated(expiring, b"expiring", wake, 10, &signer)
+        .unwrap();
+    assert!(
+        receiver
+            .claim_wake(STREAM.channel, target, 12)
+            .unwrap()
+            .is_none()
+    );
+    assert!(matches!(
+        receiver.claim_wake(STREAM.channel, target, 11),
+        Err(Error::WakeClock)
+    ));
+
+    let revoked = Frame {
+        expires_at: 30,
+        ..frame(2, 21)
+    };
+    receiver
+        .accept_authenticated(revoked, b"revoked", wake, 12, &signer)
+        .unwrap();
+    receiver
+        .disable_wake_target(STREAM.channel, target, 1)
+        .unwrap();
+    assert!(matches!(
+        receiver.enable_wake_target(STREAM.channel, target, 1),
+        Err(Error::WakeGrant)
+    ));
+    receiver
+        .enable_wake_target(STREAM.channel, target, 2)
+        .unwrap();
+    assert!(
+        receiver
+            .claim_wake(STREAM.channel, target, 13)
+            .unwrap()
+            .is_none()
+    );
+
+    let old_epoch = Frame {
+        expires_at: 30,
+        ..frame(3, 22)
+    };
+    receiver
+        .accept_authenticated(old_epoch, b"retired epoch", wake, 13, &signer)
+        .unwrap();
+    receiver.set_epoch(STREAM.channel, 2).unwrap();
+    assert!(
+        receiver
+            .claim_wake(STREAM.channel, target, 14)
+            .unwrap()
+            .is_none()
+    );
+
+    let current = Frame {
+        expires_at: 30,
+        epoch: 2,
+        ..frame(4, 23)
+    };
+    receiver
+        .accept_authenticated(current, b"active epoch", wake, 14, &signer)
+        .unwrap();
+    let job = receiver
+        .claim_wake(STREAM.channel, target, 14)
+        .unwrap()
+        .unwrap();
+    assert_eq!(job.message, current.message);
+    assert_eq!(job.grant_generation, 2);
+    assert!(!receiver.finish_wake(job.execution).unwrap());
+    assert!(
+        receiver
+            .start_wake(job.execution, || Ok(14), |_| true)
+            .unwrap()
+            .is_some()
+    );
+    assert!(receiver.finish_wake(job.execution).unwrap());
+    assert!(!receiver.finish_wake(job.execution).unwrap());
+}
+
+#[test]
+fn claimed_wakes_require_fresh_time_and_current_sender_authorization() {
+    use std::cell::Cell;
+
+    use howl::delivery::WakeState;
+
+    let root = tempfile::tempdir().unwrap();
+    let target = [44; 32];
+    let mut store = open(&root.path().join("wakes"), BOB);
+    store.establish_wake_time(10).unwrap();
+    store.enable_wake_target(STREAM.channel, target, 1).unwrap();
+    enqueue_wake(&mut store, 1, 20, target, 10, 12);
+    let claim = store
+        .claim_wake(STREAM.channel, target, 11)
+        .unwrap()
+        .unwrap();
+    let clock = Cell::new(11);
+    let expired = store
+        .start_wake(
+            claim.execution,
+            || Ok(clock.get()),
+            |_| {
+                clock.set(12);
+                true
+            },
+        )
+        .unwrap();
+    assert!(expired.is_none());
+    assert_eq!(
+        store.wake_state(claim.execution).unwrap(),
+        Some(WakeState::Cancelled)
+    );
+    assert!(matches!(
+        store.claim_wake(STREAM.channel, target, 11),
+        Err(Error::WakeClock)
+    ));
+
+    enqueue_wake(&mut store, 2, 21, target, 12, 30);
+    let claim = store
+        .claim_wake(STREAM.channel, target, 12)
+        .unwrap()
+        .unwrap();
+    let revoked_sender = store
+        .start_wake(
+            claim.execution,
+            || Ok(13),
+            |candidate| {
+                assert_eq!(candidate.stream, STREAM);
+                assert_eq!(candidate.epoch, 1);
+                assert_eq!(candidate.grant_generation, 1);
+                false
+            },
+        )
+        .unwrap();
+    assert!(revoked_sender.is_none());
+    assert_eq!(
+        store.wake_state(claim.execution).unwrap(),
+        Some(WakeState::Cancelled)
+    );
+
+    enqueue_wake(&mut store, 3, 22, target, 13, 30);
+    let claim = store
+        .claim_wake(STREAM.channel, target, 13)
+        .unwrap()
+        .unwrap();
+    store.set_epoch(STREAM.channel, 2).unwrap();
+    assert!(
+        store
+            .start_wake(
+                claim.execution,
+                || Ok(14),
+                |_| panic!("retired epoch reached authorization")
+            )
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store.wake_state(claim.execution).unwrap(),
+        Some(WakeState::Cancelled)
+    );
+}
+
+#[test]
+fn restart_and_grant_rotation_do_not_cross_authorization_boundaries() {
+    use howl::delivery::WakeState;
+
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("wakes");
+    let target = [44; 32];
+    let mut store = open(&path, BOB);
+    store.establish_wake_time(10).unwrap();
+    store.enable_wake_target(STREAM.channel, target, 1).unwrap();
+    enqueue_wake(&mut store, 1, 20, target, 10, 30);
+    enqueue_wake(&mut store, 2, 21, target, 10, 30);
+    enqueue_wake(&mut store, 3, 22, target, 10, 30);
+    let abandoned = store
+        .claim_wake(STREAM.channel, target, 10)
+        .unwrap()
+        .unwrap();
+    drop(store);
+
+    let mut store = open(&path, BOB);
+    assert_eq!(store.recover_wakes().unwrap(), 0);
+    assert!(
+        store
+            .claim_wake(STREAM.channel, target, 11)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store.wake_state(abandoned.execution).unwrap(),
+        Some(WakeState::Cancelled)
+    );
+    store.enable_wake_target(STREAM.channel, target, 1).unwrap();
+    let previous_grant = store
+        .claim_wake(STREAM.channel, target, 11)
+        .unwrap()
+        .unwrap();
+    assert_eq!(previous_grant.message, [21; 32]);
+    store.enable_wake_target(STREAM.channel, target, 2).unwrap();
+    assert!(matches!(
+        store.enable_wake_target(STREAM.channel, target, 1),
+        Err(Error::WakeGrant)
+    ));
+    assert!(matches!(
+        store.disable_wake_target(STREAM.channel, target, 1),
+        Err(Error::WakeGrant)
+    ));
+    assert!(
+        store
+            .start_wake(previous_grant.execution, || Ok(11), |_| true)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store.wake_state(previous_grant.execution).unwrap(),
+        Some(WakeState::Cancelled)
+    );
+    assert!(
+        store
+            .claim_wake(STREAM.channel, target, 11)
+            .unwrap()
+            .is_none()
+    );
+
+    enqueue_wake(&mut store, 4, 23, target, 11, 30);
+    let claim = store
+        .claim_wake(STREAM.channel, target, 11)
+        .unwrap()
+        .unwrap();
+    assert_eq!(claim.grant_generation, 2);
+    store
+        .disable_wake_target(STREAM.channel, target, 2)
+        .unwrap();
+    assert!(
+        store
+            .start_wake(claim.execution, || Ok(12), |_| true)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store.wake_state(claim.execution).unwrap(),
+        Some(WakeState::Cancelled)
+    );
+}
+
+#[test]
+fn cancellation_and_uncertain_execution_are_terminal_per_wake() {
+    use howl::delivery::WakeState;
+
+    let root = tempfile::tempdir().unwrap();
+    let target = [44; 32];
+    let mut store = open(&root.path().join("wakes"), BOB);
+    store.establish_wake_time(10).unwrap();
+    store.enable_wake_target(STREAM.channel, target, 1).unwrap();
+    for sequence in 1..=3 {
+        enqueue_wake(&mut store, sequence, 19 + sequence as u8, target, 10, 30);
+    }
+
+    let cancelled = store
+        .claim_wake(STREAM.channel, target, 10)
+        .unwrap()
+        .unwrap();
+    assert!(store.cancel_wake(cancelled.execution).unwrap());
+    assert!(!store.cancel_wake(cancelled.execution).unwrap());
+    assert!(
+        store
+            .start_wake(cancelled.execution, || Ok(10), |_| true)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store.wake_state(cancelled.execution).unwrap(),
+        Some(WakeState::Cancelled)
+    );
+
+    let disconnected = store
+        .claim_wake(STREAM.channel, target, 10)
+        .unwrap()
+        .unwrap();
+    assert!(!store.mark_wake_uncertain(disconnected.execution).unwrap());
+    assert!(
+        store
+            .start_wake(disconnected.execution, || Ok(10), |_| true)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        store
+            .start_wake(disconnected.execution, || Ok(10), |_| true)
+            .unwrap()
+            .is_none()
+    );
+    assert!(store.mark_wake_uncertain(disconnected.execution).unwrap());
+    assert!(!store.finish_wake(disconnected.execution).unwrap());
+    assert_eq!(
+        store.wake_state(disconnected.execution).unwrap(),
+        Some(WakeState::Uncertain)
+    );
+
+    let interrupted = store
+        .claim_wake(STREAM.channel, target, 10)
+        .unwrap()
+        .unwrap();
+    assert!(
+        store
+            .start_wake(interrupted.execution, || Ok(10), |_| true)
+            .unwrap()
+            .is_some()
+    );
+    assert!(store.cancel_wake(interrupted.execution).unwrap());
+    assert_eq!(
+        store.wake_state(interrupted.execution).unwrap(),
+        Some(WakeState::Uncertain)
+    );
+    assert!(
+        store
+            .claim_wake(STREAM.channel, target, 10)
+            .unwrap()
+            .is_none()
+    );
+}
+
+fn enqueue_wake(
+    store: &mut DeliveryStore,
+    sequence: u64,
+    message: u8,
+    target: Id,
+    now: u64,
+    expires_at: u64,
+) {
+    let frame = Frame {
+        expires_at,
+        ..frame(sequence, message)
+    };
+    store
+        .accept_authenticated(
+            frame,
+            &[message],
+            Payload::Wake {
+                target,
+                text: "review the plan",
+            },
+            now,
+            &bob_signer(),
+        )
+        .unwrap();
 }
