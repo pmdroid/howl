@@ -1,4 +1,8 @@
+mod budget;
 mod wake;
+pub use budget::{
+    BudgetError, BudgetLimit, BudgetLimits, ConversationBudget, HumanAction, HumanCommand, Turn,
+};
 pub use wake::{WakeClaim, WakeJob, WakeState};
 
 use std::{fs::File, io, ops::RangeInclusive, path::Path, time::Duration};
@@ -205,6 +209,7 @@ impl DeliveryStore {
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute_batch(include_str!("delivery.sql"))?;
         tx.execute_batch(include_str!("presence.sql"))?;
+        tx.execute_batch(include_str!("delivery/budget.sql"))?;
         tx.execute(
             "INSERT OR IGNORE INTO store(singleton, device) VALUES (1, ?1)",
             [local.encode()],
