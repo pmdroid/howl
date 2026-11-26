@@ -1,12 +1,12 @@
 use std::{io, path::Path};
 
+use howl_envelope::MAX_RECIPIENTS as MAX_MEMBERS;
 use sha2::{Digest, Sha256};
 
 use crate::identity::{LocalIdentity, PeerCertificate, PeerTrust, StateDirectory};
 
 const DOMAIN: &[u8] = b"howl/manual-channel/v1\0";
 const MEMBER_LEN: usize = 64;
-const MAX_MEMBERS: usize = 64;
 const SIGNATURE_LEN: usize = 64;
 const HEADER_LEN: usize = DOMAIN.len() + 32 + 32 + 1;
 pub const MAX_MANIFEST_LEN: usize = HEADER_LEN + MAX_MEMBERS * MEMBER_LEN + SIGNATURE_LEN;
