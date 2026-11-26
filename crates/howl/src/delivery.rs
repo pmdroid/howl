@@ -21,7 +21,7 @@ pub struct Device {
 }
 
 impl Device {
-    fn encode(self) -> [u8; 64] {
+    pub(crate) fn encode(self) -> [u8; 64] {
         let mut bytes = [0; 64];
         bytes[..32].copy_from_slice(&self.account);
         bytes[32..].copy_from_slice(&self.device);
@@ -199,6 +199,7 @@ impl DeliveryStore {
 
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute_batch(include_str!("delivery.sql"))?;
+        tx.execute_batch(include_str!("presence.sql"))?;
         tx.execute(
             "INSERT OR IGNORE INTO store(singleton, device) VALUES (1, ?1)",
             [local.encode()],
@@ -213,6 +214,10 @@ impl DeliveryStore {
         tx.commit()?;
 
         Ok(Self { connection, local })
+    }
+
+    pub fn presence(&mut self) -> crate::presence::Presence<'_> {
+        crate::presence::Presence::new(&mut self.connection)
     }
 
     pub fn set_epoch(&mut self, channel: Id, epoch: u64) -> Result<()> {
