@@ -1,12 +1,19 @@
-use std::{env, io, path::Path, process::ExitCode};
+use std::{
+    env,
+    io::{self, Read},
+    path::Path,
+    process::ExitCode,
+};
 
 use howl::{
     HELP,
     channel::{Channel, MAX_MANIFEST_LEN},
     identity::{LocalIdentity, PeerCertificate, PeerTrust},
+    node,
 };
 
-fn main() -> ExitCode {
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> ExitCode {
     let args = env::args_os().skip(1).collect::<Vec<_>>();
     let result = match args.as_slice() {
         [] => {
@@ -47,6 +54,52 @@ fn main() -> ExitCode {
             };
             join_channel(Path::new(state), manifest)
         }
+        [group, action, state, listen, relay @ ..]
+            if group == "mesh" && action == "run" && relay.len() <= 1 =>
+        {
+            let Some(listen) = listen.to_str() else {
+                return invalid_arguments();
+            };
+            let relay = match relay.first() {
+                Some(value) => {
+                    let Some(value) = value.to_str() else {
+                        return invalid_arguments();
+                    };
+                    Some(value)
+                }
+                None => None,
+            };
+            node::run(Path::new(state), listen, relay).await
+        }
+        [group, action, state] if group == "mesh" && action == "stop" => {
+            node::stop(Path::new(state)).await
+        }
+        [command, state, channel, peer, route] if command == "send" => {
+            let (Ok(channel), Ok(peer), Some(route)) =
+                (parse_id(channel), parse_id(peer), route.to_str())
+            else {
+                return invalid_arguments();
+            };
+            let mut message = String::new();
+            match io::stdin()
+                .take((node::CHAT_LIMIT + 1) as u64)
+                .read_to_string(&mut message)
+            {
+                Ok(_) => node::send(Path::new(state), channel, peer, route, &message)
+                    .await
+                    .map(|receipt| println!("{receipt}")),
+                Err(error) => Err(error),
+            }
+        }
+        [command, state, channel] if command == "read" => {
+            parse_id(channel).and_then(|channel| node::read(Path::new(state), channel))
+        }
+        [command, state, channel, message] if command == "status" => {
+            parse_id(channel).and_then(|channel| {
+                parse_id(message)
+                    .and_then(|message| node::status(Path::new(state), channel, message))
+            })
+        }
         _ => return invalid_arguments(),
     };
 
@@ -83,7 +136,13 @@ fn pin_peer(state: &Path, certificate: &str, fingerprint: &str) -> io::Result<()
 fn create_channel(state: &Path, peers: &[std::ffi::OsString]) -> io::Result<()> {
     let peers = peers
         .iter()
-        .map(|peer| parse_id(peer))
+        .map(|peer| {
+            let mut id = [0; 32];
+            hex::decode_to_slice(peer.as_encoded_bytes(), &mut id).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "invalid member device ID")
+            })?;
+            Ok(id)
+        })
         .collect::<io::Result<Vec<_>>>()?;
     let identity = LocalIdentity::load_or_create(state)?;
     let channel = Channel::create(state, &identity, &peers)?;

@@ -57,6 +57,14 @@ impl LocalIdentity {
         })
     }
 
+    pub(crate) fn signing_key(&self) -> &SigningKey {
+        &self.signing
+    }
+
+    pub(crate) fn encryption_key(&self) -> &StaticSecret {
+        &self.encryption
+    }
+
     pub(crate) fn sign(&self, message: &[u8]) -> [u8; 64] {
         self.signing.sign(message).to_bytes()
     }
@@ -125,6 +133,21 @@ impl PeerCertificate {
 
     pub fn endpoint(&self) -> EndpointId {
         self.endpoint
+    }
+
+    pub(crate) fn manual_account_id(&self) -> [u8; 32] {
+        let mut digest = Sha256::new();
+        digest.update(b"howl/manual-account/v1\0");
+        digest.update(self.device_id());
+        digest.finalize().into()
+    }
+
+    pub(crate) fn signing_public(&self) -> [u8; 32] {
+        *field(&self.bytes, 33)
+    }
+
+    pub(crate) fn encryption_public(&self) -> [u8; 32] {
+        *field(&self.bytes, 97)
     }
 
     pub(crate) fn verify_signature(&self, message: &[u8], signature: &[u8; 64]) -> io::Result<()> {
@@ -271,6 +294,21 @@ impl StateDirectory {
         )?);
         check_private(&file, &self.path.join(filename), false)?;
         Ok(file)
+    }
+
+    pub(crate) fn key(&self, filename: &str) -> io::Result<Zeroizing<[u8; 32]>> {
+        let mut key = Zeroizing::new([0; 32]);
+        match self.read(filename, &mut key[..]) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                getrandom::fill(&mut key[..]).map_err(io::Error::other)?;
+                if !self.write(filename, &key[..])? {
+                    self.read(filename, &mut key[..])?;
+                }
+            }
+            Err(error) => return Err(error),
+        }
+        Ok(key)
     }
 
     pub(crate) fn write(&self, filename: &str, bytes: &[u8]) -> io::Result<bool> {

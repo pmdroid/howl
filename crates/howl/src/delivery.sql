@@ -31,6 +31,10 @@ CREATE TABLE IF NOT EXISTS recipients (
     acknowledged INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (envelope, device)
 ) STRICT;
+CREATE TABLE IF NOT EXISTS peer_routes (
+    device BLOB PRIMARY KEY,
+    address TEXT NOT NULL
+) STRICT;
 CREATE INDEX IF NOT EXISTS recipients_due ON recipients(due) WHERE acknowledged = 0;
 CREATE TABLE IF NOT EXISTS inbox (
     id INTEGER PRIMARY KEY,

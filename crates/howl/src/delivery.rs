@@ -150,6 +150,7 @@ pub struct Receipt {
 pub struct Attempt {
     pub recipient: Device,
     pub frame: Vec<u8>,
+    pub route: Option<String>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -263,6 +264,31 @@ impl DeliveryStore {
         recipients: &[Device],
         now: u64,
     ) -> Result<()> {
+        self.enqueue_frames(frame, bytes, recipients, now, None)
+    }
+
+    pub fn enqueue_routed(
+        &mut self,
+        frame: Frame,
+        bytes: &[u8],
+        recipient: Device,
+        route: &str,
+        now: u64,
+    ) -> Result<()> {
+        if route.is_empty() || route.len() > 64 {
+            return Err(Error::InvalidFrame);
+        }
+        self.enqueue_frames(frame, bytes, &[recipient], now, Some(route))
+    }
+
+    fn enqueue_frames(
+        &mut self,
+        frame: Frame,
+        bytes: &[u8],
+        recipients: &[Device],
+        now: u64,
+        route: Option<&str>,
+    ) -> Result<()> {
         frame.validate(bytes)?;
         if frame.stream.sender != self.local {
             return Err(Error::Device);
@@ -330,12 +356,19 @@ impl DeliveryStore {
             }
         } else {
             let row = tx.last_insert_rowid();
-            for recipient in recipients {
+            for recipient in &recipients {
                 tx.execute(
                     "INSERT INTO recipients (envelope, device, due) VALUES (?1, ?2, ?3)",
                     params![row, recipient.encode(), now.to_be_bytes()],
                 )?;
             }
+        }
+        if let Some(route) = route {
+            tx.execute(
+                "INSERT INTO peer_routes (device, address) VALUES (?1, ?2)
+                 ON CONFLICT(device) DO UPDATE SET address = excluded.address",
+                params![recipients[0].encode(), route],
+            )?;
         }
         tx.commit()?;
         Ok(())
@@ -352,9 +385,10 @@ impl DeliveryStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let due = {
             let mut statement = tx.prepare(
-                "SELECT o.id, r.device, o.frame, r.attempt FROM recipients r
+                "SELECT o.id, r.device, o.frame, r.attempt, p.address FROM recipients r
                  JOIN outbox o ON o.id = r.envelope
                  JOIN channels c ON c.channel = substr(o.stream, 1, 32) AND c.epoch = o.epoch
+                 LEFT JOIN peer_routes p ON p.device = r.device
                  WHERE (?1 IS NULL OR c.channel = ?1) AND r.acknowledged = 0 AND r.due <= ?2
                  AND o.frame IS NOT NULL AND (o.expires = ?3 OR o.expires > ?2)
                  ORDER BY r.due, o.id, r.device LIMIT ?4",
@@ -368,13 +402,14 @@ impl DeliveryStore {
                             row.get::<_, [u8; 64]>(1)?,
                             row.get::<_, Vec<u8>>(2)?,
                             row.get::<_, u32>(3)?,
+                            row.get::<_, Option<String>>(4)?,
                         ))
                     },
                 )?
                 .collect::<std::result::Result<Vec<_>, _>>()?
         };
         let mut messages = Vec::with_capacity(due.len());
-        for (id, device, bytes, attempt) in due {
+        for (id, device, bytes, attempt, route) in due {
             let interval = 1_u64 << attempt.min(8);
             let jitter = getrandom::u64().map_err(io::Error::other)? % interval;
             let due = now.checked_add(interval + jitter).map(u64::to_be_bytes);
@@ -385,6 +420,7 @@ impl DeliveryStore {
             messages.push(Attempt {
                 recipient: Device::decode(device),
                 frame: bytes,
+                route,
             });
         }
         tx.commit()?;

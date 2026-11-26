@@ -21,7 +21,7 @@ rusqlite = { version = "=0.43.0", default-features = false, features = ["bundled
 rustix = { version = "1", features = ["fs", "process"] }
 sha2 = "0.11"
 x25519-dalek = { version = "3", features = ["static_secrets"] }
-tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 tempfile = "=3.27.0"
 thiserror = "2"
 zeroize = "1"
