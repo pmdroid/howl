@@ -20,6 +20,8 @@ A peer, relay, hosted mailbox, model provider, and isolated agent can each behav
 | Root key unavailable, recovery key available | Recover using the pinned head, installed recovery proof, and replacement proofs | Advance to generation 1, sequence 0. Accept designations from the new root only. |
 | Root and recovery keys unavailable | Present a replacement root without the established recovery proof | Reject succession. Pair with the new genesis as a distinct account. |
 | An accepted rotation | Encounter another correctly signed rotation for the same previous head and sequence | Persist evidence and suspend affected authorization until a trusted head is selected. |
+| Two peers with the same pinned head | One accepts a valid rotation and the other a valid recovery from that head | After exchange, each detects the competing successors and suspends affected authorization. |
+| A roster that lists a device certificate at sequence 5 | Accept a current membership signer revocation through sequence 5 | Persist the revocation, invalidate matching queued work, and reject sequence 5 even after designation rotation. A later certificate requires its own roster entry. |
 | A valid device under a superseded designation | Attempt to wake an agent with the old certificate | Decline the wake. A current roster and certificate must authorize it. |
 | Observer-only session | Agent invokes the grant method or replays the challenge from a different session | Reject the request with no grant. |
 | A valid human grant | Restart the daemon, then reuse it in the same active session and generation | Apply the persisted grant if its scope still matches. |
