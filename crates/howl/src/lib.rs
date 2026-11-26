@@ -9,3 +9,5 @@ pub const HELP: &str = "Howl - agent collaboration\n\nUsage: howl [--help | --ve
 
 pub mod identity;
 pub mod transport;
+
+pub mod delivery;
