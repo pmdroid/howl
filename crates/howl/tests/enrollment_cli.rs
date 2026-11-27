@@ -222,3 +222,299 @@ fn enrollment_transfers_separate_artifacts_and_checks_all_device_proofs() {
         fs::read(operator_exchange.join("enrollment-certificate")).unwrap(),
     );
 }
+
+#[test]
+fn offline_export_recovers_authority_after_loss_of_the_online_root() {
+    let fixture = tempfile::tempdir().unwrap();
+    let operator = fixture.path().join("online");
+    let offline = fixture.path().join("offline");
+    let package = fixture.path().join("package");
+    let unlock = fixture.path().join("unlock");
+    let damaged_unlock = fixture.path().join("damaged-unlock");
+    let downloaded_package = fixture.path().join("downloaded-package");
+    let recovered = fixture.path().join("recovered");
+    let next_offline = fixture.path().join("next-offline");
+    let init = success(command(&[
+        "init".as_ref(),
+        operator.as_os_str(),
+        offline.as_os_str(),
+    ]));
+    let account = line(&init, "Account ");
+    let head = line(&init, "Authority ");
+    let prior = AuthorityStore::open(&operator).unwrap().current().unwrap();
+    let export = |unlock: &Path| {
+        command(&[
+            "recover-export".as_ref(),
+            operator.as_os_str(),
+            offline.as_os_str(),
+            package.as_os_str(),
+            unlock.as_os_str(),
+        ])
+    };
+    failed(export(&package));
+    let first = success(export(&unlock));
+    let public = fs::read(package.join("recovery-package")).unwrap();
+    let key = fs::read(unlock.join("recovery-unlock")).unwrap();
+    assert!(public.len() > 32);
+    assert_eq!(key.len(), 32);
+    assert!(!first.contains(&hex::encode(&key)));
+    assert!(!package.join("recovery-unlock").exists());
+    assert_eq!(
+        fs::metadata(unlock.join("recovery-unlock"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    assert_eq!(success(export(&unlock)), first);
+    assert_eq!(fs::read(package.join("recovery-package")).unwrap(), public);
+    assert_eq!(fs::read(unlock.join("recovery-unlock")).unwrap(), key);
+
+    artifact(&damaged_unlock, &unlock, &["recovery-unlock"]);
+    let mut wrong_key = key;
+    wrong_key[0] ^= 1;
+    fs::write(damaged_unlock.join("recovery-unlock"), wrong_key).unwrap();
+    artifact(
+        &downloaded_package,
+        &package,
+        &["authority-pin", "recovery-package"],
+    );
+    let mut tampered = public.clone();
+    *tampered.last_mut().unwrap() ^= 1;
+    fs::write(downloaded_package.join("recovery-package"), tampered).unwrap();
+
+    fs::remove_dir_all(&operator).unwrap();
+    fs::remove_dir_all(&offline).unwrap();
+
+    let recover = |package: &Path, unlock: &Path, head: &OsStr| {
+        command(&[
+            "recover".as_ref(),
+            recovered.as_os_str(),
+            package.as_os_str(),
+            unlock.as_os_str(),
+            next_offline.as_os_str(),
+            account,
+            head,
+        ])
+    };
+    failed(recover(&package, &damaged_unlock, head));
+    failed(recover(&downloaded_package, &unlock, head));
+    failed(recover(&package, &unlock, "00".repeat(32).as_ref()));
+    assert!(!recovered.join("authority-pin").exists());
+
+    fs::write(downloaded_package.join("recovery-package"), public).unwrap();
+    let result = success(recover(&downloaded_package, &unlock, head));
+    assert_eq!(line(&result, "Account "), account);
+    assert_ne!(line(&result, "Authority "), head);
+    let authority = AuthorityStore::open(&recovered).unwrap().load().unwrap();
+    let successor = authority.head().unwrap();
+    assert_eq!(authority.records().len(), 2);
+    assert_eq!(successor.account, prior.account);
+    assert_eq!(successor.generation, prior.generation + 1);
+    assert_ne!(successor.root, prior.root);
+    assert_ne!(successor.recovery, prior.recovery);
+    assert_eq!(success(recover(&downloaded_package, &unlock, head)), result);
+}
+
+#[test]
+fn existing_devices_adopt_recovery_and_a_higher_certificate_sequence() {
+    let fixture = tempfile::tempdir().unwrap();
+    let path = |name: &str| fixture.path().join(name);
+    let operator = path("operator");
+    let offline = path("offline");
+    let candidate = path("candidate");
+    let observer = path("observer");
+    let first_exchange = path("first-exchange");
+    let first = success(command(&[
+        "init".as_ref(),
+        operator.as_os_str(),
+        offline.as_os_str(),
+    ]));
+    pairing_exchange(
+        &operator,
+        &candidate,
+        &first_exchange,
+        &path("first-secret"),
+        &first,
+        "1",
+    );
+    success(accept_enrollment(&candidate, &first_exchange, &first));
+    let observer_exchange = path("observer-exchange");
+    pairing_exchange(
+        &operator,
+        &observer,
+        &observer_exchange,
+        &path("observer-secret"),
+        &first,
+        "1",
+    );
+    success(accept_enrollment(&observer, &observer_exchange, &first));
+    success(command(&[
+        "peer".as_ref(),
+        observer.as_os_str(),
+        first_exchange.as_os_str(),
+    ]));
+    let first_pin = fs::read(candidate.join("authority-pin")).unwrap();
+    let first_cert = fs::read(candidate.join("enrollment-certificate")).unwrap();
+    let device = LocalIdentity::load_or_create(&candidate)
+        .unwrap()
+        .certificate();
+    let package = path("package");
+    let unlock = path("unlock");
+    success(command(&[
+        "recover-export".as_ref(),
+        operator.as_os_str(),
+        offline.as_os_str(),
+        package.as_os_str(),
+        unlock.as_os_str(),
+    ]));
+    let recovered = path("recovered");
+    let recovered_offline = path("recovered-offline");
+    let second = success(command(&[
+        "recover".as_ref(),
+        recovered.as_os_str(),
+        package.as_os_str(),
+        unlock.as_os_str(),
+        recovered_offline.as_os_str(),
+        line(&first, "Account "),
+        line(&first, "Authority "),
+    ]));
+    let old_sequence_exchange = path("old-sequence-exchange");
+    pairing_exchange(
+        &recovered,
+        &candidate,
+        &old_sequence_exchange,
+        &path("old-sequence-secret"),
+        &second,
+        "1",
+    );
+    failed(accept_enrollment(
+        &candidate,
+        &old_sequence_exchange,
+        &second,
+    ));
+    assert_eq!(
+        success(command(&["authority".as_ref(), candidate.as_os_str()])),
+        first
+    );
+    let renewal = path("renewal-exchange");
+    pairing_exchange(
+        &recovered,
+        &candidate,
+        &renewal,
+        &path("renewal-secret"),
+        &second,
+        "2",
+    );
+    failed(accept_enrollment(&observer, &renewal, &second));
+    success(accept_enrollment(&candidate, &renewal, &second));
+    success(accept_enrollment(&candidate, &renewal, &second));
+    failed(accept_enrollment(&candidate, &first_exchange, &first));
+    assert_eq!(
+        success(command(&["authority".as_ref(), candidate.as_os_str()])),
+        second
+    );
+    assert_eq!(
+        fs::read(candidate.join("authority-pin")).unwrap(),
+        first_pin
+    );
+    assert_eq!(
+        fs::read(candidate.join("enrollment-certificate")).unwrap(),
+        first_cert
+    );
+    let unrelated = path("unrelated-operator");
+    let unrelated_offline = path("unrelated-offline");
+    let unrelated_ids = success(command(&[
+        "init".as_ref(),
+        unrelated.as_os_str(),
+        unrelated_offline.as_os_str(),
+    ]));
+    let unrelated_exchange = path("unrelated-exchange");
+    pairing_exchange(
+        &unrelated,
+        &candidate,
+        &unrelated_exchange,
+        &path("unrelated-secret"),
+        &unrelated_ids,
+        "3",
+    );
+    failed(accept_enrollment(
+        &candidate,
+        &unrelated_exchange,
+        &unrelated_ids,
+    ));
+    assert_eq!(
+        success(command(&["authority".as_ref(), candidate.as_os_str()])),
+        second
+    );
+
+    let observer_renewal = path("observer-renewal");
+    pairing_exchange(
+        &recovered,
+        &observer,
+        &observer_renewal,
+        &path("observer-renewal-secret"),
+        &second,
+        "2",
+    );
+    success(accept_enrollment(&observer, &observer_renewal, &second));
+    let peer =
+        |exchange: &Path| command(&["peer".as_ref(), observer.as_os_str(), exchange.as_os_str()]);
+    failed(peer(&first_exchange));
+    success(peer(&renewal));
+    success(peer(&renewal));
+    let pinned = PeerTrust::open(&observer)
+        .unwrap()
+        .pinned(device.device_id())
+        .unwrap();
+    assert_eq!(pinned.as_bytes(), device.as_bytes());
+}
+
+fn accept_enrollment(state: &Path, exchange: &Path, authority: &str) -> Output {
+    command(&[
+        "accept".as_ref(),
+        state.as_os_str(),
+        exchange.as_os_str(),
+        line(authority, "Account "),
+        line(authority, "Authority "),
+        line(authority, "Designation "),
+    ])
+}
+
+fn pairing_exchange(
+    issuer: &Path,
+    state: &Path,
+    exchange: &Path,
+    secret: &Path,
+    authority: &str,
+    sequence: &str,
+) {
+    let identity = success(command(&[
+        "identity".as_ref(),
+        state.as_os_str(),
+        exchange.as_os_str(),
+    ]));
+    success(command(&[
+        "offer".as_ref(),
+        issuer.as_os_str(),
+        exchange.as_os_str(),
+        line(&identity, "Fingerprint "),
+        sequence.as_ref(),
+        secret.as_os_str(),
+    ]));
+    success(command(&[
+        "respond".as_ref(),
+        state.as_os_str(),
+        exchange.as_os_str(),
+        line(authority, "Account "),
+        line(authority, "Authority "),
+        line(authority, "Designation "),
+        secret.as_os_str(),
+    ]));
+    success(command(&[
+        "certify".as_ref(),
+        issuer.as_os_str(),
+        exchange.as_os_str(),
+    ]));
+}
