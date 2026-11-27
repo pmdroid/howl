@@ -33,6 +33,7 @@ use tokio::{
 
 use crate::{
     delivery::DeliveryStatus,
+    identity::StateDirectory,
     interaction::{
         AgentAddress, ChannelSummary, Event, EventPage, LocalDevice, LocalInteraction, Wake,
     },
@@ -187,6 +188,7 @@ struct App {
     peer: Option<Id>,
     views: HashMap<Conversation, ConversationView>,
     routes: HashMap<Id, String>,
+    peer_labels: HashMap<String, String>,
     draft: String,
     notice: String,
     device_output: String,
@@ -211,6 +213,7 @@ impl App {
             peer: None,
             views: HashMap::new(),
             routes: HashMap::new(),
+            peer_labels: HashMap::new(),
             draft: String::new(),
             notice: String::new(),
             device_output: String::new(),
@@ -235,6 +238,15 @@ impl App {
             .iter()
             .find(|channel| Some(channel.id) == self.channel)
             .map_or(&[], |channel| channel.peers.as_slice())
+    }
+
+    fn peer_label(&self, peer: &Id) -> String {
+        let id = hex::encode(peer);
+        self.peer_labels
+            .get(&id)
+            .map(|label| visible(label).chars().take(32).collect::<String>())
+            .filter(|label| !label.trim().is_empty())
+            .unwrap_or_else(|| short(&id).to_owned())
     }
 
     fn refresh(&mut self) -> RefreshRequest {
@@ -799,6 +811,11 @@ pub async fn run(state: &Path) -> io::Result<()> {
     let mut terminal = ratatui::try_init()?;
     execute!(io::stdout(), EnableBracketedPaste, EnableMouseCapture)?;
     let mut app = App::new();
+    app.peer_labels = StateDirectory::open(state)
+        .and_then(|state| state.read_bounded("peer-labels.json", 16 * 1024))
+        .ok()
+        .and_then(|labels| serde_json::from_slice(&labels).ok())
+        .unwrap_or_default();
     let result = drive(state, &mut terminal, &mut app).await;
     drop(terminal);
     drop(cleanup);
@@ -1243,7 +1260,7 @@ fn draw_navigation(
     let peers_list = std::iter::once(ListItem::new("Whole channel")).chain(
         app.peers()
             .iter()
-            .map(|peer| ListItem::new(short(&hex::encode(peer)).to_owned())),
+            .map(|peer| ListItem::new(app.peer_label(peer))),
     );
     draw_list(
         frame,

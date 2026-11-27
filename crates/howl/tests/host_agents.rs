@@ -8,7 +8,7 @@ use std::{
 
 use agent_client_protocol::v1::schema::{ContentBlock, SessionUpdate, StopReason};
 use howl::{
-    managed_acp::{Event, Harness, HostClaude, HostCodex, HostGrok, ManagedSession},
+    managed_acp::{Event, Harness, HostClaude, HostCodex, HostGrok, HostOpenCode, ManagedSession},
     observer::{ObserverProvider, Snapshot},
 };
 
@@ -76,6 +76,19 @@ async fn live_host_codex_uses_docker_repository_tools() {
         host = host.with_state_home(path.into()).unwrap();
     }
     check_repository_prompt(|image| Harness::host_codex(image, host)).await;
+}
+
+#[tokio::test]
+#[ignore = "requires native OpenCode Go sign-in and a Linux Docker observer"]
+async fn live_host_opencode_uses_docker_repository_tools() {
+    let host = HostOpenCode::new(
+        configured("HOWL_HOST_NODE"),
+        configured("HOWL_HOST_OPENCODE"),
+        configured("HOWL_HOST_OPENCODE_DATA_HOME"),
+        std::env::var("HOWL_HOST_OPENCODE_MODEL").unwrap_or_else(|_| "kimi-k3".to_owned()),
+    )
+    .unwrap();
+    check_repository_prompt(|image| Harness::host_opencode(image, host)).await;
 }
 
 async fn check_repository_prompt(harness: impl FnOnce(String) -> Harness) {

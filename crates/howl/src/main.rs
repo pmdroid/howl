@@ -13,7 +13,7 @@ use howl::{
     identity::{LocalIdentity, PeerCertificate, PeerTrust},
     interaction::LocalInteraction,
     mailbox_client,
-    managed_acp::{Harness, HostClaude, HostCodex, HostGrok},
+    managed_acp::{Harness, HostClaude, HostCodex, HostGrok, HostOpenCode},
     node,
     observer::{ObserverProvider, Snapshot},
     remote_mcp, serve_gateway, tui, web, webhooks,
@@ -489,7 +489,21 @@ fn host_harness(driver: &str, image: String) -> io::Result<Harness> {
             }
             Harness::host_codex(image, codex)
         }
-        _ => return Err(invalid_input("driver must be claude, grok, or codex")),
+        "opencode" => Harness::host_opencode(
+            image,
+            HostOpenCode::new(
+                node,
+                configured_path("HOWL_HOST_OPENCODE")?,
+                configured_path("HOWL_HOST_OPENCODE_DATA_HOME")?,
+                env::var("HOWL_HOST_OPENCODE_MODEL").unwrap_or_else(|_| "kimi-k3".to_owned()),
+            )
+            .map_err(io::Error::other)?,
+        ),
+        _ => {
+            return Err(invalid_input(
+                "driver must be claude, grok, codex, or opencode",
+            ));
+        }
     };
     Ok(harness)
 }

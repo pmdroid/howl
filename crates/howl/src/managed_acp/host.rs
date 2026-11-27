@@ -183,10 +183,128 @@ impl HostCodex {
     }
 }
 
+pub struct HostOpenCode {
+    node: PathBuf,
+    opencode: PathBuf,
+    data: PathBuf,
+    model: String,
+}
+
+impl HostOpenCode {
+    pub fn new(node: PathBuf, opencode: PathBuf, data: PathBuf, model: String) -> Result<Self> {
+        if ![&node, &opencode, &data]
+            .into_iter()
+            .all(|path| path.is_absolute())
+            || model.is_empty()
+            || !model
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"-._".contains(&byte))
+        {
+            return Err(Error::HostAgent);
+        }
+        Ok(Self {
+            node,
+            opencode,
+            data,
+            model,
+        })
+    }
+
+    fn fingerprint(&self, hash: &mut Sha256) {
+        hash.update(b"howl/host-opencode/v1\0");
+        for value in [
+            self.node.as_os_str().as_encoded_bytes(),
+            self.opencode.as_os_str().as_encoded_bytes(),
+            self.data.as_os_str().as_encoded_bytes(),
+            self.model.as_bytes(),
+        ] {
+            hash.update((value.len() as u64).to_be_bytes());
+            hash.update(value);
+        }
+    }
+
+    fn start(&self) -> Result<HostProcess> {
+        let scratch = tempfile::Builder::new().prefix("howl-host-").tempdir()?;
+        let scratch_path = fs::canonicalize(scratch.path())?;
+        let cwd = scratch_path.join("workspace");
+        let home = scratch_path.join("home");
+        fs::create_dir(&cwd)?;
+        fs::create_dir(&home)?;
+        let configure = |command: &mut Command| {
+            command
+                .env("XDG_DATA_HOME", &self.data)
+                .env("XDG_CONFIG_HOME", scratch_path.join("config"))
+                .env("XDG_STATE_HOME", scratch_path.join("state"))
+                .env("XDG_CACHE_HOME", scratch_path.join("cache"))
+                .env("OPENCODE_DISABLE_PROJECT_CONFIG", "true")
+                .env("OPENCODE_DISABLE_CLAUDE_CODE", "true")
+                .env("OPENCODE_DISABLE_FREE_MODELS", "true")
+                .env("OPENCODE_DISABLE_AUTOUPDATE", "true");
+        };
+        let mut version = Command::new(&self.opencode);
+        version
+            .env_clear()
+            .env("HOME", &home)
+            .current_dir(&cwd)
+            .arg("--version");
+        configure(&mut version);
+        let version = version.output()?;
+        if !version.status.success() || version.stdout.trim_ascii() != b"opencode v2.4.2" {
+            return Err(Error::HostAgent);
+        }
+        let model = format!("opencode-go/{}", self.model);
+        let rule = |action, resource, effect| {
+            serde_json::json!({
+                "action": action, "resource": resource, "effect": effect
+            })
+        };
+        let permissions = [
+            rule("*", "*", "deny"),
+            rule("howl_repository_read_file", "*", "allow"),
+            rule("howl_repository_list_directory", "*", "allow"),
+        ];
+        let config = serde_json::json!({
+            "model": model,
+            "small_model": model,
+            "update": "disable",
+            "automations": false,
+            "share": "disabled",
+            "default_agent": "howl_repository",
+            "agent": {
+                "howl_repository": {
+                    "description": "Reviews the repository through Howl's Docker tools",
+                    "mode": "primary",
+                    "permissions": permissions
+                }
+            },
+            "permissions": permissions,
+            "policies": [
+                rule("provider.use", "*", "deny"),
+                rule("provider.use", "opencode-go", "allow"),
+                rule("mcp.use", "*", "deny"),
+                rule("mcp.use", "howl_repository", "allow"),
+                rule("plugin.use", "*", "deny"),
+                rule("skill.use", "*", "deny"),
+                rule("websearch.use", "*", "deny"),
+                rule("tool.use", "*", "deny"),
+                rule("tool.use", "howl_repository_read_file:*", "allow"),
+                rule("tool.use", "howl_repository_list_directory:*", "allow"),
+            ]
+        });
+        launch(&self.opencode, &self.node, scratch, cwd, &home, |command| {
+            configure(command);
+            command
+                .arg("acp")
+                .env("OPENCODE_CONFIG_CONTENT", config.to_string());
+        })
+    }
+}
+
 pub(super) enum HostAgent {
     Claude(HostClaude),
     Grok(HostGrok),
     Codex(HostCodex),
+    OpenCode(HostOpenCode),
 }
 
 impl HostAgent {
@@ -195,6 +313,7 @@ impl HostAgent {
             Self::Claude(agent) => agent.node(),
             Self::Grok(agent) => &agent.node,
             Self::Codex(agent) => &agent.node,
+            Self::OpenCode(agent) => &agent.node,
         }
     }
 
@@ -203,6 +322,7 @@ impl HostAgent {
             Self::Claude(agent) => agent.fingerprint(hash),
             Self::Grok(agent) => agent.fingerprint(hash),
             Self::Codex(agent) => agent.fingerprint(hash),
+            Self::OpenCode(agent) => agent.fingerprint(hash),
         }
     }
 
@@ -215,6 +335,7 @@ impl HostAgent {
             Self::Claude(agent) => agent.start(),
             Self::Grok(agent) => agent.start(),
             Self::Codex(agent) => agent.start(repository.ok_or(Error::HostAgent)?),
+            Self::OpenCode(agent) => agent.start(),
         }
     }
 }
