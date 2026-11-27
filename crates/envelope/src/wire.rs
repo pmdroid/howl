@@ -16,8 +16,10 @@ pub fn validate_routing(routing: Routing, intent: Intent) -> Result<(), Error> {
         return Err(Error::Encoding);
     }
     match intent {
-        Intent::Chat | Intent::AgentReply if routing.expires_at == 0 => Ok(()),
-        Intent::Wake
+        Intent::Chat | Intent::AgentReply | Intent::IntegrationChat if routing.expires_at == 0 => {
+            Ok(())
+        }
+        Intent::Wake | Intent::IntegrationWake
             if matches!(
                 routing.expires_at.checked_sub(routing.created_at),
                 Some(1..=300)
@@ -58,8 +60,11 @@ pub fn encode_recipient(recipient: Recipient) -> [u8; RECIPIENT_SIZE] {
     triple
 }
 
-pub fn pad(body: Body<&str>) -> Result<Zeroizing<Vec<u8>>, Error> {
+pub fn pad(body: Body<&str>, integration: Option<Id>) -> Result<Zeroizing<Vec<u8>>, Error> {
     let mut bytes = Zeroizing::new(vec![0; 4]);
+    if let Some(integration) = integration {
+        bytes.extend_from_slice(&integration);
+    }
     let text = match body {
         Body::Chat(text) if !text.is_empty() => text,
         Body::Wake { session, text } => {
@@ -87,7 +92,7 @@ pub fn pad(body: Body<&str>) -> Result<Zeroizing<Vec<u8>>, Error> {
     Ok(bytes)
 }
 
-pub fn unpad(intent: Intent, plaintext: &[u8]) -> Result<Body<String>, Error> {
+pub fn unpad(intent: Intent, plaintext: &[u8]) -> Result<(Body<String>, Option<Id>), Error> {
     let mut data = plaintext;
     let len = u32::from_be_bytes(take(&mut data)?) as usize;
     let (mut logical, padding) = data.split_at_checked(len).ok_or(Error::Encoding)?;
@@ -96,15 +101,19 @@ pub fn unpad(intent: Intent, plaintext: &[u8]) -> Result<Body<String>, Error> {
     {
         return Err(Error::Encoding);
     }
-    match intent {
-        Intent::Chat if !logical.is_empty() => Ok(Body::Chat(text(logical)?)),
-        Intent::Chat => Err(Error::Encoding),
-        Intent::Wake => {
+    let integration = intent
+        .is_integration()
+        .then(|| take(&mut logical))
+        .transpose()?;
+    let body = match intent {
+        Intent::Chat | Intent::IntegrationChat if !logical.is_empty() => Body::Chat(text(logical)?),
+        Intent::Chat | Intent::IntegrationChat => return Err(Error::Encoding),
+        Intent::Wake | Intent::IntegrationWake => {
             let session = take(&mut logical)?;
-            Ok(Body::Wake {
+            Body::Wake {
                 session,
                 text: text(logical)?,
-            })
+            }
         }
         Intent::AgentReply => {
             let agent = take(&mut logical)?;
@@ -115,15 +124,16 @@ pub fn unpad(intent: Intent, plaintext: &[u8]) -> Result<Body<String>, Error> {
             if logical.is_empty() {
                 return Err(Error::Encoding);
             }
-            Ok(Body::AgentReply(AgentReply {
+            Body::AgentReply(AgentReply {
                 agent,
                 role,
                 in_reply_to,
                 context_digest,
                 text: text(logical)?,
-            }))
+            })
         }
-    }
+    };
+    Ok((body, integration))
 }
 
 fn text(bytes: &[u8]) -> Result<String, Error> {
@@ -178,6 +188,8 @@ pub fn parse(frame: &[u8]) -> Result<Decoded<'_>, Error> {
         [WIRE_VERSION, 1] => Intent::Chat,
         [WIRE_VERSION, 2] => Intent::Wake,
         [WIRE_VERSION, 3] => Intent::AgentReply,
+        [WIRE_VERSION, 4] => Intent::IntegrationChat,
+        [WIRE_VERSION, 5] => Intent::IntegrationWake,
         _ => return Err(Error::Encoding),
     };
     let channel = take(&mut bytes)?;
