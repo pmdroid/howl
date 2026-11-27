@@ -5,13 +5,16 @@ use std::{
     time::Duration,
 };
 
-use agent_client_protocol::v1::schema::{PermissionOptionKind, StopReason};
+use agent_client_protocol::v1::schema::{
+    ContentBlock, PermissionOptionKind, SessionUpdate, StopReason,
+};
 use howl::{
     managed_acp::{
         Capabilities, Close, Error, Event, Harness, ManagedSession, PermissionDecision, Phase,
         Restore,
     },
     observer::{ObserverProvider, Snapshot},
+    provider_broker::Provider,
 };
 use tokio::time::{sleep, timeout};
 
@@ -246,4 +249,78 @@ async fn bounds_stuck_turns_and_degrades_unsupported_methods() {
     .unwrap();
     assert!(session.prompt("oversize".into(), LIMIT).await.is_err());
     stopped(&session, Phase::Interrupted).await;
+}
+
+async fn provider_reply(harness: Harness) {
+    let provider = provider();
+    let repo = repository();
+    let store = tempfile::tempdir().unwrap();
+    let session = ManagedSession::start(
+        &store.path().join("journal"),
+        &provider,
+        snapshot(repo.path(), "tracked.txt"),
+        harness,
+    )
+    .await
+    .unwrap();
+    let mut events = session.subscribe();
+    let result = session
+        .prompt(
+            "Reply with the single word HOWL_OK. Do not use tools.".to_owned(),
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(result, StopReason::EndTurn));
+    let saw_reply = timeout(LIMIT, async {
+        let mut output = String::new();
+        while let Ok(event) = events.recv().await {
+            if let Event::Update(update) = event
+                && let SessionUpdate::AgentMessageChunk(chunk) = update.update
+                && let ContentBlock::Text(text) = chunk.content
+            {
+                output.push_str(&text.text);
+                if output.contains("HOWL_OK") {
+                    return true;
+                }
+            }
+        }
+        false
+    })
+    .await
+    .unwrap_or(false);
+    assert!(saw_reply, "no expected provider reply received");
+    session.close().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned Codex image, configured model, and a host OpenAI API key"]
+async fn live_brokered_codex() {
+    let model = std::env::var("HOWL_CODEX_MODEL").expect("set HOWL_CODEX_MODEL");
+    provider_reply(
+        Harness::new(
+            "codex-brokered",
+            std::env::var("HOWL_CODEX_IMAGE").expect("set HOWL_CODEX_IMAGE"),
+            "/usr/local/bin/node",
+            &["/fixture/codex-wrapper.mjs", &model],
+        )
+        .with_provider(Provider::OpenAi, &model),
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned Grok image, configured model, and a host xAI API key"]
+async fn live_brokered_grok() {
+    let model = std::env::var("HOWL_GROK_MODEL").unwrap_or_else(|_| "grok-4.7".to_owned());
+    provider_reply(
+        Harness::new(
+            "grok-brokered",
+            std::env::var("HOWL_GROK_IMAGE").expect("set HOWL_GROK_IMAGE"),
+            "/bin/sh",
+            &["/usr/local/share/howl/grok-provider.sh", &model],
+        )
+        .with_provider(Provider::XAi, &model),
+    )
+    .await;
 }
