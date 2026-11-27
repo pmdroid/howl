@@ -1,4 +1,4 @@
-use howl_envelope::AgentRole;
+use howl_envelope::{AgentRole, DeviceAddress, RecipientSecret, Routing, inspect_unverified, seal};
 
 use super::*;
 
@@ -25,6 +25,151 @@ fn frame(sender: Device, message: u8, expires_at: u64) -> Frame {
         created_at: 10,
         expires_at,
     }
+}
+
+#[test]
+fn records_outbound_messages_only_after_a_successful_enqueue() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("delivery.db");
+    let key = [9; 32];
+    let mut store = DeliveryStore::open(&path, &key, LOCAL).unwrap();
+    store.set_epoch(CHANNEL, 1).unwrap();
+    let outgoing = frame(LOCAL, 20, 0);
+    assert!(matches!(
+        store.enqueue_routed_message(
+            outgoing,
+            b"signed outbound chat",
+            PEER,
+            "127.0.0.1:9",
+            10,
+            Some(Body::Chat("hello")),
+        ),
+        Err(Error::Unreserved)
+    ));
+    assert!(store.channel_events(CHANNEL, 0, 10).unwrap().is_empty());
+    store.reserve_sequence(outgoing.stream).unwrap();
+    for _ in 0..2 {
+        store
+            .enqueue_routed_message(
+                outgoing,
+                b"signed outbound chat",
+                PEER,
+                "127.0.0.1:9",
+                10,
+                Some(Body::Chat("hello")),
+            )
+            .unwrap();
+    }
+    drop(store);
+
+    let store = DeliveryStore::open(&path, &key, LOCAL).unwrap();
+    let events = store.channel_events(CHANNEL, 0, 10).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].recipient, Some(PEER));
+    assert_eq!(events[0].message.sender, LOCAL);
+    assert_eq!(events[0].message.body, Body::Chat("hello".to_owned()));
+    assert!(store.channel_history(CHANNEL, 10).unwrap().is_empty());
+    assert!(store.chat_history(CHANNEL, 10).unwrap().is_empty());
+    assert_eq!(
+        store.direct_events(CHANNEL, LOCAL, PEER, 0, 10).unwrap(),
+        events
+    );
+    let other = Device {
+        device: [13; 32],
+        ..PEER
+    };
+    assert!(
+        store
+            .direct_events(CHANNEL, LOCAL, other, 0, 10)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn direct_event_replay_uses_only_signed_single_recipient_messages() {
+    let root = tempfile::tempdir().unwrap();
+    let mut store = DeliveryStore::open(&root.path().join("delivery.db"), &[9; 32], LOCAL).unwrap();
+    store.set_epoch(CHANNEL, 1).unwrap();
+    let local_signer = SigningKey::from_bytes(&[10; 32]);
+    let peer_signer = howl_envelope::SigningKey::from_bytes(&[11; 32]);
+    let local_address = DeviceAddress {
+        account: LOCAL.account,
+        device: LOCAL.device,
+    };
+    let local_recipient = RecipientSecret::from_bytes(local_address, &[12; 32])
+        .unwrap()
+        .public_recipient();
+    let other_recipient = RecipientSecret::from_bytes(
+        DeviceAddress {
+            device: [13; 32],
+            ..local_address
+        },
+        &[14; 32],
+    )
+    .unwrap()
+    .public_recipient();
+    let mut message_ids = Vec::new();
+    for sequence in 1..=4 {
+        let recipients = if sequence == 1 {
+            vec![local_recipient, other_recipient]
+        } else {
+            vec![local_recipient]
+        };
+        let sealed = seal(
+            Routing {
+                channel: CHANNEL,
+                sender: DeviceAddress {
+                    account: PEER.account,
+                    device: PEER.device,
+                },
+                epoch: 1,
+                sequence,
+                created_at: 10,
+                expires_at: 0,
+            },
+            Body::Chat("hello"),
+            &peer_signer,
+            &recipients,
+        )
+        .unwrap();
+        let metadata = inspect_unverified(&sealed).unwrap();
+        let message = Frame {
+            stream: Stream {
+                signing_key: metadata.signing_key_id,
+                ..frame(PEER, 1, 0).stream
+            },
+            message: metadata.message_id,
+            sequence,
+            ..frame(PEER, 1, 0)
+        };
+        store
+            .accept_authenticated(message, &sealed, Payload::Chat("hello"), 10, &local_signer)
+            .unwrap();
+        message_ids.push(message.message);
+    }
+    store
+        .connection
+        .execute(
+            "DELETE FROM channel_event_addresses WHERE cursor IN (1, 2, 4)",
+            [],
+        )
+        .unwrap();
+    store
+        .connection
+        .execute("UPDATE inbox SET frame = NULL WHERE id IN (3, 4)", [])
+        .unwrap();
+
+    let first = store.direct_events(CHANNEL, LOCAL, PEER, 0, 1).unwrap();
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].recipient, Some(LOCAL));
+    assert_eq!(first[0].message.message, message_ids[1]);
+    let rest = store
+        .direct_events(CHANNEL, LOCAL, PEER, first[0].cursor, 10)
+        .unwrap();
+    assert_eq!(rest.len(), 1);
+    assert_eq!(rest[0].message.message, message_ids[2]);
+    assert_eq!(store.channel_events(CHANNEL, 0, 10).unwrap().len(), 4);
 }
 
 #[test]
@@ -169,6 +314,11 @@ fn only_the_linked_running_wake_can_publish_and_finish_in_one_transaction() {
             .len(),
         1
     );
+    let events = store.channel_events(CHANNEL, 0, 10).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].recipient, Some(PEER));
+    assert_eq!(events[0].message.message, outgoing.message);
+    assert!(matches!(&events[0].message.body, Body::AgentReply(reply) if reply.text == "draft"));
 
     let next = Frame {
         sequence: 2,

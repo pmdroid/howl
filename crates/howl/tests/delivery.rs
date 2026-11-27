@@ -231,6 +231,59 @@ fn detects_message_and_sequence_collisions_and_fills_gaps() {
 }
 
 #[test]
+fn replays_committed_channel_events_after_a_cursor_across_restart_and_pruning() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("receiver");
+    let mut receiver = open(&path, BOB);
+    let signer = bob_signer();
+    let first = frame(1, 21);
+    let mut other = frame(2, 22);
+    other.stream.channel = [9; 32];
+    receiver.set_epoch(other.stream.channel, 1).unwrap();
+    for (message, now) in [(first, 20), (other, 30), (frame(3, 23), 10)] {
+        receiver
+            .accept_authenticated(message, SENT_BYTES, Payload::Chat(BODY), now, &signer)
+            .unwrap();
+    }
+    let page = receiver.channel_events(STREAM.channel, 0, 1).unwrap();
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].message.message, first.message);
+    let first_cursor = page[0].cursor;
+    drop(receiver);
+
+    let mut receiver = open(&path, BOB);
+    let page = receiver
+        .channel_events(STREAM.channel, first_cursor, 10)
+        .unwrap();
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].message.message, [23; 32]);
+    let second_cursor = page[0].cursor;
+    assert!(
+        !receiver
+            .accept_authenticated(first, SENT_BYTES, Payload::Chat(BODY), 40, &signer)
+            .unwrap()
+            .inserted
+    );
+    assert!(
+        receiver
+            .channel_events(STREAM.channel, second_cursor, 10)
+            .unwrap()
+            .is_empty()
+    );
+    receiver.prune(STREAM.channel, 50, 50).unwrap();
+    let next = frame(4, 24);
+    receiver
+        .accept_authenticated(next, SENT_BYTES, Payload::Chat(BODY), 50, &signer)
+        .unwrap();
+    let page = receiver
+        .channel_events(STREAM.channel, second_cursor, 10)
+        .unwrap();
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].message.message, next.message);
+    assert!(page[0].cursor > second_cursor);
+}
+
+#[test]
 fn checks_wake_expiry_and_preserves_clock_watermark_across_restart() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("receiver");

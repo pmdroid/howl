@@ -40,9 +40,14 @@ fn successful(output: Output) -> String {
 }
 
 fn start(state: &Path) -> (Node, String) {
+    start_with(state, &[])
+}
+
+fn start_with(state: &Path, flags: &[&str]) -> (Node, String) {
     let mut child = Node(
         Command::new(env!("CARGO_BIN_EXE_howl"))
             .args(["mesh", "run"])
+            .args(flags)
             .arg(state)
             .arg("127.0.0.1:0")
             .stdout(Stdio::piped())
@@ -398,9 +403,51 @@ async fn enrolled_peers_stop_new_delivery_after_signed_revocation() {
     successful(cli(&["channel", "join"], &bob, &[second_manifest]));
     let second_id = hex::decode(second_channel).unwrap().try_into().unwrap();
 
-    let (mut a_node, _) = start(&alice);
-    let (mut b_node, bob_address) = start(&bob);
+    let (mut a_node, alice_address) = start(&alice);
+    let (mut b_node, bob_address) = start_with(&bob, &["--client-only"]);
     let channel_id: [u8; 32] = hex::decode(channel).unwrap().try_into().unwrap();
+    let a_device = *a_peer.device_id();
+    let b_device = *b_peer.device_id();
+    let reviewer = howl_envelope::AgentRole::Reviewer;
+    assert!(
+        node::grant_wake(&bob, channel_id, a_device, reviewer.agent_id(&b_device), 1)
+            .await
+            .is_err()
+    );
+    let agent = reviewer.agent_id(&a_device);
+    node::grant_wake(&alice, channel_id, b_device, agent, 1)
+        .await
+        .unwrap();
+    let wake = node::send_wake(
+        &bob,
+        channel_id,
+        a_device,
+        &alice_address,
+        agent,
+        30,
+        "review from the human client",
+    )
+    .await
+    .unwrap();
+    let message = wake.strip_prefix("queued ").unwrap();
+    let until = Instant::now() + Duration::from_secs(15);
+    loop {
+        let report = successful(cli(&["status"], &bob, &[channel, message]));
+        if report.contains("delivered") {
+            break;
+        }
+        assert!(
+            Instant::now() < until,
+            "client wake was not delivered: {report}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let events: Vec<serde_json::Value> =
+        serde_json::from_str(&successful(cli(&["events"], &bob, &[channel]))).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["message"], message);
+    assert_eq!(events[0]["role"], "wake");
+    let cursor = events[0]["cursor"].as_u64().unwrap().to_string();
     let queued = node::send(
         &alice,
         channel_id,
@@ -412,6 +459,10 @@ async fn enrolled_peers_stop_new_delivery_after_signed_revocation() {
     .unwrap();
     assert!(queued.starts_with("queued "));
     wait_for_text(&bob, channel, "signed before removal").await;
+    let events: Vec<serde_json::Value> =
+        serde_json::from_str(&successful(cli(&["events"], &bob, &[channel, &cursor]))).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["text"], "signed before removal");
     let queued = node::send(
         &alice,
         second_id,
