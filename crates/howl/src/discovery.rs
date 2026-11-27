@@ -13,9 +13,9 @@ const DOMAIN: &[u8] = b"howl/peer-address/v1\0";
 const LIFETIME: u64 = 86_400_000;
 const FUTURE_SKEW: u64 = 120_000;
 const BODY_LEN: usize = 1 + 32 + 32 + 8 + 8 + 1 + 16 + 2;
-pub(crate) const HINT_LEN: usize = BODY_LEN + 64;
+pub const HINT_LEN: usize = BODY_LEN + 64;
 
-pub(crate) struct RouteHint([u8; HINT_LEN]);
+pub struct RouteHint([u8; HINT_LEN]);
 
 impl RouteHint {
     pub(crate) fn issue(
@@ -50,27 +50,27 @@ impl RouteHint {
         Ok(Self(bytes))
     }
 
-    pub(crate) fn from_bytes(bytes: [u8; HINT_LEN]) -> Self {
+    pub fn from_bytes(bytes: [u8; HINT_LEN]) -> Self {
         Self(bytes)
     }
 
-    pub(crate) fn as_bytes(&self) -> &[u8; HINT_LEN] {
+    pub fn as_bytes(&self) -> &[u8; HINT_LEN] {
         &self.0
     }
 
-    pub(crate) fn device(&self) -> &Id {
+    pub fn device(&self) -> &Id {
         self.field(1)
     }
 
-    pub(crate) fn issued(&self) -> &[u8; 8] {
+    pub fn issued(&self) -> &[u8; 8] {
         self.field(65)
     }
 
-    pub(crate) fn address(
-        &self,
-        peer: &PeerCertificate,
-        now: u64,
-    ) -> io::Result<Option<SocketAddr>> {
+    pub fn expires(&self) -> &[u8; 8] {
+        self.field(73)
+    }
+
+    pub fn address(&self, peer: &PeerCertificate, now: u64) -> io::Result<Option<SocketAddr>> {
         if self.0[0] != 1
             || self.device() != peer.device_id()
             || self.field::<32>(33) != &peer.fingerprint()
@@ -78,7 +78,7 @@ impl RouteHint {
             return Err(invalid("address hint does not match the pinned device"));
         }
         let issued = u64::from_be_bytes(*self.issued());
-        let expires = u64::from_be_bytes(*self.field(73));
+        let expires = u64::from_be_bytes(*self.expires());
         if !matches!(expires.checked_sub(issued), Some(1..=LIFETIME))
             || issued > now.saturating_add(FUTURE_SKEW)
         {
@@ -103,7 +103,7 @@ impl RouteHint {
     }
 }
 
-pub(crate) fn now() -> io::Result<u64> {
+pub fn now() -> io::Result<u64> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(io::Error::other)?

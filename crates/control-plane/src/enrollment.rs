@@ -8,7 +8,10 @@ use axum::{
     routing::{get, post},
 };
 use deadpool_postgres::Pool;
-use howl::enrollment::{Authority, AuthorityRecord, Designation, DeviceCertificate};
+use howl::{
+    enrollment::{Authority, AuthorityRecord, Designation, DeviceCertificate},
+    identity::PeerCertificate,
+};
 use serde::{Deserialize, Serialize};
 use tokio_postgres::Transaction;
 
@@ -286,4 +289,41 @@ impl DeviceMaterial {
         )
         .map_err(|_| Error::Unauthorized)
     }
+}
+
+pub(crate) async fn verify_peer_certificate(
+    tx: &Transaction<'_>,
+    device: &TrustedDevice,
+    peer: &PeerCertificate,
+) -> Result<[u8; 8]> {
+    let row = tx
+        .query_opt(
+            "SELECT d.records, p.github_id FROM howl_control.enrolled_devices d
+         JOIN howl_control.enrollment_pins p ON p.account_id = d.account_id
+            AND p.authority_head = d.authority_head AND p.designation_digest = d.designation_digest
+         WHERE d.account_id = $1 AND d.device_id = $2 AND d.signing_key = $3
+            AND p.authority_head = $4 AND p.designation_digest = $5",
+            &[
+                &&device.account_id[..],
+                &&device.device_id[..],
+                &&device.signing_key[..],
+                &&device.authority_head[..],
+                &&device.designation_digest[..],
+            ],
+        )
+        .await?
+        .ok_or(Error::Unauthorized)?;
+    let material: DeviceMaterial =
+        serde_json::from_value(row.get(0)).map_err(|_| Error::Internal)?;
+    let pin = EnrollmentPin {
+        github_id: row.get(1),
+        account_id: device.account_id,
+        authority_head: device.authority_head,
+        designation_digest: device.designation_digest,
+    };
+    let certificate = material.verify(&pin)?;
+    if !certificate.matches(peer) {
+        return Err(Error::Unauthorized);
+    }
+    Ok(certificate.sequence.to_be_bytes())
 }

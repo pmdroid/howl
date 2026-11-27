@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use tokio_postgres::Row;
 use zeroize::Zeroizing;
 
+mod discovery;
 mod enrollment;
 mod github;
 mod login;
@@ -86,6 +87,7 @@ impl ControlPlane {
         Router::new()
             .route("/healthz", get(health))
             .merge(enrollment::routes())
+            .merge(discovery::routes())
             .route("/v1/login/device", post(begin_login))
             .route("/v1/login/device/{id}/poll", post(poll_login))
             .route("/v1/auth/challenge", post(challenge))
@@ -106,6 +108,8 @@ pub async fn migrate(pool: &Pool) -> Result<()> {
     tx.batch_execute(include_str!("../migrations/001_auth.sql"))
         .await?;
     tx.batch_execute(include_str!("../migrations/002_enrollment.sql"))
+        .await?;
+    tx.batch_execute(include_str!("../migrations/004_discovery.sql"))
         .await?;
     tx.commit().await?;
     Ok(())

@@ -405,34 +405,14 @@ async fn device_login_rejects_replays_and_rotates_or_revokes_device_bound_creden
 #[ignore = "requires a disposable PostgreSQL instance with owner and runtime fixture roles"]
 async fn hosted_enrollment_requires_a_current_independent_pin_and_pairing_certificate() {
     use crate::{EnrollmentPin, pin_enrollment};
-    use howl::{
-        enrollment::{Authority, AuthorityRecord, Designation, Enroll, Floor, PairingTicket},
-        identity::LocalIdentity,
-    };
-    use std::{
-        fs,
-        io::Write,
-        os::unix::fs::{DirBuilderExt, OpenOptionsExt},
-    };
+    use howl::enrollment::{Authority, AuthorityRecord, Designation, Floor};
 
     let owner = pool("HOWL_TEST_CONTROL_DATABASE_OWNER");
     migrate(&owner).await.unwrap();
     let runtime = pool("HOWL_TEST_CONTROL_DATABASE_RUNTIME");
     let temp = tempfile::tempdir().unwrap();
     let device_path = temp.path().join("device");
-    fs::DirBuilder::new()
-        .mode(0o700)
-        .create(&device_path)
-        .unwrap();
-    fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(device_path.join("device-v1"))
-        .unwrap()
-        .write_all(&[&[1], &[20; 32][..], &[21; 32], &[22; 32], &[23; 32]].concat())
-        .unwrap();
-    let identity = LocalIdentity::load_or_create(&device_path).unwrap();
+    let identity = enrollment_identity(&device_path, [20, 21, 22, 23]);
     let device_key = SigningKey::from_bytes(&[21; 32]);
     let peer = identity.certificate();
     let root = SigningKey::from_bytes(&[24; 32]);
@@ -445,25 +425,13 @@ async fn hosted_enrollment_requires_a_current_independent_pin_and_pairing_certif
         .head()
         .unwrap();
     let designation = Designation::issue(head, 1, &root, &membership, &[]).unwrap();
-    let (ticket, offer) =
-        PairingTicket::create(&designation, &membership, &peer, peer.fingerprint(), 1, 100)
-            .unwrap();
-    let response = offer
-        .respond(&designation, &identity, ticket.invitation_secret(), 110)
-        .unwrap();
-    let certificate = ticket
-        .enroll(Enroll {
-            state: &temp.path().join("owner"),
-            designation: &designation,
-            signer: &membership,
-            peer: &peer,
-            offer: &offer,
-            response: &response,
-            now: 110,
-        })
-        .unwrap();
-    let material = json!({"authority":[hex::encode(genesis.as_bytes())],
-        "designation":hex::encode(designation.as_bytes()), "certificate":hex::encode(certificate.as_bytes())});
+    let material = enrollment_material(
+        &temp.path().join("owner"),
+        &identity,
+        &genesis,
+        &designation,
+        &membership,
+    );
     let encoded = serde_json::to_vec(&material).unwrap();
     let github_id = 7654321;
     let mut connection = runtime.get().await.unwrap();
@@ -623,6 +591,136 @@ async fn hosted_enrollment_requires_a_current_independent_pin_and_pairing_certif
         account
     );
 
+    let other_path = temp.path().join("other-device");
+    let other_identity = enrollment_identity(&other_path, [28, 27, 29, 30]);
+    let other_material = enrollment_material(
+        &temp.path().join("owner"),
+        &other_identity,
+        &genesis,
+        &designation,
+        &membership,
+    );
+    let other_material = serde_json::to_vec(&other_material).unwrap();
+    let proof = enrollment_proof(
+        &http,
+        &server.url,
+        &substitute,
+        &other_key,
+        "enrollment",
+        &other_material,
+    )
+    .await;
+    assert_eq!(
+        send(
+            proof.nonce,
+            proof.signature,
+            &substitute.access_token,
+            other_material
+        )
+        .await
+        .unwrap()
+        .status(),
+        StatusCode::NO_CONTENT
+    );
+
+    let discovery = format!("{}/v1/discovery/hints", server.url);
+    let issued = howl::discovery::now().unwrap();
+    let latest = signed_hint(&peer, &device_key, issued, 4101);
+    let stale = signed_hint(&peer, &device_key, issued - 1, 4100);
+    let conflict = signed_hint(&peer, &device_key, issued, 4102);
+    let published = send_hint(
+        &http,
+        &server.url,
+        &credentials,
+        &device_key,
+        &peer,
+        &latest,
+    )
+    .await;
+    assert_eq!(published, StatusCode::NO_CONTENT);
+    assert_eq!(
+        send_hint(
+            &http,
+            &server.url,
+            &credentials,
+            &device_key,
+            &peer,
+            &latest
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    for rejected in [&stale, &conflict] {
+        assert_eq!(
+            send_hint(
+                &http,
+                &server.url,
+                &credentials,
+                &device_key,
+                &peer,
+                rejected
+            )
+            .await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    let mut tampered = latest;
+    tampered[99] ^= 1;
+    assert_eq!(
+        send_hint(
+            &http,
+            &server.url,
+            &credentials,
+            &device_key,
+            &peer,
+            &tampered
+        )
+        .await,
+        StatusCode::BAD_REQUEST
+    );
+    let lookup = format!("{discovery}/{}", credentials.session.device_id);
+    let proof = enrollment_proof(
+        &http,
+        &server.url,
+        &substitute,
+        &other_key,
+        "discovery-read",
+        peer.device_id(),
+    )
+    .await;
+    let returned = http
+        .get(&lookup)
+        .bearer_auth(&substitute.access_token)
+        .header("howl-nonce", &proof.nonce)
+        .header("howl-signature", &proof.signature)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(returned.status(), StatusCode::OK);
+    assert_eq!(
+        returned.headers()["content-type"],
+        "application/octet-stream"
+    );
+    assert_eq!(&returned.bytes().await.unwrap()[..], &latest);
+    let wrong = enrollment_proof(
+        &http,
+        &server.url,
+        &credentials,
+        &device_key,
+        "discovery-read",
+        &[128; 32],
+    )
+    .await;
+    let mismatched = http
+        .get(&lookup)
+        .bearer_auth(&credentials.access_token)
+        .header("howl-nonce", wrong.nonce)
+        .header("howl-signature", wrong.signature)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(mismatched.status(), StatusCode::UNAUTHORIZED);
+
     let updated = Designation::issue(
         head,
         2,
@@ -658,6 +756,24 @@ async fn hosted_enrollment_requires_a_current_independent_pin_and_pairing_certif
             .await
             .is_err()
     );
+    let proof = enrollment_proof(
+        &http,
+        &server.url,
+        &credentials,
+        &device_key,
+        "discovery-read",
+        peer.device_id(),
+    )
+    .await;
+    let denied = http
+        .get(&lookup)
+        .bearer_auth(&credentials.access_token)
+        .header("howl-nonce", proof.nonce)
+        .header("howl-signature", proof.signature)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
     let old = enrollment_proof(
         &http,
         &server.url,
@@ -697,4 +813,96 @@ async fn enrollment_proof(
         nonce,
         signature: hex::encode(key.sign(&bytes).to_bytes()),
     }
+}
+
+fn signed_hint(
+    peer: &howl::identity::PeerCertificate,
+    key: &SigningKey,
+    issued: u64,
+    port: u16,
+) -> [u8; howl::discovery::HINT_LEN] {
+    let mut record = [0; howl::discovery::HINT_LEN];
+    record[0] = 1;
+    record[1..33].copy_from_slice(peer.device_id());
+    record[33..65].copy_from_slice(&peer.fingerprint());
+    record[65..73].copy_from_slice(&issued.to_be_bytes());
+    record[73..81].copy_from_slice(&(issued + 60_000).to_be_bytes());
+    record[81..86].copy_from_slice(&[4, 192, 0, 2, 1]);
+    record[98..100].copy_from_slice(&port.to_be_bytes());
+    let signed = [b"howl/peer-address/v1\0".as_slice(), &record[..100]].concat();
+    record[100..].copy_from_slice(&key.sign(&signed).to_bytes());
+    record
+}
+
+async fn send_hint(
+    http: &Client,
+    url: &str,
+    credentials: &crate::Credentials,
+    key: &SigningKey,
+    peer: &howl::identity::PeerCertificate,
+    hint: &[u8],
+) -> StatusCode {
+    let bytes = [peer.as_bytes().as_slice(), hint].concat();
+    let proof = enrollment_proof(http, url, credentials, key, "discovery-write", &bytes).await;
+    http.post(format!("{url}/v1/discovery/hints"))
+        .bearer_auth(&credentials.access_token)
+        .header("howl-nonce", proof.nonce)
+        .header("howl-signature", proof.signature)
+        .body(bytes)
+        .send()
+        .await
+        .unwrap()
+        .status()
+}
+
+fn enrollment_identity(path: &std::path::Path, material: [u8; 4]) -> howl::identity::LocalIdentity {
+    use std::{
+        fs,
+        io::Write,
+        os::unix::fs::{DirBuilderExt, OpenOptionsExt},
+    };
+    fs::DirBuilder::new().mode(0o700).create(path).unwrap();
+    let record = [
+        vec![1],
+        material.into_iter().flat_map(|byte| [byte; 32]).collect(),
+    ]
+    .concat();
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path.join("device-v1"))
+        .unwrap()
+        .write_all(&record)
+        .unwrap();
+    howl::identity::LocalIdentity::load_or_create(path).unwrap()
+}
+
+fn enrollment_material(
+    state: &std::path::Path,
+    identity: &howl::identity::LocalIdentity,
+    genesis: &howl::enrollment::AuthorityRecord,
+    designation: &howl::enrollment::Designation,
+    membership: &SigningKey,
+) -> Value {
+    use howl::enrollment::{Enroll, PairingTicket};
+    let peer = identity.certificate();
+    let (ticket, offer) =
+        PairingTicket::create(designation, membership, &peer, peer.fingerprint(), 1, 100).unwrap();
+    let response = offer
+        .respond(designation, identity, ticket.invitation_secret(), 110)
+        .unwrap();
+    let certificate = ticket
+        .enroll(Enroll {
+            state,
+            designation,
+            signer: membership,
+            peer: &peer,
+            offer: &offer,
+            response: &response,
+            now: 110,
+        })
+        .unwrap();
+    json!({"authority":[hex::encode(genesis.as_bytes())], "designation":hex::encode(designation.as_bytes()),
+        "certificate":hex::encode(certificate.as_bytes())})
 }

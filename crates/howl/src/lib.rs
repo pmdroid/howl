@@ -18,7 +18,7 @@ pub mod mailbox_client;
 pub mod node;
 
 pub mod delivery;
-mod discovery;
+pub mod discovery;
 pub mod observer;
 pub mod presence;
 
