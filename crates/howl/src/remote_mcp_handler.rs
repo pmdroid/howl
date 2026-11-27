@@ -10,8 +10,10 @@ use rmcp::{
     ErrorData, RoleServer, ServerHandler,
     handler::server::{router::tool::ToolRouter, tool::ToolCallContext, wrapper::Parameters},
     model::{
-        CallToolRequestParams, CallToolResponse, CallToolResult, Implementation, ListToolsResult,
+        CallToolRequestParams, CallToolResponse, CallToolResult, CancelTaskParams, GetTaskParams,
+        GetTaskResult, Implementation, InitializeRequestParams, InitializeResult, ListToolsResult,
         PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerConfig,
+        TASKS_EXTENSION_ID, UpdateTaskParams,
     },
     schemars::{self, JsonSchema},
     service::RequestContext,
@@ -22,11 +24,11 @@ use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
 use crate::{
-    delivery::{IntegrationRunState, NewIntegrationRun},
+    delivery::{IntegrationRun, IntegrationRunState, NewIntegrationRun},
     enrollment::ChannelPermission,
     interaction::LocalInteraction,
     node,
-    remote_mcp::{self, IntegrationPermission, authenticated},
+    remote_mcp::{self, IntegrationPermission, authenticated, tasks},
 };
 
 #[derive(Clone)]
@@ -232,7 +234,7 @@ impl GatewayTools {
         &self,
         context: RequestContext<RoleServer>,
         Parameters(args): Parameters<WakeArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
+    ) -> Result<CallToolResponse, ErrorData> {
         let channel = permitted(&context, &args.channel, IntegrationPermission::Wake)?;
         let principal = authenticated(&context)?.clone();
         let peer = parse_id(&args.peer)?;
@@ -247,7 +249,7 @@ impl GatewayTools {
             ));
         }
         let state = Arc::clone(&self.state);
-        tokio::spawn(async move {
+        let run = tokio::spawn(async move {
             let request = NewIntegrationRun {
                 owner: principal.id(),
                 key: &args.key,
@@ -269,13 +271,13 @@ impl GatewayTools {
                     .await
                     .map_err(from_io)?;
             }
-            let run = node::integration_run(&state, principal.id(), run.id)
+            node::integration_run(&state, principal.id(), run.id)
                 .map_err(from_io)?
-                .ok_or_else(run_unavailable)?;
-            Ok(CallToolResult::structured(run.summary()))
+                .ok_or_else(run_unavailable)
         })
         .await
-        .map_err(|_| ErrorData::internal_error("Howl operation interrupted", None))?
+        .map_err(|_| ErrorData::internal_error("Howl operation interrupted", None))??;
+        Ok(tasks::call_response(&run, &context))
     }
 
     #[tool(
@@ -332,7 +334,7 @@ impl GatewayTools {
             if permission == IntegrationPermission::Cancel {
                 let run = node::cancel_integration_run(&state, &owner, id)?
                     .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
-                return Ok(run.summary());
+                return Ok(run_summary(&run));
             }
             Ok(run.value())
         })
@@ -350,17 +352,107 @@ impl GatewayTools {
             .map(CallToolResult::structured)
             .map_err(from_io)
     }
+
+    async fn task_operation(
+        &self,
+        context: &RequestContext<RoleServer>,
+        task_id: &str,
+        permission: IntegrationPermission,
+    ) -> Result<IntegrationRun, ErrorData> {
+        if !tasks::is_native_protocol(context) {
+            return Err(ErrorData::invalid_request(
+                "native tasks require MCP 2026-07-28",
+                None,
+            ));
+        }
+        let id = parse_id(task_id)?;
+        let principal = authenticated(context)?.clone();
+        let state = Arc::clone(&self.state);
+        tokio::task::spawn_blocking(move || {
+            let run = node::integration_run(&state, principal.id(), id)
+                .map_err(from_io)?
+                .filter(|run| principal.permits(&run.channel, permission))
+                .ok_or_else(run_unavailable)?;
+            LocalInteraction::new(&state)
+                .authorize(run.channel, ChannelPermission::Receive)
+                .map_err(|_| run_unavailable())?;
+            if permission == IntegrationPermission::Cancel {
+                node::cancel_integration_run(&state, principal.id(), id)
+                    .map_err(from_io)?
+                    .ok_or_else(run_unavailable)
+            } else {
+                Ok(run)
+            }
+        })
+        .await
+        .map_err(|_| ErrorData::internal_error("Howl operation interrupted", None))?
+    }
 }
 
 #[tool_handler(router = self.tools)]
 impl ServerHandler for GatewayTools {
     fn get_info(&self) -> ServerConfig {
-        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new("howl", env!("CARGO_PKG_VERSION")))
+        ServerConfig::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_tasks()
+                .build(),
+        )
+        .with_server_info(Implementation::new("howl", env!("CARGO_PKG_VERSION")))
+    }
+
+    async fn initialize(
+        &self,
+        request: InitializeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<InitializeResult, ErrorData> {
+        context.peer.set_peer_info(request.clone());
+        let mut result = self.negotiate_initialize(&request)?;
+        if let Some(extensions) = &mut result.capabilities.extensions {
+            extensions.remove(TASKS_EXTENSION_ID);
+            if extensions.is_empty() {
+                result.capabilities.extensions = None;
+            }
+        }
+        Ok(result)
     }
 
     fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
         Cow::Borrowed(&[ProtocolVersion::V_2025_11_25, ProtocolVersion::V_2026_07_28])
+    }
+
+    async fn get_task(
+        &self,
+        request: GetTaskParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<GetTaskResult, ErrorData> {
+        let run = self
+            .task_operation(&context, &request.task_id, IntegrationPermission::Read)
+            .await?;
+        Ok(GetTaskResult::new(tasks::get_task(&run)?))
+    }
+
+    async fn cancel_task(
+        &self,
+        request: CancelTaskParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<(), ErrorData> {
+        self.task_operation(&context, &request.task_id, IntegrationPermission::Cancel)
+            .await?;
+        Ok(())
+    }
+
+    async fn update_task(
+        &self,
+        request: UpdateTaskParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<(), ErrorData> {
+        self.task_operation(&context, &request.task_id, IntegrationPermission::Read)
+            .await?;
+        Err(ErrorData::invalid_params(
+            "task has no pending client inputs",
+            None,
+        ))
     }
 
     async fn list_tools(
@@ -455,6 +547,14 @@ fn parse_id(value: &str) -> Result<Id, ErrorData> {
     hex::decode_to_slice(value, &mut id)
         .map_err(|_| ErrorData::invalid_params("invalid Howl identifier", None))?;
     Ok(id)
+}
+
+fn run_summary(run: &IntegrationRun) -> Value {
+    let mut summary = run.value();
+    if let Value::Object(properties) = &mut summary {
+        properties.remove("reply");
+    }
+    summary
 }
 
 fn run_unavailable() -> ErrorData {
