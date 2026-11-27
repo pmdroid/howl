@@ -245,6 +245,10 @@ impl DeliveryStore {
 
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute_batch(include_str!("delivery.sql"))?;
+        let schema: u32 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if schema == 0 {
+            tx.execute_batch(include_str!("delivery/channel_posts.sql"))?;
+        }
         tx.execute_batch(include_str!("delivery/integration_runs.sql"))?;
         tx.execute_batch(include_str!("presence.sql"))?;
         tx.execute_batch(include_str!("delivery/budget.sql"))?;
@@ -388,7 +392,7 @@ impl DeliveryStore {
         &mut self,
         frame: Frame,
         bytes: &[u8],
-        recipient: Device,
+        recipients: &[Device],
         body: Body<&str>,
         now: u64,
         attribution: IntegrationDelivery,
@@ -396,7 +400,7 @@ impl DeliveryStore {
         self.enqueue_frames(
             frame,
             bytes,
-            &[recipient],
+            recipients,
             EnqueueTime::Integration(now, attribution),
             None,
             Some(body),
@@ -572,7 +576,8 @@ impl DeliveryStore {
         if changed != 0
             && let Some(body) = body
         {
-            let cursor = messages::record_outbound(&tx, row, recipients[0], now, body)?;
+            let recipient = (recipients.len() == 1).then_some(recipients[0]);
+            let cursor = messages::record_outbound(&tx, row, recipient, now, body)?;
             if let Some(integration) = integration {
                 messages::record_integration(&tx, cursor, integration.actor)?;
             }

@@ -175,7 +175,7 @@ impl DeliveryStore {
 pub(super) fn record_outbound(
     connection: &Connection,
     envelope: i64,
-    recipient: Device,
+    recipient: Option<Device>,
     now: u64,
     body: Body<&str>,
 ) -> Result<i64> {
@@ -196,7 +196,7 @@ pub(super) fn record_outbound(
     }
     connection.execute(
         "INSERT INTO channel_event_addresses (cursor, outbound, recipient) VALUES (?1, 1, ?2)",
-        params![cursor, recipient.encode()],
+        params![cursor, recipient.map(Device::encode)],
     )?;
     Ok(cursor)
 }

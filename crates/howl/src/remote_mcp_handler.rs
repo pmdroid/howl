@@ -54,6 +54,13 @@ struct ReadArgs {
 #[serde(deny_unknown_fields)]
 struct PostArgs {
     channel: String,
+    text: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct DirectArgs {
+    channel: String,
     peer: String,
     text: String,
 }
@@ -153,7 +160,7 @@ impl GatewayTools {
     }
 
     #[tool(
-        description = "Queue signed chat addressed to a pinned member of a granted channel",
+        description = "Post one signed message to all current recipients of a granted channel",
         annotations(
             read_only_hint = false,
             idempotent_hint = false,
@@ -166,7 +173,8 @@ impl GatewayTools {
         context: RequestContext<RoleServer>,
         Parameters(args): Parameters<PostArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.send_post(&context, args).await
+        self.send_post(&context, &args.channel, None, &args.text)
+            .await
     }
 
     #[tool(
@@ -181,20 +189,27 @@ impl GatewayTools {
     async fn dm(
         &self,
         context: RequestContext<RoleServer>,
-        Parameters(args): Parameters<PostArgs>,
+        Parameters(args): Parameters<DirectArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.send_post(&context, args).await
+        self.send_post(
+            &context,
+            &args.channel,
+            Some(parse_id(&args.peer)?),
+            &args.text,
+        )
+        .await
     }
 
     async fn send_post(
         &self,
         context: &RequestContext<RoleServer>,
-        args: PostArgs,
+        channel: &str,
+        peer: Option<Id>,
+        text: &str,
     ) -> Result<CallToolResult, ErrorData> {
-        let channel = permitted(context, &args.channel, IntegrationPermission::Send)?;
-        let peer = parse_id(&args.peer)?;
+        let channel = permitted(context, channel, IntegrationPermission::Send)?;
         let owner = authenticated(context)?.id();
-        let receipt = node::send_integration_chat(&self.state, channel, peer, owner, &args.text)
+        let receipt = node::send_integration_chat(&self.state, channel, peer, owner, text)
             .await
             .map_err(from_io)?;
         let message = receipt
