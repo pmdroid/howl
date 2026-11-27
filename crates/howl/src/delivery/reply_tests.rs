@@ -50,18 +50,24 @@ fn only_the_linked_running_wake_can_publish_and_finish_in_one_transaction() {
         device: [13; 32],
     };
     assert!(matches!(
-        store.accept_network_wake(frame(other, 12, 30), b"wrong sender", payload, 10, &signer),
+        store.accept_network_wake(
+            frame(other, 12, 30),
+            b"wrong sender",
+            payload,
+            || Ok(10),
+            &signer
+        ),
         Err(Error::WakeGrant)
     ));
     assert!(
         store
-            .accept_network_wake(wake, b"signed wake", payload, 10, &signer)
+            .accept_network_wake(wake, b"signed wake", payload, || Ok(10), &signer)
             .unwrap()
             .inserted
     );
     assert!(
         !store
-            .accept_network_wake(wake, b"signed wake", payload, 10, &signer)
+            .accept_network_wake(wake, b"signed wake", payload, || Ok(10), &signer)
             .unwrap()
             .inserted
     );
@@ -169,7 +175,7 @@ fn only_the_linked_running_wake_can_publish_and_finish_in_one_transaction() {
         ..frame(PEER, 17, 40)
     };
     store
-        .accept_network_wake(next, b"next signed wake", payload, 11, &signer)
+        .accept_network_wake(next, b"next signed wake", payload, || Ok(11), &signer)
         .unwrap();
     let claim = store.claim_wake(CHANNEL, agent, 11).unwrap().unwrap();
     let approval = WakeApproval {
@@ -222,5 +228,66 @@ fn only_the_linked_running_wake_can_publish_and_finish_in_one_transaction() {
             .delivery_status(outgoing.stream, outgoing.message)
             .unwrap()
             .is_empty()
+    );
+}
+
+#[test]
+fn network_wakes_recheck_expiry_under_the_inbox_write_lock_before_acknowledging() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("delivery.db");
+    let key = [9; 32];
+    let mut receiver = DeliveryStore::open(&path, &key, LOCAL).unwrap();
+    let probe = DeliveryStore::open(&path, &key, LOCAL).unwrap();
+    probe.connection.busy_timeout(Duration::ZERO).unwrap();
+    let signer = SigningKey::from_bytes(&[10; 32]);
+    let target = AgentRole::Reviewer.agent_id(&LOCAL.device);
+    let payload = Payload::Wake {
+        target,
+        text: "review",
+    };
+    receiver.set_epoch(CHANNEL, 1).unwrap();
+    receiver.establish_wake_time(10).unwrap();
+    receiver
+        .enable_network_wake_target(CHANNEL, PEER, target, 1)
+        .unwrap();
+    let existing = frame(PEER, 21, 30);
+    assert!(
+        receiver
+            .accept_network_wake(existing, b"existing wake", payload, || Ok(10), &signer)
+            .unwrap()
+            .inserted
+    );
+
+    let first_attempt = Frame {
+        sequence: 2,
+        ..frame(PEER, 22, 20)
+    };
+    let fresh = || {
+        let result = probe.connection.execute_batch("BEGIN IMMEDIATE");
+        assert_eq!(
+            result.unwrap_err().sqlite_error_code(),
+            Some(rusqlite::ErrorCode::DatabaseBusy)
+        );
+        Ok(20)
+    };
+    assert!(matches!(
+        receiver.accept_network_wake(first_attempt, b"first attempt", payload, fresh, &signer),
+        Err(Error::Expired)
+    ));
+    assert!(matches!(
+        receiver.accept_network_wake(first_attempt, b"first attempt", payload, || Ok(19), &signer),
+        Err(Error::WakeClock)
+    ));
+    assert!(matches!(
+        receiver.accept_network_wake(existing, b"existing wake", payload, || Ok(30), &signer),
+        Err(Error::Expired)
+    ));
+    assert_eq!(
+        receiver
+            .connection
+            .query_row("SELECT count(*) FROM wake_queue", [], |row| row
+                .get::<_, u32>(0))
+            .unwrap(),
+        1
     );
 }

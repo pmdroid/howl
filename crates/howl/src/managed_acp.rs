@@ -522,6 +522,15 @@ impl ManagedSession {
         self.request(Command::Close).await
     }
 
+    pub(crate) async fn wait_for_observer_stop(&self) -> Result<()> {
+        self.status
+            .clone()
+            .wait_for(|state| state.container.is_none())
+            .await
+            .map_err(|_| Error::Disconnected)?;
+        Ok(())
+    }
+
     async fn request<T>(
         &self,
         command: impl FnOnce(oneshot::Sender<Result<T>>) -> Command,

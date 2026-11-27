@@ -111,6 +111,11 @@ enum EnqueueTime<'a> {
     },
 }
 
+enum AdmissionTime<'a> {
+    Known(u64),
+    NetworkWake(&'a dyn Fn() -> io::Result<u64>),
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("delivery database failed")]
@@ -620,7 +625,13 @@ impl DeliveryStore {
         now: u64,
         local_signer: &SigningKey,
     ) -> Result<Receipt> {
-        self.accept_payload(frame, bytes, payload, now, local_signer, false)
+        self.accept_payload(
+            frame,
+            bytes,
+            payload,
+            AdmissionTime::Known(now),
+            local_signer,
+        )
     }
 
     pub(crate) fn accept_network_wake(
@@ -628,10 +639,16 @@ impl DeliveryStore {
         frame: Frame,
         bytes: &[u8],
         payload: Payload<'_>,
-        now: u64,
+        fresh_clock: impl Fn() -> io::Result<u64>,
         local_signer: &SigningKey,
     ) -> Result<Receipt> {
-        self.accept_payload(frame, bytes, payload, now, local_signer, true)
+        self.accept_payload(
+            frame,
+            bytes,
+            payload,
+            AdmissionTime::NetworkWake(&fresh_clock),
+            local_signer,
+        )
     }
 
     fn accept_payload(
@@ -639,9 +656,8 @@ impl DeliveryStore {
         frame: Frame,
         bytes: &[u8],
         payload: Payload<'_>,
-        now: u64,
+        time: AdmissionTime<'_>,
         local_signer: &SigningKey,
-        require_network_grant: bool,
     ) -> Result<Receipt> {
         frame.validate(bytes)?;
         let (kind, target, body, agent_reply) = match payload {
@@ -651,10 +667,6 @@ impl DeliveryStore {
                 (1, None, body, None)
             }
             Payload::Wake { target, text } if frame.expires_at != 0 && text.len() <= 65_504 => {
-                self.observe_wake_time(now)?;
-                if now < frame.created_at.saturating_sub(30) || now >= frame.expires_at {
-                    return Err(Error::Expired);
-                }
                 (2, Some(target), text, None)
             }
             Payload::AgentReply(reply)
@@ -667,32 +679,50 @@ impl DeliveryStore {
             }
             _ => return Err(Error::InvalidFrame),
         };
-        if require_network_grant && kind != 2 {
-            return Err(Error::InvalidFrame);
+        if kind == 2
+            && let AdmissionTime::Known(now) = time
+        {
+            self.observe_wake_time(now)?;
+            if expired_wake(frame, now) {
+                return Err(Error::Expired);
+            }
         }
 
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_epoch(&tx, frame)?;
-        if require_network_grant {
-            let target = target.ok_or(Error::WakeGrant)?;
-            if wake::grant_generation(&tx, frame.stream.channel, frame.stream.sender, target)?
-                .is_none()
-            {
-                return Err(Error::WakeGrant);
+        let now = match time {
+            AdmissionTime::Known(now) => {
+                if kind == 2 {
+                    let current: bool = tx.query_row(
+                        "SELECT wake_clock <= ?1 FROM store WHERE singleton = 1",
+                        [now.to_be_bytes()],
+                        |row| row.get(0),
+                    )?;
+                    if !current {
+                        return Err(Error::WakeClock);
+                    }
+                }
+                now
             }
-        }
-        if kind == 2 {
-            let current: bool = tx.query_row(
-                "SELECT wake_clock <= ?1 FROM store WHERE singleton = 1",
-                [now.to_be_bytes()],
-                |row| row.get(0),
-            )?;
-            if !current {
-                return Err(Error::WakeClock);
+            AdmissionTime::NetworkWake(clock) => {
+                let target = target.ok_or(Error::InvalidFrame)?;
+                let now = clock()?;
+                wake::record_wake_time(&tx, now)?;
+                if expired_wake(frame, now) {
+                    tx.commit()?;
+                    return Err(Error::Expired);
+                }
+                if wake::grant_generation(&tx, frame.stream.channel, frame.stream.sender, target)?
+                    .is_none()
+                {
+                    tx.commit()?;
+                    return Err(Error::WakeGrant);
+                }
+                now
             }
-        }
+        };
         let stream = frame.stream.encode();
         let sequence = frame.sequence.to_be_bytes();
         let digest: Id = Sha256::digest(bytes).into();
@@ -894,6 +924,10 @@ impl DeliveryStore {
         File::open(parent)?.sync_all()?;
         Ok(())
     }
+}
+
+fn expired_wake(frame: Frame, now: u64) -> bool {
+    now < frame.created_at.saturating_sub(30) || now >= frame.expires_at
 }
 
 fn approved_reply_cursor(
