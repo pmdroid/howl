@@ -2,6 +2,7 @@ mod budget;
 mod integration_runs;
 mod mailbox_outbox;
 mod messages;
+mod ongoing;
 #[cfg(test)]
 mod reply_tests;
 mod wake;
@@ -17,6 +18,10 @@ pub(crate) use integration_runs::{
 };
 pub(crate) use mailbox_outbox::MAILBOX_OUTBOX_BATCH;
 pub use messages::{ChannelEvent, ChannelMessage};
+pub(crate) use ongoing::{
+    Input as OngoingInput, Publication as OngoingPublication, Schedule as OngoingSchedule,
+    Thread as OngoingThread,
+};
 pub use wake::{WakeClaim, WakeJob, WakeState};
 pub(crate) use webhook_queue::{WebhookAttempt, WebhookEventKind, WebhookFilter, WebhookOutcome};
 
@@ -120,6 +125,7 @@ pub struct ApprovedAgentReply<Text> {
 enum EnqueueTime<'a> {
     Ordinary(u64),
     Integration(u64, IntegrationDelivery),
+    Conversation(u64, i64, AgentReply<&'a str>),
     Approved {
         approval: ApprovedAgentReply<&'a str>,
         clock: &'a dyn Fn() -> io::Result<u64>,
@@ -255,6 +261,7 @@ impl DeliveryStore {
             tx.execute_batch(include_str!("delivery/channel_posts.sql"))?;
         }
         tx.execute_batch(include_str!("delivery/integration_runs.sql"))?;
+        tx.execute_batch(include_str!("delivery/ongoing.sql"))?;
         tx.execute_batch(include_str!("presence.sql"))?;
         tx.execute_batch(include_str!("delivery/budget.sql"))?;
         tx.execute(
@@ -457,6 +464,25 @@ impl DeliveryStore {
         .map(|_| ())
     }
 
+    pub(crate) fn enqueue_ongoing_reply(
+        &mut self,
+        frame: Frame,
+        bytes: &[u8],
+        recipient: Device,
+        route: &str,
+        turn: i64,
+        reply: AgentReply<&str>,
+    ) -> Result<Id> {
+        self.enqueue_frames(
+            frame,
+            bytes,
+            &[recipient],
+            EnqueueTime::Conversation(frame.created_at, turn, reply),
+            Some(route),
+            Some(Body::AgentReply(reply)),
+        )
+    }
+
     fn enqueue_frames(
         &mut self,
         frame: Frame,
@@ -489,8 +515,15 @@ impl DeliveryStore {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_epoch(&tx, frame)?;
-        let (now, approved, integration) = match time {
-            EnqueueTime::Ordinary(now) => (now, None, None),
+        let (now, approved, integration, ongoing) = match time {
+            EnqueueTime::Ordinary(now) => (now, None, None, None),
+            EnqueueTime::Conversation(now, turn, reply) => {
+                if let Some(message) = ongoing::publication(&tx, frame, recipients[0], turn, reply)?
+                {
+                    return Ok(message);
+                }
+                (now, None, None, Some(turn))
+            }
             EnqueueTime::Integration(now, attribution) => {
                 if let Some(dispatch) = attribution.dispatch
                     && let (_, Some(message)) =
@@ -498,12 +531,12 @@ impl DeliveryStore {
                 {
                     return Ok(message);
                 }
-                (now, None, Some(attribution))
+                (now, None, Some(attribution), None)
             }
             EnqueueTime::Approved { approval, clock } => {
                 let now = clock()?;
                 wake::record_wake_time(&tx, now)?;
-                (now, Some(approval), None)
+                (now, Some(approval), None, None)
             }
         };
         let reply_cursor = match approved {
@@ -617,6 +650,9 @@ impl DeliveryStore {
         }
         if let Some(dispatch) = integration.and_then(|attribution| attribution.dispatch) {
             integration_runs::link_dispatch(&tx, dispatch, frame, row, now)?;
+        }
+        if let Some(turn) = ongoing {
+            ongoing::publish(&tx, turn, frame.message)?;
         }
         tx.commit()?;
         Ok(frame.message)

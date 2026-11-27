@@ -533,13 +533,13 @@ async fn execute(
 }
 
 #[derive(Default)]
-struct ReplyBuffer {
+pub(crate) struct ReplyBuffer {
     v1: String,
     v2: Vec<(agent_client_protocol::v2::schema::MessageId, String)>,
 }
 
 impl ReplyBuffer {
-    fn receive(&mut self, event: Event) -> io::Result<()> {
+    pub(crate) fn receive(&mut self, event: Event) -> io::Result<()> {
         use agent_client_protocol::v2::schema as v2;
 
         match event {
@@ -593,7 +593,7 @@ impl ReplyBuffer {
         Ok(&mut self.v2[index].1)
     }
 
-    fn finish(self) -> io::Result<String> {
+    pub(crate) fn finish(self) -> io::Result<String> {
         let text = if self.v2.is_empty() {
             self.v1
         } else {

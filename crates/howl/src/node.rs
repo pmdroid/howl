@@ -634,6 +634,11 @@ enum IntegrationSource {
     Wake(IntegrationDispatch),
 }
 
+enum ReplyDispatch<'a> {
+    Wake(ApprovedAgentReply<&'a str>),
+    Conversation(i64),
+}
+
 fn integration_actor(gateway: &Id, owner: &str) -> Id {
     let mut hash = Sha256::new();
     hash.update(b"howl/integration-actor/v1\0");
@@ -663,7 +668,40 @@ pub fn queue_agent_reply(
         },
         Body::AgentReply(approved.reply),
         0,
-        Some(approved),
+        Some(ReplyDispatch::Wake(approved)),
+    )
+}
+
+pub(crate) fn queue_ongoing_reply(
+    state: &Path,
+    identity: &LocalIdentity,
+    delivery: &mut DeliveryStore,
+    thread: crate::delivery::OngoingThread,
+    route: &str,
+    publication: &crate::delivery::OngoingPublication,
+) -> io::Result<String> {
+    let role = howl_envelope::AgentRole::default();
+    let agent = role.agent_id(identity.certificate().device_id());
+    queue_frame(
+        state,
+        identity,
+        delivery,
+        Destination {
+            channel: thread.channel,
+            peer: Some(thread.peer.device),
+            route: parse_route(route.as_bytes())?,
+            integration: None,
+        },
+        Body::AgentReply(howl_envelope::AgentReply {
+            agent,
+            role,
+            in_reply_to: publication.source,
+            context_digest: Sha256::digest([thread.scope, publication.source].as_flattened())
+                .into(),
+            text: &publication.result,
+        }),
+        0,
+        Some(ReplyDispatch::Conversation(publication.id)),
     )
 }
 
@@ -674,7 +712,7 @@ fn queue_frame(
     destination: Destination,
     body: Body<&str>,
     lifetime: u16,
-    approved: Option<ApprovedAgentReply<&str>>,
+    approved: Option<ReplyDispatch<'_>>,
 ) -> io::Result<String> {
     let Destination {
         channel,
@@ -796,8 +834,17 @@ fn queue_frame(
     let route = route.map_or("-".to_owned(), |address| address.to_string());
     let target = devices[0];
     match approved {
-        Some(approved) => {
+        Some(ReplyDispatch::Wake(approved)) => {
             delivery.enqueue_agent_reply(outbound, &sealed, target, &route, unix_time, approved)
+        }
+        Some(ReplyDispatch::Conversation(turn)) => {
+            let Body::AgentReply(reply) = body else {
+                return Err(invalid("invalid conversation reply"));
+            };
+            let message = delivery
+                .enqueue_ongoing_reply(outbound, &sealed, target, &route, turn, reply)
+                .map_err(io::Error::other)?;
+            return Ok(format!("queued {}", hex::encode(message)));
         }
         None => {
             let visible = (!matches!(&body, Body::CancelWake { .. })).then_some(body);

@@ -37,6 +37,9 @@ async fn main() -> ExitCode {
             println!("howl {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
+        [group, action, state, driver, image] if group == "agent" && action == "serve" => {
+            serve_agent(Path::new(state), driver, image).await
+        }
         [group, action, state]
             if (group == "identity" && action == "show")
                 || (group == "mesh" && action == "init") =>
@@ -473,6 +476,17 @@ async fn run_workflow(args: &[OsString]) -> io::Result<()> {
         println!("Changes {}", path.display());
     }
     Ok(())
+}
+
+async fn serve_agent(state: &Path, driver: &OsStr, image: &OsStr) -> io::Result<()> {
+    let driver = required_text(driver)?.to_owned();
+    let image = required_text(image)?.to_owned();
+    let observer = ObserverProvider::connect(&configured_path("HOWL_OBSERVER_DOCKER_SOCKET")?)
+        .map_err(io::Error::other)?;
+    howl::ongoing::serve(state, observer, move || {
+        host_harness(&driver, image.clone())
+    })
+    .await
 }
 
 fn host_harness(driver: &str, image: String) -> io::Result<Harness> {
