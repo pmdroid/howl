@@ -324,6 +324,21 @@ impl StateDirectory {
         self.write_staged(filename, bytes, true).map(|_| ())
     }
 
+    pub(crate) fn lock(&self, filename: &str) -> io::Result<File> {
+        let lock = File::from(openat(
+            &self.handle,
+            filename,
+            OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::RUSR | Mode::WUSR,
+        )?);
+        check_private(&lock, &self.path.join(filename), false)?;
+        lock.try_lock().map_err(|error| match error {
+            std::fs::TryLockError::WouldBlock => io::ErrorKind::WouldBlock.into(),
+            std::fs::TryLockError::Error(error) => error,
+        })?;
+        Ok(lock)
+    }
+
     fn write_staged(&self, filename: &str, bytes: &[u8], replace: bool) -> io::Result<bool> {
         let mut nonce = [0; 16];
         getrandom::fill(&mut nonce).map_err(io::Error::other)?;

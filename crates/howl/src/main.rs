@@ -9,7 +9,7 @@ use std::{
 use howl::{
     HELP,
     channel::{Channel, MAX_MANIFEST_LEN},
-    discovery_client,
+    control_client, discovery_client,
     identity::{LocalIdentity, PeerCertificate, PeerTrust},
     managed_acp::{Harness, HostClaude, HostCodex, HostGrok},
     node,
@@ -111,6 +111,20 @@ async fn main() -> ExitCode {
         }
         [group, action, state] if group == "mesh" && action == "stop" => {
             node::stop(Path::new(state)).await
+        }
+        [group, command, state] if group == "control" && command == "login" => {
+            control_client::login(Path::new(state)).await
+        }
+        [group, command, state, authority, designation, certificate]
+            if group == "control" && command == "enroll" =>
+        {
+            control_client::enroll(
+                Path::new(state),
+                Path::new(authority),
+                Path::new(designation),
+                Path::new(certificate),
+            )
+            .await
         }
         [group, command @ ..] if group == "enrollment" => howl::enrollment::cli::run(command),
         [group, command @ ..] if group == "workflow" => workflow_command(command).await,
