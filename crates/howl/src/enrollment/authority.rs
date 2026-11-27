@@ -207,6 +207,10 @@ impl Authority {
         Ok(authority)
     }
 
+    pub fn account(&self) -> Id {
+        self.head.account
+    }
+
     pub fn head(&self) -> io::Result<AuthorityHead> {
         if self.forked {
             return Err(invalid("authority has a verified fork"));

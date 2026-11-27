@@ -109,6 +109,11 @@ impl Designation {
         Self::verify(bytes, authority.known_head(take(fields, 32))?)
     }
 
+    pub fn verify_current(&self, authority: &Authority) -> io::Result<()> {
+        Self::verify(&self.bytes, authority.head()?)?;
+        Ok(())
+    }
+
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes
     }

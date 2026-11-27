@@ -16,8 +16,8 @@ use tokio::{
 use crate::{
     channel::Channel,
     delivery::{
-        ApprovedAgentReply, BudgetLimits, DeliveryStore, WakeApproval, WakeClaim, WakeJob,
-        WakeOutcome,
+        ApprovedAgentReply, BudgetLimits, DeliveryStore, HumanAction, HumanCommand, WakeApproval,
+        WakeClaim, WakeJob, WakeOutcome,
     },
     identity::{LocalIdentity, PeerTrust, StateDirectory},
     managed_acp::{Event, Harness, ManagedSession},
@@ -64,9 +64,12 @@ pub fn agent_id(state: &Path, role: AgentRole) -> io::Result<Id> {
 pub fn claim(state: &Path, channel: Id, role: AgentRole) -> io::Result<Option<WakeJob>> {
     let _lock = WorkflowLock::acquire(state)?;
     let identity = LocalIdentity::load_or_create(state)?;
-    Channel::load(state, &identity, &channel)?;
+    let roster = Channel::load(state, &identity, &channel)?;
     let local = identity.certificate();
     let mut delivery = node::open_delivery(state, &StateDirectory::open(state)?, &local)?;
+    delivery
+        .set_epoch(channel, roster.epoch())
+        .map_err(io::Error::other)?;
     let Some(claim) = delivery
         .claim_wake(
             channel,
@@ -86,6 +89,35 @@ pub fn claim(state: &Path, channel: Id, role: AgentRole) -> io::Result<Option<Wa
     delivery
         .preview_claimed_wake(claim.execution)
         .map_err(io::Error::other)
+}
+
+pub(crate) fn pause(state: &Path, channel: Id, root: Id) -> io::Result<()> {
+    let identity = LocalIdentity::load_or_create(state)?;
+    Channel::load(state, &identity, &channel)?;
+    let local = identity.certificate();
+    let mut delivery = node::open_delivery(state, &StateDirectory::open(state)?, &local)?;
+    if !delivery
+        .has_workflow_root(channel, root)
+        .map_err(io::Error::other)?
+    {
+        return Err(not_found(
+            "conversation turn is unavailable in this channel",
+        ));
+    }
+    let mut nonce = [0; 32];
+    getrandom::fill(&mut nonce).map_err(io::Error::other)?;
+    let command = HumanCommand {
+        nonce,
+        expires_at: 0,
+        action: HumanAction::Pause { root },
+    };
+    let signature = identity.sign(&command.signing_bytes(node::device_for(state, &local)?));
+    delivery
+        .conversation_budget(BUDGET, identity.signing_key().verifying_key())
+        .map_err(io::Error::other)?
+        .apply_human(command, &signature, node::unix_time()?)
+        .map_err(io::Error::other)?;
+    Ok(())
 }
 
 pub fn recover(state: &Path) -> io::Result<usize> {
@@ -133,21 +165,31 @@ pub async fn run_turn(
     let _lock = WorkflowLock::acquire(request.state)?;
     let identity = LocalIdentity::load_or_create(request.state)?;
     let local = identity.certificate();
-    Channel::load(request.state, &identity, &request.channel)?;
+    let roster = Channel::load(request.state, &identity, &request.channel)?;
     let mut delivery =
         node::open_delivery(request.state, &StateDirectory::open(request.state)?, &local)?;
+    delivery
+        .set_epoch(request.channel, roster.epoch())
+        .map_err(io::Error::other)?;
     let preview = delivery
         .preview_claimed_wake(request.execution)
         .map_err(io::Error::other)?
         .ok_or_else(|| not_found("approved wake claim is unavailable"))?;
     let agent = request.role.agent_id(local.device_id());
-    if preview.claim.stream.channel != request.channel || preview.claim.target != agent {
+    if preview.claim.stream.channel != request.channel
+        || preview.claim.epoch != roster.epoch()
+        || preview.claim.target != agent
+        || !roster.allows(
+            &preview.claim.stream.sender.device,
+            crate::enrollment::ChannelPermission::Wake,
+        )
+    {
         return Err(denied(
             "wake claim does not match this channel and agent role",
         ));
     }
     let peer = PeerTrust::open(request.state)?.pinned(&preview.claim.stream.sender.device)?;
-    if node::device(&peer) != preview.claim.stream.sender {
+    if node::device_for(request.state, &peer)? != preview.claim.stream.sender {
         return Err(denied("wake sender is no longer the pinned peer"));
     }
     validate_grant(&delivery, &preview.claim)?;
@@ -162,7 +204,8 @@ pub async fn run_turn(
         agent,
         cause: request.cause,
     };
-    let signature = identity.sign(&approval.signing_bytes(node::device(&local)));
+    let signature =
+        identity.sign(&approval.signing_bytes(node::device_for(request.state, &local)?));
     let approved = delivery
         .conversation_budget(BUDGET, identity.signing_key().verifying_key())
         .map_err(io::Error::other)?
@@ -174,6 +217,7 @@ pub async fn run_turn(
     let mut control = TurnControl {
         delivery: &mut delivery,
         identity: &identity,
+        state: request.state,
         claim: &approved.job.claim,
         turn,
     };
@@ -298,12 +342,22 @@ fn approved_prompt(
 struct TurnControl<'a> {
     delivery: &'a mut DeliveryStore,
     identity: &'a LocalIdentity,
+    state: &'a Path,
     claim: &'a WakeClaim,
     turn: Id,
 }
 
 impl TurnControl<'_> {
     fn check(&mut self) -> io::Result<()> {
+        let roster = Channel::load(self.state, self.identity, &self.claim.stream.channel)?;
+        if self.claim.epoch != roster.epoch()
+            || !roster.allows(
+                &self.claim.stream.sender.device,
+                crate::enrollment::ChannelPermission::Wake,
+            )
+        {
+            return Err(denied("wake sender has no current channel permission"));
+        }
         validate_grant(self.delivery, self.claim)?;
         let now = node::unix_time()?;
         if now >= self.claim.expires_at {
@@ -532,5 +586,89 @@ impl WorkflowLock {
 impl Drop for WorkflowLock {
     fn drop(&mut self) {
         let _ = flock(&self.0, FlockOperation::Unlock);
+    }
+}
+
+#[cfg(test)]
+mod pause_tests {
+    use super::*;
+    use crate::delivery::{BudgetError, BudgetLimit, Frame, Payload, Stream};
+
+    #[test]
+    fn signed_pause_only_controls_a_root_linked_to_the_requested_channel() {
+        let root = tempfile::tempdir().unwrap();
+        let state = root.path().join("node");
+        let identity = LocalIdentity::load_or_create(&state).unwrap();
+        let local = identity.certificate();
+        let channel = *Channel::create(&state, &identity, &[]).unwrap().id();
+        let other = *Channel::create(&state, &identity, &[]).unwrap().id();
+        let peer = LocalIdentity::load_or_create(&root.path().join("peer"))
+            .unwrap()
+            .certificate();
+        let sender = node::device_for(&state, &peer).unwrap();
+        let agent = AgentRole::Reviewer.agent_id(local.device_id());
+        let mut delivery =
+            node::open_delivery(&state, &StateDirectory::open(&state).unwrap(), &local).unwrap();
+        let now = node::unix_time().unwrap();
+        delivery.set_epoch(channel, 1).unwrap();
+        delivery.establish_wake_time(now).unwrap();
+        delivery
+            .enable_network_wake_target(channel, sender, agent, 1)
+            .unwrap();
+        let frame = Frame {
+            stream: Stream {
+                channel,
+                sender,
+                signing_key: [7; 32],
+            },
+            message: [8; 32],
+            sequence: 1,
+            epoch: 1,
+            created_at: now,
+            expires_at: now + 300,
+        };
+        delivery
+            .accept_network_wake(
+                frame,
+                b"verified wake fixture",
+                Payload::Wake {
+                    target: agent,
+                    text: "Review the draft",
+                },
+                || Ok(now),
+                identity.signing_key(),
+            )
+            .unwrap();
+        let claim = delivery.claim_wake(channel, agent, now).unwrap().unwrap();
+        let approval = WakeApproval {
+            nonce: [9; 32],
+            expires_at: now + 30,
+            claim: &claim,
+            agent,
+            cause: None,
+        };
+        let turn = delivery
+            .conversation_budget(BUDGET, identity.signing_key().verifying_key())
+            .unwrap()
+            .start_approved_wake(
+                approval,
+                &identity.sign(&approval.signing_bytes(node::device_for(&state, &local).unwrap())),
+                || Ok(now),
+                |_, _| true,
+            )
+            .unwrap()
+            .turn;
+        assert_eq!(
+            pause(&state, other, turn.root).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        pause(&state, channel, turn.root).unwrap();
+        assert!(matches!(
+            delivery
+                .conversation_budget(BUDGET, identity.signing_key().verifying_key())
+                .unwrap()
+                .may_run(turn.id, node::unix_time().unwrap()),
+            Err(BudgetError::Limit(BudgetLimit::Paused))
+        ));
     }
 }

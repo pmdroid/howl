@@ -13,6 +13,7 @@ use howl::{
     managed_acp::{Harness, HostClaude, HostCodex, HostGrok},
     node,
     observer::{ObserverProvider, Snapshot},
+    web,
     workflow::{self, RunTurn},
 };
 use howl_envelope::AgentRole;
@@ -94,6 +95,7 @@ async fn main() -> ExitCode {
         }
         [group, command @ ..] if group == "enrollment" => howl::enrollment::cli::run(command),
         [group, command @ ..] if group == "workflow" => workflow_command(command).await,
+        [group, command @ ..] if group == "roster" => howl::enrollment::roster_cli::run(command),
         [command, state, channel, peer, route] if command == "send" => {
             let (Ok(channel), Ok(peer), Some(route)) =
                 (parse_id(channel), parse_id(peer), route.to_str())
@@ -110,6 +112,16 @@ async fn main() -> ExitCode {
                     .map(|receipt| println!("{receipt}")),
                 Err(error) => Err(error),
             }
+        }
+        [command, state, port @ ..] if command == "web" && port.len() <= 1 => {
+            let port = match port.first() {
+                Some(value) => match value.to_str().and_then(|text| text.parse::<u16>().ok()) {
+                    Some(port) => port,
+                    None => return invalid_arguments(),
+                },
+                None => 0,
+            };
+            web::run(Path::new(state), port).await
         }
         [command, state, channel] if command == "read" => {
             parse_id(channel).and_then(|channel| node::read(Path::new(state), channel))
