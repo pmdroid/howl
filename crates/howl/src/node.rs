@@ -209,6 +209,14 @@ pub async fn send(
     request_message(state, channel, recipient, route, b'S', message.as_bytes()).await
 }
 
+pub(crate) async fn send_channel(state: &Path, channel: Id, text: &str) -> io::Result<String> {
+    StateDirectory::open(state)?;
+    if text.is_empty() || text.len() > CHAT_LIMIT {
+        return Err(invalid("invalid chat length"));
+    }
+    request_message(state, channel, [0; 32], "-", b'C', text.as_bytes()).await
+}
+
 pub(crate) async fn request_peer_cancel(
     state: &Path,
     channel: Id,
@@ -455,7 +463,7 @@ fn queue(
     if matches!(*command, b'I' | b'P' | b'T') && route.is_some() {
         return Err(invalid("integration operations require a signed route"));
     }
-    let post = *command == b'P';
+    let post = matches!(*command, b'C' | b'P');
     if post && (*peer != [0; 32] || route.is_some()) {
         return Err(invalid(
             "channel posts use the current signed recipients and routes",
@@ -476,7 +484,7 @@ fn queue(
         integration: None,
     };
     match command {
-        b'S' | b'I' | b'P' => {
+        b'S' | b'I' | b'C' | b'P' => {
             let (integration, body) = if matches!(*command, b'I' | b'P') {
                 let ([length], body) = body
                     .split_first_chunk()
@@ -786,6 +794,12 @@ fn queue_frame(
             .enqueue_integration(outbound, &sealed, &devices, body, now, attribution)
             .map_err(integration_error)?;
         return Ok(format!("queued {}", hex::encode(message)));
+    }
+    if peer.is_none() {
+        delivery
+            .enqueue_channel_message(outbound, &sealed, &devices, body, now)
+            .map_err(io::Error::other)?;
+        return Ok(format!("queued {}", hex::encode(metadata.message_id)));
     }
     let route = route.map_or("-".to_owned(), |address| address.to_string());
     let target = devices[0];
