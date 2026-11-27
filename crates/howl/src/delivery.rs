@@ -1,5 +1,7 @@
 mod budget;
 mod messages;
+#[cfg(test)]
+mod reply_tests;
 mod wake;
 pub use budget::{
     ApprovedWake, BudgetError, BudgetLimit, BudgetLimits, ConversationBudget, HumanAction,
@@ -99,6 +101,14 @@ pub enum Payload<'a> {
 pub struct ApprovedAgentReply<Text> {
     pub execution: Id,
     pub reply: AgentReply<Text>,
+}
+
+enum EnqueueTime<'a> {
+    Ordinary(u64),
+    Approved {
+        approval: ApprovedAgentReply<&'a str>,
+        clock: &'a dyn Fn() -> io::Result<u64>,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -290,7 +300,7 @@ impl DeliveryStore {
         recipients: &[Device],
         now: u64,
     ) -> Result<()> {
-        self.enqueue_frames(frame, bytes, recipients, now, None, None)
+        self.enqueue_frames(frame, bytes, recipients, EnqueueTime::Ordinary(now), None)
     }
 
     pub fn enqueue_routed(
@@ -304,7 +314,13 @@ impl DeliveryStore {
         if route.is_empty() || route.len() > 64 {
             return Err(Error::InvalidFrame);
         }
-        self.enqueue_frames(frame, bytes, &[recipient], now, Some(route), None)
+        self.enqueue_frames(
+            frame,
+            bytes,
+            &[recipient],
+            EnqueueTime::Ordinary(now),
+            Some(route),
+        )
     }
 
     pub(crate) fn enqueue_agent_reply(
@@ -313,13 +329,22 @@ impl DeliveryStore {
         bytes: &[u8],
         recipient: Device,
         route: &str,
-        now: u64,
+        fresh_clock: impl Fn() -> io::Result<u64>,
         approved: ApprovedAgentReply<&str>,
     ) -> Result<()> {
-        if route.is_empty() || route.len() > 64 {
+        if route.is_empty() || route.len() > 64 || frame.expires_at != 0 {
             return Err(Error::InvalidFrame);
         }
-        self.enqueue_frames(frame, bytes, &[recipient], now, Some(route), Some(approved))
+        self.enqueue_frames(
+            frame,
+            bytes,
+            &[recipient],
+            EnqueueTime::Approved {
+                approval: approved,
+                clock: &fresh_clock,
+            },
+            Some(route),
+        )
     }
 
     fn enqueue_frames(
@@ -327,15 +352,17 @@ impl DeliveryStore {
         frame: Frame,
         bytes: &[u8],
         recipients: &[Device],
-        now: u64,
+        time: EnqueueTime<'_>,
         route: Option<&str>,
-        approved: Option<ApprovedAgentReply<&str>>,
     ) -> Result<()> {
         frame.validate(bytes)?;
         if frame.stream.sender != self.local {
             return Err(Error::Device);
         }
-        if frame.expires_at != 0 && now >= frame.expires_at {
+        if let EnqueueTime::Ordinary(now) = &time
+            && frame.expires_at != 0
+            && *now >= frame.expires_at
+        {
             return Err(Error::Expired);
         }
         if recipients.is_empty() || recipients.len() > 64 {
@@ -351,9 +378,26 @@ impl DeliveryStore {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_epoch(&tx, frame)?;
-        let reply_cursor = approved
-            .map(|approval| approved_reply_cursor(&tx, frame, recipients[0], approval, now))
-            .transpose()?;
+        let (now, approved) = match time {
+            EnqueueTime::Ordinary(now) => (now, None),
+            EnqueueTime::Approved { approval, clock } => {
+                let now = clock()?;
+                wake::record_wake_time(&tx, now)?;
+                (now, Some(approval))
+            }
+        };
+        let reply_cursor = match approved {
+            Some(approval) => match approved_reply_cursor(&tx, frame, recipients[0], approval, now)
+            {
+                Ok(cursor) => Some(cursor),
+                Err(Error::WakeGrant) => {
+                    tx.commit()?;
+                    return Err(Error::WakeGrant);
+                }
+                Err(error) => return Err(error),
+            },
+            None => None,
+        };
         let stream = frame.stream.encode();
         let sequence = frame.sequence.to_be_bytes();
         let reserved = tx
@@ -874,7 +918,8 @@ fn approved_reply_cursor(
                  AND i.message = ?3 AND i.target = ?4 AND i.epoch = ?5
                  AND i.kind = 2 AND w.state = 2 AND v.state = 1 AND v.agent = ?4
                  AND t.status = 1 AND r.paused = 0 AND i.expires > ?6 AND r.expires > ?6
-                 AND w.execution = ?7",
+                 AND w.execution = ?7
+                 AND (SELECT clock <= ?6 FROM budget_policy WHERE singleton = 1)",
             params![
                 frame.stream.channel,
                 recipient.encode(),
