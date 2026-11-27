@@ -20,3 +20,20 @@ For a live test, supply the provider keys through the host environment using `HO
 ```sh
 cargo test --locked -p howl --test managed_acp live_brokered_ -- --ignored --test-threads=1
 ```
+
+## Codex with a ChatGPT plan
+
+Use Node.js 24 or newer on the host. Sign in with ChatGPT once to authorize Howl. Choose an absolute directory outside the repository for the credential store.
+
+```sh
+export HOWL_CHATGPT_NODE=$(command -v node)
+export HOWL_CHATGPT_STORE="$HOME/.local/share/howl/chatgpt-auth"
+"$HOWL_CHATGPT_NODE" tools/chatgpt-auth/chatgpt-auth.mjs sign-in "$HOWL_CHATGPT_STORE"
+"$HOWL_CHATGPT_NODE" tools/chatgpt-auth/chatgpt-auth.mjs models "$HOWL_CHATGPT_STORE"
+```
+
+Set `HOWL_CODEX_MODEL` to a model from the returned list. Use the pinned Codex image and Docker socket from the previous steps, then run the subscription-backed smoke test.
+
+```sh
+cargo test --locked -p howl --test managed_acp live_chatgpt_plan_codex -- --ignored
+```

@@ -10,8 +10,8 @@ use agent_client_protocol::v1::schema::{
 };
 use howl::{
     managed_acp::{
-        Capabilities, Close, Error, Event, Harness, ManagedSession, PermissionDecision, Phase,
-        Restore,
+        Capabilities, ChatGptPlanAuth, Close, Error, Event, Harness, ManagedSession,
+        PermissionDecision, Phase, Restore,
     },
     observer::{ObserverProvider, Snapshot},
     provider_broker::Provider,
@@ -305,6 +305,27 @@ async fn live_brokered_codex() {
             &["/fixture/codex-wrapper.mjs", &model],
         )
         .with_provider(Provider::OpenAi, &model),
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned Codex image and ChatGPT plan consent"]
+async fn live_chatgpt_plan_codex() {
+    let model = std::env::var("HOWL_CODEX_MODEL").expect("set HOWL_CODEX_MODEL");
+    let host_node = std::env::var_os("HOWL_CHATGPT_NODE").expect("set HOWL_CHATGPT_NODE");
+    let store = std::env::var_os("HOWL_CHATGPT_STORE").expect("set HOWL_CHATGPT_STORE");
+    let helper =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools/chatgpt-auth/chatgpt-auth.mjs");
+    let auth = ChatGptPlanAuth::new(host_node.into(), helper, store.into()).unwrap();
+    provider_reply(
+        Harness::new(
+            "codex-chatgpt",
+            std::env::var("HOWL_CODEX_IMAGE").expect("set HOWL_CODEX_IMAGE"),
+            "/usr/local/bin/node",
+            &["/fixture/codex-wrapper.mjs", &model],
+        )
+        .with_chatgpt_plan(&model, auth),
     )
     .await;
 }

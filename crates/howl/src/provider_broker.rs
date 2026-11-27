@@ -26,20 +26,14 @@ const OUTPUT_TOKENS: u64 = 8192;
 pub enum Provider {
     OpenAi,
     XAi,
+    ChatGptPlan,
 }
 
 impl Provider {
     fn origin(self) -> &'static str {
         match self {
-            Self::OpenAi => "https://api.openai.com",
+            Self::OpenAi | Self::ChatGptPlan => "https://api.openai.com",
             Self::XAi => "https://api.x.ai",
-        }
-    }
-
-    fn keys(self) -> [&'static str; 2] {
-        match self {
-            Self::OpenAi => ["HOWL_OPENAI_API_KEY", "OPENAI_API_KEY"],
-            Self::XAi => ["HOWL_XAI_API_KEY", "XAI_API_KEY"],
         }
     }
 
@@ -47,7 +41,7 @@ impl Provider {
         matches!(
             (self, method, path),
             (_, "GET", "/v1/models")
-                | (Self::OpenAi, "POST", "/v1/responses")
+                | (Self::OpenAi | Self::ChatGptPlan, "POST", "/v1/responses")
                 | (Self::XAi, "POST", "/v1/chat/completions")
         )
     }
@@ -56,6 +50,7 @@ impl Provider {
         match self {
             Self::OpenAi => 1,
             Self::XAi => 2,
+            Self::ChatGptPlan => 3,
         }
     }
 }
@@ -64,7 +59,9 @@ impl Provider {
 pub enum Error {
     #[error("set {0} in the host environment to enable this provider")]
     MissingKey(&'static str),
-    #[error("invalid provider credential in host environment")]
+    #[error("sign in to ChatGPT from the host to use the ChatGPT plan")]
+    MissingPlan,
+    #[error("invalid host provider credential")]
     InvalidKey,
     #[error("invalid provider model")]
     Model,
@@ -86,29 +83,51 @@ pub(crate) struct Broker {
 
 impl Broker {
     pub(crate) fn from_environment(provider: Provider, model: &str) -> Result<Self, Error> {
+        let keys = match provider {
+            Provider::OpenAi => ["HOWL_OPENAI_API_KEY", "OPENAI_API_KEY"],
+            Provider::XAi => ["HOWL_XAI_API_KEY", "XAI_API_KEY"],
+            Provider::ChatGptPlan => return Err(Error::MissingPlan),
+        };
+        let key = keys
+            .iter()
+            .find_map(env::var_os)
+            .ok_or(Error::MissingKey(keys[0]))?;
+        let key = Zeroizing::new(key.into_string().map_err(|_| Error::InvalidKey)?);
+        Self::new(provider, model, key, 4096)
+    }
+
+    pub(crate) fn from_chatgpt_plan(model: &str, token: Zeroizing<String>) -> Result<Self, Error> {
+        Self::new(Provider::ChatGptPlan, model, token, 16 * 1024)
+    }
+
+    fn new(
+        provider: Provider,
+        model: &str,
+        key: Zeroizing<String>,
+        key_limit: usize,
+    ) -> Result<Self, Error> {
         if model.is_empty()
             || model.len() > 128
             || !model.bytes().all(|byte| byte.is_ascii_graphic())
         {
             return Err(Error::Model);
         }
-        let keys = provider.keys();
-        let key = keys
-            .iter()
-            .find_map(env::var_os)
-            .ok_or(Error::MissingKey(keys[0]))?;
-        let key = Zeroizing::new(key.into_string().map_err(|_| Error::InvalidKey)?);
-        if key.is_empty() || key.len() > 4096 || !key.bytes().all(|byte| byte.is_ascii_graphic()) {
+        if key.is_empty()
+            || key.len() > key_limit
+            || !key.bytes().all(|byte| byte.is_ascii_graphic())
+        {
             return Err(Error::InvalidKey);
         }
-        let client = Client::builder()
+        let mut client = Client::builder()
             .https_only(true)
             .no_proxy()
             .redirect(Policy::none())
             .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(120))
-            .build()
-            .map_err(|_| Error::Client)?;
+            .timeout(Duration::from_secs(120));
+        if provider == Provider::ChatGptPlan {
+            client = client.user_agent(concat!("Howl/", env!("CARGO_PKG_VERSION")));
+        }
+        let client = client.build().map_err(|_| Error::Client)?;
         Ok(Broker {
             provider,
             client,
@@ -313,6 +332,10 @@ fn allowed_payload(body: &str, model: &str, provider: Provider) -> Option<String
     }
     request.remove("service_tier");
     let output_field = match provider {
+        Provider::ChatGptPlan => {
+            normalize_plan_payload(&mut request)?;
+            return Some(serde_json::Value::Object(request).to_string());
+        }
         Provider::OpenAi => {
             request.insert("store".to_owned(), false.into());
             "max_output_tokens"
@@ -346,7 +369,7 @@ fn allowed_field(provider: Provider, field: &str) -> bool {
             | "top_p"
             | "service_tier"
     ) || match provider {
-        Provider::OpenAi => matches!(
+        Provider::OpenAi | Provider::ChatGptPlan => matches!(
             field,
             "input"
                 | "instructions"
@@ -379,6 +402,96 @@ fn allowed_field(provider: Provider, field: &str) -> bool {
                 | "top_logprobs"
                 | "user"
         ),
+    }
+}
+
+fn normalize_plan_payload(request: &mut serde_json::Map<String, serde_json::Value>) -> Option<()> {
+    use serde_json::{Value, json};
+
+    for field in [
+        "max_output_tokens",
+        "metadata",
+        "prompt_cache_retention",
+        "safety_identifier",
+        "temperature",
+        "top_p",
+        "truncation",
+    ] {
+        request.remove(field);
+    }
+    if request
+        .get("tool_choice")
+        .is_some_and(|choice| !allowed_plan_tool_choice(choice))
+    {
+        return None;
+    }
+    let tools = request.remove("tools");
+    let input = request.get_mut("input")?;
+    if let Value::String(text) = input {
+        *input = json!([{ "role": "user", "content": std::mem::take(text) }]);
+    }
+    let items = input.as_array_mut()?;
+    for item in items.iter_mut() {
+        let fields = item.as_object_mut()?;
+        match fields.get("type").and_then(Value::as_str) {
+            None | Some("message") => match fields.get("role").and_then(Value::as_str)? {
+                "developer" | "user" | "assistant" => {}
+                "system" => {
+                    fields.insert("role".to_owned(), "developer".into());
+                }
+                _ => return None,
+            },
+            Some("additional_tools") => {
+                if fields.get("role").and_then(Value::as_str) != Some("developer")
+                    || !fields
+                        .get("tools")
+                        .and_then(Value::as_array)
+                        .is_some_and(|tools| tools.iter().all(allowed_tool))
+                {
+                    return None;
+                }
+            }
+            Some(
+                "reasoning"
+                | "function_call"
+                | "function_call_output"
+                | "custom_tool_call"
+                | "custom_tool_call_output",
+            ) => {}
+            _ => return None,
+        }
+    }
+    if let Some(tools) = tools {
+        let Value::Array(tools) = tools else {
+            return None;
+        };
+        let (flat, namespaces): (Vec<_>, Vec<_>) = tools.into_iter().partition(is_local_tool);
+        if !flat.is_empty() {
+            items.insert(
+                0,
+                json!({"type": "additional_tools", "role": "developer", "tools": flat}),
+            );
+        }
+        if !namespaces.is_empty() {
+            request.insert("tools".to_owned(), Value::Array(namespaces));
+        }
+    }
+    request.insert("store".to_owned(), false.into());
+    request.insert("stream".to_owned(), true.into());
+    Some(())
+}
+
+fn allowed_plan_tool_choice(choice: &serde_json::Value) -> bool {
+    if let Some(mode) = choice.as_str() {
+        return matches!(mode, "auto" | "none" | "required");
+    }
+    match choice.get("type").and_then(serde_json::Value::as_str) {
+        Some("function" | "custom") => choice.get("name").is_some_and(serde_json::Value::is_string),
+        Some("allowed_tools") => choice
+            .get("tools")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|tools| tools.iter().all(is_local_tool)),
+        _ => false,
     }
 }
 
@@ -600,6 +713,88 @@ mod tests {
             .unwrap(),
             serde_json::json!({"max_output_tokens":8192,"model":"selected","store":false})
         );
+    }
+
+    #[test]
+    fn codex_plan_preserves_local_tools_and_uses_stateless_streaming() {
+        use serde_json::{Value, json};
+
+        let request = json!({
+            "model": "selected",
+            "stream": false,
+            "max_output_tokens": 30,
+            "temperature": 1,
+            "top_p": 1,
+            "service_tier": "priority",
+            "metadata": {"source": "fixture"},
+            "safety_identifier": "fixture",
+            "input": [
+                {"type": "message", "role": "system", "content": "fixture"},
+                {"role": "user", "content": "hello"},
+                {"type": "function_call_output", "call_id": "fixture", "output": "done"}
+            ],
+            "tools": [
+                {"type": "function", "name": "read"},
+                {"type": "namespace", "name": "repo", "tools": [{"type": "custom", "name": "read"}]}
+            ]
+        });
+        let outgoing = allowed_payload(&request.to_string(), "selected", Provider::ChatGptPlan);
+        assert_eq!(
+            serde_json::from_str::<Value>(&outgoing.unwrap()).unwrap(),
+            json!({
+                "model": "selected",
+                "store": false,
+                "stream": true,
+                "input": [
+                    {"type": "additional_tools", "role": "developer", "tools": [{"type": "function", "name": "read"}]},
+                    {"type": "message", "role": "developer", "content": "fixture"},
+                    {"role": "user", "content": "hello"},
+                    {"type": "function_call_output", "call_id": "fixture", "output": "done"}
+                ],
+                "tools": [{"type": "namespace", "name": "repo", "tools": [{"type": "custom", "name": "read"}]}]
+            })
+        );
+        let outgoing = allowed_payload(
+            r#"{"model":"selected","input":"hello"}"#,
+            "selected",
+            Provider::ChatGptPlan,
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&outgoing.unwrap()).unwrap()["input"],
+            json!([{"role": "user", "content": "hello"}])
+        );
+    }
+
+    #[test]
+    fn codex_plan_requires_explicit_host_oauth_and_denies_hosted_requests() {
+        assert!(matches!(
+            Broker::from_environment(Provider::ChatGptPlan, "selected"),
+            Err(Error::MissingPlan),
+        ));
+        let broker =
+            Broker::from_chatgpt_plan("selected", Zeroizing::new("a".repeat(16 * 1024))).unwrap();
+        assert_eq!(broker.origin, "https://api.openai.com");
+        assert!(broker.provider.allows("POST", "/v1/responses"));
+        assert!(!broker.provider.allows("POST", "/v1/chat/completions"));
+        assert!(matches!(
+            Broker::from_chatgpt_plan("selected", Zeroizing::new("invalid\nvalue".into())),
+            Err(Error::InvalidKey)
+        ));
+        for request in [
+            r#"{"model":"other","input":"hello"}"#,
+            r#"{"model":"selected","input":[],"store":true}"#,
+            r#"{"model":"selected","input":[],"previous_response_id":"resp_other"}"#,
+            r#"{"model":"selected","input":[{"type":"item_reference","id":"resp_other"}]}"#,
+            r#"{"model":"selected","input":[],"tools":[{"type":"tool_search","execution":"client"}]}"#,
+            r#"{"model":"selected","input":[],"tool_choice":{"type":"web_search"}}"#,
+            r#"{"model":"selected","input":[{"type":"additional_tools","role":"developer","tools":[{"type":"namespace","tools":[{"type":"web_search"}]}]}]}"#,
+            r#"{"model":"selected","input":[{"type":"tool_search_output","tools":[{"type":"web_search"}]}]}"#,
+        ] {
+            assert!(
+                allowed_payload(request, "selected", Provider::ChatGptPlan).is_none(),
+                "{request}"
+            );
+        }
     }
 
     #[tokio::test]

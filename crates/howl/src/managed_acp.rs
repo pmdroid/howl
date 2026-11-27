@@ -1,4 +1,7 @@
+mod chatgpt;
 mod journal;
+
+pub use chatgpt::ChatGptPlanAuth;
 
 use std::{
     io,
@@ -46,6 +49,10 @@ pub enum Error {
     Observer(#[from] crate::observer::Error),
     #[error(transparent)]
     Provider(#[from] provider_broker::Error),
+    #[error(
+        "ChatGPT plan authorization unavailable. Run the Howl ChatGPT sign-in helper and try again."
+    )]
+    ChatGptAuth,
     #[error("managed session storage or pipes failed")]
     Io(#[from] io::Error),
     #[error("invalid managed session state")]
@@ -80,6 +87,7 @@ pub struct Harness {
     executable: PathBuf,
     args: Vec<String>,
     provider: Option<(Provider, String)>,
+    chatgpt: Option<ChatGptPlanAuth>,
 }
 
 impl Harness {
@@ -109,12 +117,32 @@ impl Harness {
             executable: executable.into(),
             args: args.iter().map(|arg| (*arg).to_owned()).collect(),
             provider: None,
+            chatgpt: None,
         }
     }
 
     pub fn with_provider(mut self, provider: Provider, model: &str) -> Self {
         self.provider = Some((provider, model.to_owned()));
+        self.chatgpt = None;
         self
+    }
+
+    pub fn with_chatgpt_plan(mut self, model: &str, auth: ChatGptPlanAuth) -> Self {
+        self.provider = Some((Provider::ChatGptPlan, model.to_owned()));
+        self.chatgpt = Some(auth);
+        self
+    }
+
+    async fn broker(&self) -> Result<Option<Broker>> {
+        let Some((provider, model)) = &self.provider else {
+            return Ok(None);
+        };
+        let broker = if let Some(auth) = &self.chatgpt {
+            Broker::from_chatgpt_plan(model, auth.access_token().await?)?
+        } else {
+            Broker::from_environment(*provider, model)?
+        };
+        Ok(Some(broker))
     }
 
     fn fingerprint(&self) -> [u8; 32] {
@@ -136,6 +164,12 @@ impl Harness {
             hash.update([provider.tag()]);
             hash.update((model.len() as u64).to_be_bytes());
             hash.update(model.as_bytes());
+        }
+        if let Some(auth) = &self.chatgpt {
+            let store = auth.store().as_os_str().as_bytes();
+            hash.update(b"chatgpt-plan-store");
+            hash.update((store.len() as u64).to_be_bytes());
+            hash.update(store);
         }
         hash.finalize().into()
     }
@@ -253,11 +287,7 @@ impl ManagedSession {
         id: String,
         restore: Option<Restore>,
     ) -> Result<Self> {
-        let broker = harness
-            .provider
-            .as_ref()
-            .map(|(provider, model)| Broker::from_environment(*provider, model))
-            .transpose()?;
+        let broker = harness.broker().await?;
         Self::open_with_broker(root, provider, snapshot, harness, id, restore, broker).await
     }
 
