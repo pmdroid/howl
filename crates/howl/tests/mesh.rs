@@ -7,7 +7,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use howl::identity::{LocalIdentity, PeerTrust};
+use howl::{
+    identity::{LocalIdentity, PeerTrust},
+    node,
+};
 
 struct Node(Child);
 
@@ -68,8 +71,8 @@ fn start(state: &Path) -> (Node, String) {
     panic!("node did not start");
 }
 
-#[test]
-fn trusted_peers_exchange_durable_chat_through_the_cli() {
+#[tokio::test]
+async fn trusted_peers_exchange_durable_chat_through_the_cli() {
     let root = tempfile::tempdir().unwrap();
     let alice = root.path().join("alice");
     let bob = root.path().join("bob");
@@ -84,6 +87,7 @@ fn trusted_peers_exchange_durable_chat_through_the_cli() {
         .pin(&alice_cert, &alice_cert.fingerprint())
         .unwrap();
     let bob_device = hex::encode(bob_cert.device_id());
+    let alice_device = *alice_cert.device_id();
 
     let manifest = successful(cli(&["channel", "create"], &alice, &[&bob_device]));
     let mut lines = manifest.lines();
@@ -124,6 +128,55 @@ fn trusted_peers_exchange_durable_chat_through_the_cli() {
     let inbox = successful(cli(&["read"], &bob, &[channel]));
     assert_eq!(inbox.lines().count(), 1);
     assert!(inbox.contains("hello from Alice"));
+
+    let channel_id = hex::decode(channel).unwrap().try_into().unwrap();
+    let reviewer = howl_envelope::AgentRole::Reviewer.agent_id(bob_cert.device_id());
+    let architect = howl_envelope::AgentRole::Architect.agent_id(bob_cert.device_id());
+    node::grant_wake(&bob, channel_id, alice_device, reviewer, 1)
+        .await
+        .unwrap();
+    let blocked = node::send_wake(
+        &alice,
+        channel_id,
+        *bob_cert.device_id(),
+        &bob_address,
+        architect,
+        30,
+        "wrong role",
+    )
+    .await
+    .unwrap();
+    let allowed = node::send_wake(
+        &alice,
+        channel_id,
+        *bob_cert.device_id(),
+        &bob_address,
+        reviewer,
+        30,
+        "review the plan",
+    )
+    .await
+    .unwrap();
+    let blocked = blocked.strip_prefix("queued ").unwrap();
+    let allowed = allowed.strip_prefix("queued ").unwrap();
+    let until = Instant::now() + Duration::from_secs(15);
+    loop {
+        let report = successful(cli(&["status"], &alice, &[channel, allowed]));
+        if report.contains("delivered") {
+            break;
+        }
+        assert!(
+            Instant::now() < until,
+            "authorized wake was not delivered: {report}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let report = successful(cli(&["status"], &alice, &[channel, blocked]));
+    assert!(
+        report.contains("queued"),
+        "ungranted role got an ACK: {report}"
+    );
+    assert_eq!(successful(cli(&["read"], &bob, &[channel])), inbox);
 
     successful(cli(&["mesh", "stop"], &alice, &[]));
     successful(cli(&["mesh", "stop"], &bob, &[]));

@@ -44,12 +44,59 @@ pub struct DeviceAddress {
 pub enum Intent {
     Chat = 1,
     Wake = 2,
+    AgentReply = 3,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum AgentRole {
+    Architect = 1,
+    Reviewer = 2,
+}
+
+impl AgentRole {
+    pub fn agent_id(self, device: &Id) -> Id {
+        let mut hash = Sha256::new();
+        hash.update(b"howl/agent-role/v1\0");
+        hash.update(device);
+        hash.update([self as u8]);
+        hash.finalize().into()
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Architect => "architect",
+            Self::Reviewer => "reviewer",
+        }
+    }
+}
+
+impl TryFrom<u8> for AgentRole {
+    type Error = Error;
+
+    fn try_from(value: u8) -> Result<Self, Error> {
+        match value {
+            1 => Ok(Self::Architect),
+            2 => Ok(Self::Reviewer),
+            _ => Err(Error::Encoding),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AgentReply<Text> {
+    pub agent: Id,
+    pub role: AgentRole,
+    pub in_reply_to: Id,
+    pub context_digest: Id,
+    pub text: Text,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Body<Text> {
     Chat(Text),
     Wake { session: Id, text: Text },
+    AgentReply(AgentReply<Text>),
 }
 
 impl<Text> Body<Text> {
@@ -57,6 +104,7 @@ impl<Text> Body<Text> {
         match self {
             Self::Chat(_) => Intent::Chat,
             Self::Wake { .. } => Intent::Wake,
+            Self::AgentReply(_) => Intent::AgentReply,
         }
     }
 }
@@ -177,6 +225,11 @@ pub fn seal(
         return Err(Error::Encoding);
     }
 
+    if let Body::AgentReply(reply) = &body
+        && reply.agent != reply.role.agent_id(&routing.sender.device)
+    {
+        return Err(Error::Unauthorized);
+    }
     let mut padded = wire::pad(body)?;
     let mut rng = ChaCha20Rng::try_from_rng(&mut OsRng).map_err(|_| Error::Randomness)?;
     let mut secret = Zeroizing::new([0; KEY_SIZE]);
@@ -253,7 +306,7 @@ pub fn open(
     if routing.sender != policy.sender.address
         || metadata.signing_key_id != key_id(b"device-signing", &policy.sender.signing_key)
         || !match metadata.intent {
-            Intent::Chat => policy.sender.chat,
+            Intent::Chat | Intent::AgentReply => policy.sender.chat,
             Intent::Wake => policy.sender.wake,
         }
     {
@@ -330,6 +383,11 @@ pub fn open(
         )
         .map_err(|_| Error::Ciphertext)?;
     let body = wire::unpad(metadata.intent, &padded)?;
+    if let Body::AgentReply(reply) = &body
+        && reply.agent != reply.role.agent_id(&routing.sender.device)
+    {
+        return Err(Error::Unauthorized);
+    }
     Ok(OpenedEnvelope { metadata, body })
 }
 

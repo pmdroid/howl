@@ -74,3 +74,22 @@ CREATE TABLE IF NOT EXISTS wake_queue (
     CHECK (state = 4 OR ((state = 0) = (execution IS NULL)))
 ) STRICT;
 CREATE INDEX IF NOT EXISTS wakes_pending ON wake_queue(cursor) WHERE state = 0;
+CREATE TABLE IF NOT EXISTS wake_authorizations (
+    channel BLOB NOT NULL,
+    target BLOB NOT NULL,
+    sender BLOB NOT NULL CHECK (length(sender) = 64),
+    generation BLOB NOT NULL CHECK (length(generation) = 8),
+    PRIMARY KEY (channel, target),
+    FOREIGN KEY (channel, target) REFERENCES wake_targets(channel, target)
+) STRICT;
+CREATE TABLE IF NOT EXISTS agent_replies (
+    cursor INTEGER PRIMARY KEY REFERENCES inbox(id),
+    agent BLOB NOT NULL CHECK (length(agent) = 32),
+    role INTEGER NOT NULL CHECK (role IN (1, 2)),
+    in_reply_to BLOB NOT NULL CHECK (length(in_reply_to) = 32),
+    context_digest BLOB NOT NULL CHECK (length(context_digest) = 32)
+) STRICT;
+CREATE TABLE IF NOT EXISTS wake_replies (
+    cursor INTEGER PRIMARY KEY REFERENCES wake_queue(cursor),
+    envelope INTEGER NOT NULL REFERENCES outbox(id)
+) STRICT;

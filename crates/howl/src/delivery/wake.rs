@@ -42,26 +42,63 @@ impl DeliveryStore {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let changed = tx.execute(
-            "INSERT INTO wake_targets (channel, target, generation, status)
-             SELECT ?1, ?2, ?3, 1 WHERE EXISTS (SELECT 1 FROM channels WHERE channel = ?1)
-             ON CONFLICT (channel, target) DO UPDATE SET generation = excluded.generation, status = 1
-             WHERE wake_targets.generation < excluded.generation
-                OR (wake_targets.generation = excluded.generation AND wake_targets.status IN (1, 2))",
-            params![channel, target, generation],
-        )?;
-        if changed == 0 {
+        enable_target(&tx, channel, target, generation)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn enable_network_wake_target(
+        &mut self,
+        channel: Id,
+        sender: Device,
+        target: Id,
+        generation: u64,
+    ) -> Result<()> {
+        if generation == 0 || sender == self.local {
             return Err(Error::WakeGrant);
         }
+        let generation = generation.to_be_bytes();
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let conflicts: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM wake_authorizations
+             WHERE channel = ?1 AND target = ?2 AND generation = ?3 AND sender <> ?4)",
+            params![channel, target, generation, sender.encode()],
+            |row| row.get(0),
+        )?;
+        if conflicts {
+            return Err(Error::WakeGrant);
+        }
+        enable_target(&tx, channel, target, generation)?;
         tx.execute(
-            "UPDATE wake_queue SET state = CASE state WHEN 2 THEN 5 ELSE 4 END
-             WHERE state IN (0, 1, 2) AND generation < ?3 AND cursor IN (
-                 SELECT id FROM inbox WHERE kind = 2 AND substr(stream, 1, 32) = ?1 AND target = ?2
-             )",
-            params![channel, target, generation],
+            "INSERT INTO wake_authorizations (channel, target, sender, generation)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (channel, target) DO UPDATE
+             SET sender = excluded.sender, generation = excluded.generation",
+            params![channel, target, sender.encode(), generation],
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    pub(crate) fn wake_sender_authorized(&self, channel: Id, sender: Device) -> Result<bool> {
+        Ok(self.connection.query_row(
+            "SELECT EXISTS (SELECT 1 FROM wake_authorizations a JOIN wake_targets t
+             ON t.channel = a.channel AND t.target = a.target AND t.generation = a.generation
+             WHERE a.channel = ?1 AND a.sender = ?2 AND t.status = 1)",
+            params![channel, sender.encode()],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub fn wake_grant_generation(
+        &self,
+        channel: Id,
+        sender: Device,
+        target: Id,
+    ) -> Result<Option<u64>> {
+        Ok(grant_generation(&self.connection, channel, sender, target)?)
     }
 
     pub fn disable_wake_target(&mut self, channel: Id, target: Id, generation: u64) -> Result<()> {
@@ -210,6 +247,45 @@ impl DeliveryStore {
             .optional()?;
         Ok(state)
     }
+}
+
+fn enable_target(tx: &Connection, channel: Id, target: Id, generation: [u8; 8]) -> Result<()> {
+    let changed = tx.execute(
+        "INSERT INTO wake_targets (channel, target, generation, status)
+         SELECT ?1, ?2, ?3, 1 WHERE EXISTS (SELECT 1 FROM channels WHERE channel = ?1)
+         ON CONFLICT (channel, target) DO UPDATE SET generation = excluded.generation, status = 1
+         WHERE wake_targets.generation < excluded.generation
+            OR (wake_targets.generation = excluded.generation AND wake_targets.status IN (1, 2))",
+        params![channel, target, generation],
+    )?;
+    if changed == 0 {
+        return Err(Error::WakeGrant);
+    }
+    tx.execute(
+        "UPDATE wake_queue SET state = CASE state WHEN 2 THEN 5 ELSE 4 END
+         WHERE state IN (0, 1, 2) AND generation < ?3 AND cursor IN (
+             SELECT id FROM inbox WHERE kind = 2 AND substr(stream, 1, 32) = ?1 AND target = ?2
+         )",
+        params![channel, target, generation],
+    )?;
+    Ok(())
+}
+
+pub(super) fn grant_generation(
+    connection: &Connection,
+    channel: Id,
+    sender: Device,
+    target: Id,
+) -> rusqlite::Result<Option<u64>> {
+    connection
+        .query_row(
+            "SELECT a.generation FROM wake_authorizations a JOIN wake_targets t
+             ON t.channel = a.channel AND t.target = a.target AND t.generation = a.generation
+             WHERE a.channel = ?1 AND a.target = ?2 AND a.sender = ?3 AND t.status = 1",
+            params![channel, target, sender.encode()],
+            |row| Ok(u64::from_be_bytes(row.get(0)?)),
+        )
+        .optional()
 }
 
 pub(super) fn recover_linked_wakes(connection: &Connection) -> rusqlite::Result<(usize, usize)> {

@@ -1,8 +1,8 @@
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce, aead::AeadInPlace};
 use ed25519_dalek::Signer;
 use howl_envelope::{
-    AuthorizedSender, Body, DeviceAddress, Error, MAX_FRAME_SIZE, ReceivePolicy, Recipient,
-    RecipientSecret, Routing, SigningKey, inspect_unverified, open, seal,
+    AgentReply, AgentRole, AuthorizedSender, Body, DeviceAddress, Error, MAX_FRAME_SIZE,
+    ReceivePolicy, Recipient, RecipientSecret, Routing, SigningKey, inspect_unverified, open, seal,
 };
 use hpke::{Kem, Serializable, kem::X25519HkdfSha256};
 use serde_json::Value;
@@ -99,6 +99,57 @@ fn opens_independent_padded_wake_vector_and_rejects_signed_failures() {
     assert!(open(&frame, &policy, &recipient).is_ok());
     policy.now = vector["expires_at"].as_u64().unwrap();
     assert_eq!(open(&frame, &policy, &recipient), Err(Error::Stale));
+}
+
+#[test]
+fn separates_signed_agent_replies_from_human_chat() {
+    let signer = SigningKey::from_bytes(&[12; 32]);
+    let receiver = RecipientSecret::from_bytes(address(1), &[45; 32]).unwrap();
+    let recipients = [receiver.public_recipient()];
+    let routing = chat_routing();
+    let role = AgentRole::Reviewer;
+    let reply = AgentReply {
+        agent: role.agent_id(&routing.sender.device),
+        role,
+        in_reply_to: [41; 32],
+        context_digest: [42; 32],
+        text: "proposal",
+    };
+    let bytes = seal(routing, Body::AgentReply(reply), &signer, &recipients).unwrap();
+    let policy = policy(routing, signer.verifying_key().to_bytes(), &recipients, 1);
+    assert_eq!(
+        open(&bytes, &policy, &receiver).unwrap().body,
+        Body::AgentReply(AgentReply {
+            agent: reply.agent,
+            role,
+            in_reply_to: reply.in_reply_to,
+            context_digest: reply.context_digest,
+            text: reply.text.to_owned()
+        })
+    );
+    assert_eq!(
+        seal(
+            routing,
+            Body::AgentReply(AgentReply {
+                role: AgentRole::Architect,
+                ..reply
+            }),
+            &signer,
+            &recipients,
+        ),
+        Err(Error::Unauthorized)
+    );
+    let chat = seal(
+        routing,
+        Body::Chat("agent reviewer proposal"),
+        &signer,
+        &recipients,
+    )
+    .unwrap();
+    assert!(matches!(
+        open(&chat, &policy, &receiver).unwrap().body,
+        Body::Chat(_)
+    ));
 }
 
 #[test]

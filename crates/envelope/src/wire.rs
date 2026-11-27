@@ -1,6 +1,6 @@
 use crate::{
-    Body, DeviceAddress, Error, Id, Intent, MAX_FRAME_SIZE, MAX_RECIPIENTS, Metadata, Recipient,
-    Routing, TAG_SIZE, WRAP_SIZE, key_id,
+    AgentReply, AgentRole, Body, DeviceAddress, Error, Id, Intent, MAX_FRAME_SIZE, MAX_RECIPIENTS,
+    Metadata, Recipient, Routing, TAG_SIZE, WRAP_SIZE, key_id,
 };
 use zeroize::Zeroizing;
 
@@ -16,7 +16,7 @@ pub fn validate_routing(routing: Routing, intent: Intent) -> Result<(), Error> {
         return Err(Error::Encoding);
     }
     match intent {
-        Intent::Chat if routing.expires_at == 0 => Ok(()),
+        Intent::Chat | Intent::AgentReply if routing.expires_at == 0 => Ok(()),
         Intent::Wake
             if matches!(
                 routing.expires_at.checked_sub(routing.created_at),
@@ -59,26 +59,31 @@ pub fn encode_recipient(recipient: Recipient) -> [u8; RECIPIENT_SIZE] {
 }
 
 pub fn pad(body: Body<&str>) -> Result<Zeroizing<Vec<u8>>, Error> {
-    let (session, text) = match body {
-        Body::Chat(text) if !text.is_empty() => (None, text),
-        Body::Wake { session, text } => (Some(session), text),
-        Body::Chat(_) => return Err(Error::Encoding),
+    let mut bytes = Zeroizing::new(vec![0; 4]);
+    let text = match body {
+        Body::Chat(text) if !text.is_empty() => text,
+        Body::Wake { session, text } => {
+            bytes.extend_from_slice(&session);
+            text
+        }
+        Body::AgentReply(reply) if !reply.text.is_empty() => {
+            bytes.extend_from_slice(&reply.agent);
+            bytes.push(reply.role as u8);
+            bytes.extend_from_slice(&reply.in_reply_to);
+            bytes.extend_from_slice(&reply.context_digest);
+            reply.text
+        }
+        _ => return Err(Error::Encoding),
     };
-    let logical_len = text
-        .len()
-        .checked_add(session.map_or(0, |id| id.len()))
+    let logical_len = (bytes.len() - 4)
+        .checked_add(text.len())
         .ok_or(Error::Encoding)?;
     if logical_len > MAX_PADDED_SIZE - 4 {
         return Err(Error::Encoding);
     }
-    let padded_len = (logical_len + 4).next_multiple_of(PADDING_BLOCK);
-    let mut bytes = Zeroizing::new(Vec::with_capacity(padded_len));
-    bytes.extend_from_slice(&(logical_len as u32).to_be_bytes());
-    if let Some(session) = session {
-        bytes.extend_from_slice(&session);
-    }
+    bytes[..4].copy_from_slice(&(logical_len as u32).to_be_bytes());
     bytes.extend_from_slice(text.as_bytes());
-    bytes.resize(padded_len, 0);
+    bytes.resize((logical_len + 4).next_multiple_of(PADDING_BLOCK), 0);
     Ok(bytes)
 }
 
@@ -91,20 +96,40 @@ pub fn unpad(intent: Intent, plaintext: &[u8]) -> Result<Body<String>, Error> {
     {
         return Err(Error::Encoding);
     }
-    let session = if intent == Intent::Wake {
-        Some(take(&mut logical)?)
-    } else if logical.is_empty() {
-        return Err(Error::Encoding);
-    } else {
-        None
-    };
-    let text = std::str::from_utf8(logical)
-        .map_err(|_| Error::Encoding)?
-        .to_owned();
-    Ok(match session {
-        Some(session) => Body::Wake { session, text },
-        None => Body::Chat(text),
-    })
+    match intent {
+        Intent::Chat if !logical.is_empty() => Ok(Body::Chat(text(logical)?)),
+        Intent::Chat => Err(Error::Encoding),
+        Intent::Wake => {
+            let session = take(&mut logical)?;
+            Ok(Body::Wake {
+                session,
+                text: text(logical)?,
+            })
+        }
+        Intent::AgentReply => {
+            let agent = take(&mut logical)?;
+            let [role] = take(&mut logical)?;
+            let role = AgentRole::try_from(role)?;
+            let in_reply_to = take(&mut logical)?;
+            let context_digest = take(&mut logical)?;
+            if logical.is_empty() {
+                return Err(Error::Encoding);
+            }
+            Ok(Body::AgentReply(AgentReply {
+                agent,
+                role,
+                in_reply_to,
+                context_digest,
+                text: text(logical)?,
+            }))
+        }
+    }
+}
+
+fn text(bytes: &[u8]) -> Result<String, Error> {
+    std::str::from_utf8(bytes)
+        .map(str::to_owned)
+        .map_err(|_| Error::Encoding)
 }
 
 pub struct Decoded<'a> {
@@ -152,6 +177,7 @@ pub fn parse(frame: &[u8]) -> Result<Decoded<'_>, Error> {
     let intent = match take(&mut bytes)? {
         [WIRE_VERSION, 1] => Intent::Chat,
         [WIRE_VERSION, 2] => Intent::Wake,
+        [WIRE_VERSION, 3] => Intent::AgentReply,
         _ => return Err(Error::Encoding),
     };
     let channel = take(&mut bytes)?;

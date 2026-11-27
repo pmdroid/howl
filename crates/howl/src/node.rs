@@ -8,8 +8,8 @@ use std::{
 
 use ed25519_dalek::VerifyingKey;
 use howl_envelope::{
-    AuthorizedSender, Body, DeviceAddress, Id, Intent, Metadata, ReceivePolicy, Recipient,
-    RecipientSecret, Routing,
+    AgentReply, AuthorizedSender, Body, DeviceAddress, Id, Intent, Metadata, ReceivePolicy,
+    Recipient, RecipientSecret, Routing,
 };
 use sha2::{Digest, Sha256};
 use tokio::{
@@ -20,7 +20,8 @@ use tokio::{
 use crate::{
     channel::Channel,
     delivery::{
-        ACK_LENGTH, ACK_TAG, Acknowledgment, DeliveryStore, Device, Frame, Payload, Stream,
+        ACK_LENGTH, ACK_TAG, Acknowledgment, ApprovedAgentReply, DeliveryStore, Device, Frame,
+        Payload, Stream,
     },
     identity::{LocalIdentity, PeerCertificate, PeerTrust, StateDirectory},
     local_control::{self, ControlServer},
@@ -29,6 +30,7 @@ use crate::{
 
 const EPOCH: u64 = 1;
 pub const CHAT_LIMIT: usize = 65_532;
+pub const WAKE_LIMIT: usize = CHAT_LIMIT - 32;
 const CONTROL_WORKERS: usize = 16;
 const DELIVERY_WORKERS: usize = 8;
 const DELIVERY_KEY: &str = "delivery.key";
@@ -53,6 +55,7 @@ pub async fn run(state: &Path, listen: &str, relay: Option<&str>) -> io::Result<
     let transport =
         Arc::new(Transport::bind(&identity, PeerTrust::open(state)?, network, bind).await?);
     let mut delivery = open_delivery(state, &directory, &local)?;
+    delivery.recover_wakes().map_err(io::Error::other)?;
     let address = transport.address();
     for ip in address.ip_addrs() {
         println!("Listening {ip}");
@@ -146,15 +149,64 @@ pub async fn send(
     if message.is_empty() || message.len() > CHAT_LIMIT {
         return Err(invalid("invalid chat length"));
     }
+    request_message(state, channel, recipient, route, b'S', message.as_bytes()).await
+}
+
+pub async fn send_wake(
+    state: &Path,
+    channel: Id,
+    recipient: Id,
+    route: &str,
+    target: Id,
+    lifetime_secs: u16,
+    message: &str,
+) -> io::Result<String> {
+    StateDirectory::open(state)?;
+    if message.is_empty() || message.len() > WAKE_LIMIT || !(1..=300).contains(&lifetime_secs) {
+        return Err(invalid("invalid wake text or lifetime"));
+    }
+    let mut body = Vec::with_capacity(34 + message.len());
+    body.extend_from_slice(&target);
+    body.extend_from_slice(&lifetime_secs.to_be_bytes());
+    body.extend_from_slice(message.as_bytes());
+    request_message(state, channel, recipient, route, b'W', &body).await
+}
+
+pub async fn grant_wake(
+    state: &Path,
+    channel: Id,
+    sender: Id,
+    target: Id,
+    generation: u64,
+) -> io::Result<()> {
+    StateDirectory::open(state)?;
+    let mut request = Vec::with_capacity(105);
+    request.push(b'G');
+    request.extend_from_slice(&channel);
+    request.extend_from_slice(&sender);
+    request.extend_from_slice(&target);
+    request.extend_from_slice(&generation.to_be_bytes());
+    local_control::request(state, &request).await?;
+    Ok(())
+}
+
+async fn request_message(
+    state: &Path,
+    channel: Id,
+    recipient: Id,
+    route: &str,
+    command: u8,
+    body: &[u8],
+) -> io::Result<String> {
     let route = parse_route(route.as_bytes())?;
     let text = route.map_or("-".to_owned(), |address| address.to_string());
-    let mut request = Vec::with_capacity(66 + text.len() + message.len());
-    request.push(b'S');
+    let mut request = Vec::with_capacity(66 + text.len() + body.len());
+    request.push(command);
     request.extend_from_slice(&channel);
     request.extend_from_slice(&recipient);
     request.push(text.len() as u8);
     request.extend_from_slice(text.as_bytes());
-    request.extend_from_slice(message.as_bytes());
+    request.extend_from_slice(body);
     local_control::request(state, &request).await
 }
 
@@ -172,13 +224,25 @@ pub fn read(state: &Path, id: Id) -> io::Result<()> {
         &StateDirectory::open(state)?,
         &identity.certificate(),
     )?;
-    for item in delivery.chat_history(id, 100).map_err(io::Error::other)? {
-        println!(
-            "{} {} {:?}",
-            hex::encode(item.sender.device),
-            item.received_at,
-            item.body
-        );
+    for item in delivery
+        .channel_history(id, 100)
+        .map_err(io::Error::other)?
+    {
+        let sender = hex::encode(item.sender.device);
+        match item.body {
+            Body::Chat(text) => println!("{sender} {} {text:?}", item.received_at),
+            Body::AgentReply(reply) => println!(
+                "agent {sender} {} {} message={} reply-to={} context={} {} {:?}",
+                reply.role.name(),
+                hex::encode(reply.agent),
+                hex::encode(item.message),
+                hex::encode(reply.in_reply_to),
+                hex::encode(reply.context_digest),
+                item.received_at,
+                reply.text,
+            ),
+            Body::Wake { .. } => return Err(invalid("unexpected wake in channel history")),
+        }
     }
     Ok(())
 }
@@ -222,69 +286,227 @@ fn queue(
     let ([command], request) = request
         .split_first_chunk()
         .ok_or_else(|| invalid("invalid mesh command"))?;
-    if *command != b'S' {
-        return Err(invalid("invalid mesh command"));
-    }
     let (channel, rest) = request
         .split_first_chunk()
-        .ok_or_else(|| invalid("invalid chat channel"))?;
+        .ok_or_else(|| invalid("invalid mesh channel"))?;
     let (peer, rest) = rest
         .split_first_chunk()
-        .ok_or_else(|| invalid("invalid chat recipient"))?;
+        .ok_or_else(|| invalid("invalid mesh peer"))?;
+    if *command == b'G' {
+        return enable_grant(state, identity, delivery, *channel, peer, rest);
+    }
+
     let ([route_length], rest) = rest
         .split_first_chunk()
         .ok_or_else(|| invalid("invalid peer route"))?;
-    let (route, text) = rest
+    let (route, body) = rest
         .split_at_checked(usize::from(*route_length))
         .ok_or_else(|| invalid("invalid peer route"))?;
     let route = parse_route(route)?;
     if route.is_none() && !has_relay {
         return Err(invalid("peer address or relay is required"));
     }
-    let text = std::str::from_utf8(text).map_err(io::Error::other)?;
-    let roster = Channel::load(state, identity, channel)?;
-    let local = identity.certificate();
-    let target = roster
-        .members()
-        .iter()
-        .find(|member| member.device_id() == peer)
-        .filter(|member| member.device_id() != local.device_id())
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "recipient is outside the channel or is the local device",
+    let address = Destination {
+        channel: *channel,
+        peer: *peer,
+        route,
+    };
+    match command {
+        b'S' => {
+            let text = std::str::from_utf8(body).map_err(io::Error::other)?;
+            if text.is_empty() || text.len() > CHAT_LIMIT {
+                return Err(invalid("invalid chat length"));
+            }
+            queue_frame(
+                state,
+                identity,
+                delivery,
+                address,
+                Body::Chat(text),
+                0,
+                None,
             )
-        })?;
-    let stream = local_stream(*channel, &local);
+        }
+        b'W' => {
+            let (target, rest) = body
+                .split_first_chunk()
+                .ok_or_else(|| invalid("invalid wake target"))?;
+            let (lifetime, bytes) = rest
+                .split_first_chunk()
+                .ok_or_else(|| invalid("invalid wake lifetime"))?;
+            let lifetime = u16::from_be_bytes(*lifetime);
+            let text = std::str::from_utf8(bytes).map_err(io::Error::other)?;
+            if text.is_empty() || text.len() > WAKE_LIMIT || !(1..=300).contains(&lifetime) {
+                return Err(invalid("invalid wake text or lifetime"));
+            }
+            queue_frame(
+                state,
+                identity,
+                delivery,
+                address,
+                Body::Wake {
+                    session: *target,
+                    text,
+                },
+                lifetime,
+                None,
+            )
+        }
+        _ => Err(invalid("invalid mesh command")),
+    }
+}
+
+fn enable_grant(
+    state: &Path,
+    identity: &LocalIdentity,
+    delivery: &mut DeliveryStore,
+    channel: Id,
+    peer: &Id,
+    bytes: &[u8],
+) -> io::Result<String> {
+    let (target, generation) = bytes
+        .split_first_chunk()
+        .ok_or_else(|| invalid("invalid wake grant target"))?;
+    let generation = u64::from_be_bytes(
+        generation
+            .try_into()
+            .map_err(|_| invalid("invalid wake grant generation"))?,
+    );
+    let roster = Channel::load(state, identity, &channel)?;
+    let sender = channel_peer(&roster, &identity.certificate(), peer)?;
     delivery
-        .set_epoch(*channel, EPOCH)
+        .set_epoch(channel, EPOCH)
+        .map_err(io::Error::other)?;
+    delivery
+        .establish_wake_time(unix_time()?)
+        .map_err(io::Error::other)?;
+    delivery
+        .enable_network_wake_target(channel, device(sender), *target, generation)
+        .map_err(io::Error::other)?;
+    Ok("granted".to_owned())
+}
+
+struct Destination {
+    channel: Id,
+    peer: Id,
+    route: Option<SocketAddr>,
+}
+
+pub fn queue_agent_reply(
+    state: &Path,
+    identity: &LocalIdentity,
+    delivery: &mut DeliveryStore,
+    channel: Id,
+    recipient: Id,
+    route: &str,
+    approved: ApprovedAgentReply<&str>,
+) -> io::Result<String> {
+    queue_frame(
+        state,
+        identity,
+        delivery,
+        Destination {
+            channel,
+            peer: recipient,
+            route: parse_route(route.as_bytes())?,
+        },
+        Body::AgentReply(approved.reply),
+        0,
+        Some(approved.execution),
+    )
+}
+
+fn queue_frame(
+    state: &Path,
+    identity: &LocalIdentity,
+    delivery: &mut DeliveryStore,
+    destination: Destination,
+    body: Body<&str>,
+    lifetime: u16,
+    execution: Option<Id>,
+) -> io::Result<String> {
+    let Destination {
+        channel,
+        peer,
+        route,
+    } = destination;
+    let roster = Channel::load(state, identity, &channel)?;
+    let local = identity.certificate();
+    let target = channel_peer(&roster, &local, &peer)?;
+    let stream = local_stream(channel, &local);
+    delivery
+        .set_epoch(channel, EPOCH)
         .map_err(io::Error::other)?;
     let sequence = delivery
         .reserve_sequence(stream)
         .map_err(io::Error::other)?;
     let now = unix_time()?;
+    let expires_at = if lifetime == 0 {
+        0
+    } else {
+        now.checked_add(u64::from(lifetime))
+            .ok_or_else(|| invalid("invalid wake deadline"))?
+    };
     let key_seed = zeroize::Zeroizing::new(identity.signing_key().to_bytes());
     let signer = howl_envelope::SigningKey::from_bytes(&key_seed);
+    let approved = match (&body, execution) {
+        (Body::AgentReply(reply), Some(execution)) => Some(ApprovedAgentReply {
+            execution,
+            reply: *reply,
+        }),
+        (Body::AgentReply(_), None) | (_, Some(_)) => {
+            return Err(invalid("invalid reply approval"));
+        }
+        _ => None,
+    };
     let sealed = howl_envelope::seal(
         Routing {
-            channel: *channel,
+            channel,
             sender: address(&local),
             epoch: EPOCH,
             sequence,
             created_at: now,
-            expires_at: 0,
+            expires_at,
         },
-        Body::Chat(text),
+        body,
         &signer,
         &[recipient(target)],
     )
     .map_err(io::Error::other)?;
     let metadata = howl_envelope::inspect_unverified(&sealed).map_err(io::Error::other)?;
     let route = route.map_or("-".to_owned(), |address| address.to_string());
-    delivery
-        .enqueue_routed(frame(metadata), &sealed, device(target), &route, now)
-        .map_err(io::Error::other)?;
+    let outbound = frame(metadata);
+    match approved {
+        Some(approved) => delivery.enqueue_agent_reply(
+            outbound,
+            &sealed,
+            device(target),
+            &route,
+            unix_time,
+            approved,
+        ),
+        None => delivery.enqueue_routed(outbound, &sealed, device(target), &route, now),
+    }
+    .map_err(io::Error::other)?;
     Ok(format!("queued {}", hex::encode(metadata.message_id)))
+}
+
+fn channel_peer<'a>(
+    roster: &'a Channel,
+    local: &PeerCertificate,
+    id: &Id,
+) -> io::Result<&'a PeerCertificate> {
+    roster
+        .members()
+        .iter()
+        .find(|member| member.device_id() == id)
+        .filter(|member| member.device_id() != local.device_id())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "peer is outside the channel or is the local device",
+            )
+        })
 }
 
 fn target_address(
@@ -336,9 +558,6 @@ fn accept(
     }
 
     let unverified = howl_envelope::inspect_unverified(bytes).map_err(io::Error::other)?;
-    if unverified.intent != Intent::Chat {
-        return Err(invalid("unsupported message intent"));
-    }
     let roster = Channel::load(state, identity, &unverified.routing.channel)?;
     if !roster
         .members()
@@ -355,6 +574,19 @@ fn accept(
     let local = identity.certificate();
     let secret = RecipientSecret::from_bytes(address(&local), &key).map_err(io::Error::other)?;
     let now = unix_time()?;
+    let wake = unverified.intent == Intent::Wake;
+    if wake {
+        delivery.observe_wake_time(now).map_err(io::Error::other)?;
+        if !delivery
+            .wake_sender_authorized(*roster.id(), device(peer))
+            .map_err(io::Error::other)?
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "sender has no wake grant",
+            ));
+        }
+    }
     let policy = ReceivePolicy {
         channel: *roster.id(),
         epoch: EPOCH,
@@ -363,30 +595,52 @@ fn accept(
             address: address(peer),
             signing_key: peer.signing_public(),
             chat: true,
-            wake: false,
+            wake,
         },
         authorized_recipients: &allowed,
     };
     let message = howl_envelope::open(bytes, &policy, &secret).map_err(io::Error::other)?;
-    let Body::Chat(text) = message.body else {
-        return Err(invalid("unsupported message intent"));
-    };
     delivery
         .set_epoch(*roster.id(), EPOCH)
         .map_err(io::Error::other)?;
-    let accepted = delivery
-        .accept_authenticated(
-            frame(message.metadata),
+    let metadata = frame(message.metadata);
+    let accepted = match &message.body {
+        Body::Chat(text) => delivery.accept_authenticated(
+            metadata,
             bytes,
-            Payload::Chat(&text),
+            Payload::Chat(text),
             now,
             identity.signing_key(),
-        )
-        .map_err(io::Error::other)?;
+        ),
+        Body::Wake { session, text } => delivery.accept_network_wake(
+            metadata,
+            bytes,
+            Payload::Wake {
+                target: *session,
+                text,
+            },
+            unix_time,
+            identity.signing_key(),
+        ),
+        Body::AgentReply(reply) => delivery.accept_authenticated(
+            metadata,
+            bytes,
+            Payload::AgentReply(AgentReply {
+                agent: reply.agent,
+                role: reply.role,
+                in_reply_to: reply.in_reply_to,
+                context_digest: reply.context_digest,
+                text: &reply.text,
+            }),
+            now,
+            identity.signing_key(),
+        ),
+    }
+    .map_err(io::Error::other)?;
     Ok(Some(accepted.acknowledgment))
 }
 
-fn open_delivery(
+pub(crate) fn open_delivery(
     state: &Path,
     directory: &StateDirectory,
     local: &PeerCertificate,
@@ -402,7 +656,7 @@ fn address(cert: &PeerCertificate) -> DeviceAddress {
     }
 }
 
-fn device(cert: &PeerCertificate) -> Device {
+pub(crate) fn device(cert: &PeerCertificate) -> Device {
     let address = address(cert);
     Device {
         account: address.account,
@@ -447,7 +701,7 @@ fn frame(metadata: Metadata) -> Frame {
     }
 }
 
-fn parse_route(route: &[u8]) -> io::Result<Option<SocketAddr>> {
+pub(crate) fn parse_route(route: &[u8]) -> io::Result<Option<SocketAddr>> {
     if route == b"-" {
         return Ok(None);
     }
@@ -462,7 +716,7 @@ fn parse_relay(value: &str) -> io::Result<RelayUrl> {
     value.parse().map_err(io::Error::other)
 }
 
-fn unix_time() -> io::Result<u64> {
+pub(crate) fn unix_time() -> io::Result<u64> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|time| time.as_secs())
