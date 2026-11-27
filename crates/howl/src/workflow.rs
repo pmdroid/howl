@@ -64,9 +64,12 @@ pub fn agent_id(state: &Path, role: AgentRole) -> io::Result<Id> {
 pub fn claim(state: &Path, channel: Id, role: AgentRole) -> io::Result<Option<WakeJob>> {
     let _lock = WorkflowLock::acquire(state)?;
     let identity = LocalIdentity::load_or_create(state)?;
-    Channel::load(state, &identity, &channel)?;
+    let roster = Channel::load(state, &identity, &channel)?;
     let local = identity.certificate();
     let mut delivery = node::open_delivery(state, &StateDirectory::open(state)?, &local)?;
+    delivery
+        .set_epoch(channel, roster.epoch())
+        .map_err(io::Error::other)?;
     let Some(claim) = delivery
         .claim_wake(
             channel,
@@ -133,21 +136,31 @@ pub async fn run_turn(
     let _lock = WorkflowLock::acquire(request.state)?;
     let identity = LocalIdentity::load_or_create(request.state)?;
     let local = identity.certificate();
-    Channel::load(request.state, &identity, &request.channel)?;
+    let roster = Channel::load(request.state, &identity, &request.channel)?;
     let mut delivery =
         node::open_delivery(request.state, &StateDirectory::open(request.state)?, &local)?;
+    delivery
+        .set_epoch(request.channel, roster.epoch())
+        .map_err(io::Error::other)?;
     let preview = delivery
         .preview_claimed_wake(request.execution)
         .map_err(io::Error::other)?
         .ok_or_else(|| not_found("approved wake claim is unavailable"))?;
     let agent = request.role.agent_id(local.device_id());
-    if preview.claim.stream.channel != request.channel || preview.claim.target != agent {
+    if preview.claim.stream.channel != request.channel
+        || preview.claim.epoch != roster.epoch()
+        || preview.claim.target != agent
+        || !roster.allows(
+            &preview.claim.stream.sender.device,
+            crate::enrollment::ChannelPermission::Wake,
+        )
+    {
         return Err(denied(
             "wake claim does not match this channel and agent role",
         ));
     }
     let peer = PeerTrust::open(request.state)?.pinned(&preview.claim.stream.sender.device)?;
-    if node::device(&peer) != preview.claim.stream.sender {
+    if node::device_for(request.state, &peer)? != preview.claim.stream.sender {
         return Err(denied("wake sender is no longer the pinned peer"));
     }
     validate_grant(&delivery, &preview.claim)?;
@@ -162,7 +175,8 @@ pub async fn run_turn(
         agent,
         cause: request.cause,
     };
-    let signature = identity.sign(&approval.signing_bytes(node::device(&local)));
+    let signature =
+        identity.sign(&approval.signing_bytes(node::device_for(request.state, &local)?));
     let approved = delivery
         .conversation_budget(BUDGET, identity.signing_key().verifying_key())
         .map_err(io::Error::other)?
@@ -174,6 +188,7 @@ pub async fn run_turn(
     let mut control = TurnControl {
         delivery: &mut delivery,
         identity: &identity,
+        state: request.state,
         claim: &approved.job.claim,
         turn,
     };
@@ -298,12 +313,22 @@ fn approved_prompt(
 struct TurnControl<'a> {
     delivery: &'a mut DeliveryStore,
     identity: &'a LocalIdentity,
+    state: &'a Path,
     claim: &'a WakeClaim,
     turn: Id,
 }
 
 impl TurnControl<'_> {
     fn check(&mut self) -> io::Result<()> {
+        let roster = Channel::load(self.state, self.identity, &self.claim.stream.channel)?;
+        if self.claim.epoch != roster.epoch()
+            || !roster.allows(
+                &self.claim.stream.sender.device,
+                crate::enrollment::ChannelPermission::Wake,
+            )
+        {
+            return Err(denied("wake sender has no current channel permission"));
+        }
         validate_grant(self.delivery, self.claim)?;
         let now = node::unix_time()?;
         if now >= self.claim.expires_at {

@@ -207,11 +207,23 @@ impl Authority {
         Ok(authority)
     }
 
+    pub fn account(&self) -> Id {
+        self.head.account
+    }
+
     pub fn head(&self) -> io::Result<AuthorityHead> {
         if self.forked {
             return Err(invalid("authority has a verified fork"));
         }
         Ok(self.head)
+    }
+
+    pub fn known_head(&self, digest: Id) -> io::Result<AuthorityHead> {
+        self.head()?;
+        self.entries
+            .get(&digest)
+            .map(|entry| entry.head)
+            .ok_or_else(|| invalid("authority head is outside the pinned history"))
     }
 
     pub fn records(&self) -> &[AuthorityRecord] {
