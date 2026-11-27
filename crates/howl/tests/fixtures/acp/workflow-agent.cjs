@@ -2,24 +2,22 @@ const assert = require("node:assert/strict");
 const { existsSync, readFileSync } = require("node:fs");
 const { createInterface } = require("node:readline");
 
-const [stage] = process.argv.slice(1);
-const stages = {
-  "architect-draft": {
-    request: "DRAFT_REQUEST", selected: "Architect selected data\n", role: "architect",
-    reply: "HOWL_ARCHITECT_DRAFT",
+const [agent] = process.argv.slice(1);
+const selected = { architect: "Architect selected data\n", reviewer: "Reviewer selected data\n" };
+const turns = {
+  DRAFT_REQUEST: {
+    agent: "architect", reply: "HOWL_ARCHITECT_DRAFT",
   },
-  reviewer: {
-    request: "REVIEW_REQUEST", selected: "Reviewer selected data\n", role: "reviewer",
-    context: { role: "architect", text: "HOWL_ARCHITECT_DRAFT" }, reply: "HOWL_REVIEWER_FEEDBACK",
+  REVIEW_REQUEST: {
+    agent: "reviewer", context: "HOWL_ARCHITECT_DRAFT", reply: "HOWL_REVIEWER_FEEDBACK",
   },
-  "architect-final": {
-    request: "FINAL_REQUEST", selected: "Architect selected data\n", role: "architect",
-    context: { role: "reviewer", text: "HOWL_REVIEWER_FEEDBACK" }, reply: "HOWL_ARCHITECT_FINAL",
+  FINAL_REQUEST: {
+    agent: "architect", context: "HOWL_REVIEWER_FEEDBACK", reply: "HOWL_ARCHITECT_FINAL",
+    previous: [{ instruction: "DRAFT_REQUEST", reply: "HOWL_ARCHITECT_DRAFT" }],
   },
 };
-const fixture = stages[stage];
-assert(fixture);
-const sessionId = stage + "-fixture";
+assert(selected[agent]);
+const sessionId = agent + "-fixture";
 
 function send(message) {
   process.stdout.write(JSON.stringify({ jsonrpc: "2.0", ...message }) + "\n");
@@ -37,7 +35,7 @@ async function run() {
         break;
       case "session/new":
         assert.equal(params.cwd, "/workspace");
-        assert.equal(readFileSync("/workspace/selected.txt", "utf8"), fixture.selected);
+        assert.equal(readFileSync("/workspace/selected.txt", "utf8"), selected[agent]);
         assert.equal(existsSync("/workspace/unselected.txt"), false);
         send({ id, result: { sessionId } });
         break;
@@ -45,13 +43,13 @@ async function run() {
         assert.equal(params.sessionId, sessionId);
         const prompt = params.prompt.map(item => item.text).join("\n");
         const data = JSON.parse(prompt.split("\n").at(-1));
-        assert.equal(data.role, fixture.role);
-        assert.equal(data.human_instruction, fixture.request);
+        const fixture = turns[data.human_instruction];
+        assert.equal(fixture.agent, agent);
         assert.deepEqual(data.context_messages.map(message => ({
           author: message.body.author,
-          role: message.body.role,
           text: message.body.text,
-        })), fixture.context ? [{ author: "agent", ...fixture.context }] : []);
+        })), fixture.context ? [{ author: "agent", text: fixture.context }] : []);
+        assert.deepEqual(data.previous_turns ?? [], fixture.previous ?? []);
         send({
           method: "session/update", params: {
             sessionId, update: {
