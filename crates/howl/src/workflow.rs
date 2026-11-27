@@ -378,22 +378,33 @@ async fn execute(
         output.finish()
     }
     .await;
-    let result = match result {
-        Ok(result) => result,
-        Err(error) => {
-            let _ = timeout(Duration::from_secs(3), session.cancel()).await;
-            let _ = timeout(Duration::from_secs(3), session.close()).await;
-            return Err(error);
-        }
-    };
-    tokio::select! {
-        biased;
-        signal = &mut interrupted => Err(stopped(signal)),
-        close = timeout(Duration::from_secs(3), session.close()) => {
-            close.map_err(io::Error::other)?.map_err(io::Error::other)?;
-            Ok(result)
-        }
+    if result.is_err() {
+        let _ = timeout(Duration::from_secs(3), session.cancel()).await;
     }
+    let close = async {
+        let closed = timeout(Duration::from_secs(3), session.close()).await;
+        timeout(Duration::from_secs(5), session.wait_for_observer_stop())
+            .await
+            .map_err(io::Error::other)?
+            .map_err(io::Error::other)?;
+        closed.map_err(io::Error::other)?.map_err(io::Error::other)
+    };
+    tokio::pin!(close);
+    let closed = if result.is_ok() {
+        tokio::select! {
+            biased;
+            signal = &mut interrupted => {
+                let _ = close.await;
+                return Err(stopped(signal));
+            }
+            result = &mut close => result,
+        }
+    } else {
+        close.await
+    };
+    let text = result?;
+    closed?;
+    Ok(text)
 }
 
 #[derive(Default)]
