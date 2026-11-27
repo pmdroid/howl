@@ -147,13 +147,13 @@ async fn challenge(http: &Client, url: &str, op: &str, token: &str) -> String {
     string(&result, "nonce").to_owned()
 }
 
-async fn allow_poll(pool: &Pool) {
+async fn allow_poll(pool: &Pool, login: &[u8; 32]) {
     pool.get()
         .await
         .unwrap()
         .execute(
-            "UPDATE howl_control.pending_logins SET next_poll = clock_timestamp()",
-            &[],
+            "UPDATE howl_control.pending_logins SET next_poll = clock_timestamp() WHERE id = $1",
+            &[&&login[..]],
         )
         .await
         .unwrap();
@@ -200,11 +200,16 @@ async fn device_login_rejects_replays_and_rotates_or_revokes_device_bound_creden
         "device_id":hex::encode(DEVICE), "signing_key":hex::encode(key.verifying_key().to_bytes()),
     })).send().await.unwrap()).await;
     assert_eq!(start["user_code"], "ABCD-EFGH");
+    let login = string(&start, "login");
+    let login_id = proof::decode::<32>(login).unwrap();
     let row = owner
         .get()
         .await
         .unwrap()
-        .query_one("SELECT provider_code FROM howl_control.pending_logins", &[])
+        .query_one(
+            "SELECT provider_code FROM howl_control.pending_logins WHERE id = $1",
+            &[&&login_id[..]],
+        )
         .await
         .unwrap();
     assert!(
@@ -212,7 +217,6 @@ async fn device_login_rejects_replays_and_rotates_or_revokes_device_bound_creden
             .windows(DEVICE_CODE.len())
             .any(|bytes| bytes == DEVICE_CODE.as_bytes())
     );
-    let login = string(&start, "login");
     let poll = format!("{url}/v1/login/device/{login}/poll");
     let initial_nonce = string(&start, "nonce");
     let wrong = sign(&wrong_key, login, "poll", initial_nonce, None);
@@ -231,7 +235,7 @@ async fn device_login_rejects_replays_and_rotates_or_revokes_device_bound_creden
         StatusCode::TOO_MANY_REQUESTS
     );
     assert_eq!(upstream.polls.load(Ordering::SeqCst), 0);
-    allow_poll(&owner).await;
+    allow_poll(&owner, &login_id).await;
     let pending = success(http.post(&poll).json(&signed).send().await.unwrap()).await;
     assert_eq!(pending["state"], "pending");
     assert_eq!(
@@ -243,7 +247,7 @@ async fn device_login_rejects_replays_and_rotates_or_revokes_device_bound_creden
             .status(),
         StatusCode::UNAUTHORIZED
     );
-    allow_poll(&owner).await;
+    allow_poll(&owner, &login_id).await;
     let slow = success(
         http.post(&poll)
             .json(&sign(&key, login, "poll", string(&pending, "nonce"), None))
@@ -253,7 +257,7 @@ async fn device_login_rejects_replays_and_rotates_or_revokes_device_bound_creden
     )
     .await;
     assert_eq!(slow["interval"], 8);
-    allow_poll(&owner).await;
+    allow_poll(&owner, &login_id).await;
     let logged_in = success(
         http.post(&poll)
             .json(&sign(&key, login, "poll", string(&slow, "nonce"), None))
@@ -905,4 +909,144 @@ fn enrollment_material(
         .unwrap();
     json!({"authority":[hex::encode(genesis.as_bytes())], "designation":hex::encode(designation.as_bytes()),
         "certificate":hex::encode(certificate.as_bytes())})
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL roles and HOWL_TEST_CONTROL_CLI pointing to the built Howl binary"]
+async fn native_login_persists_private_credentials_and_enrolls_through_refresh() {
+    use crate::{EnrollmentPin, pin_enrollment};
+    use howl::enrollment::{Authority, AuthorityRecord, AuthorityStore, Designation};
+    use std::{fs, os::unix::fs::PermissionsExt};
+
+    let binary = std::env::var_os("HOWL_TEST_CONTROL_CLI").unwrap();
+    let owner = pool("HOWL_TEST_CONTROL_DATABASE_OWNER");
+    migrate(&owner).await.unwrap();
+    let runtime = pool("HOWL_TEST_CONTROL_DATABASE_RUNTIME");
+    let upstream = Arc::new(Provider {
+        polls: AtomicUsize::new(2),
+        revoked: AtomicUsize::new(0),
+    });
+    let provider = serve(
+        Router::new()
+            .route("/login/device/code", post(start))
+            .route("/login/oauth/access_token", post(upstream_poll))
+            .route("/user", get(user))
+            .route("/applications/fixtureapp/grant", delete(upstream_revoke))
+            .with_state(upstream.clone()),
+    )
+    .await;
+    let github = GitHub::new("fixtureapp".into(), Zeroizing::new("fixture_secret".into()))
+        .unwrap()
+        .fixture(provider.url.clone());
+    let control =
+        Arc::new(ControlPlane::new(runtime, github, AUDIENCE, Zeroizing::new([3; 32])).unwrap());
+    let server = serve(control.router()).await;
+    let root = tempfile::tempdir().unwrap();
+    let device = root.path().join("device");
+    let identity = enrollment_identity(&device, [61, 62, 63, 64]);
+    let root_key = SigningKey::from_bytes(&[65; 32]);
+    let recovery = SigningKey::from_bytes(&[66; 32]);
+    let membership = SigningKey::from_bytes(&[67; 32]);
+    let genesis = AuthorityRecord::genesis(&root_key, &recovery);
+    let account = genesis.digest();
+    let head = Authority::import([genesis.clone()], account, account)
+        .unwrap()
+        .head()
+        .unwrap();
+    let designation = Designation::issue(head, 1, &root_key, &membership, &[]).unwrap();
+    pin_enrollment(
+        &owner,
+        EnrollmentPin {
+            github_id: 1234567,
+            account_id: account,
+            authority_head: head.digest,
+            designation_digest: designation.digest(),
+        },
+    )
+    .await
+    .unwrap();
+    let authority = root.path().join("authority");
+    AuthorityStore::open(&authority)
+        .unwrap()
+        .initialize(std::slice::from_ref(&genesis), account, head.digest)
+        .unwrap();
+    let material = enrollment_material(
+        &root.path().join("pairing"),
+        &identity,
+        &genesis,
+        &designation,
+        &membership,
+    );
+    let designation_file = root.path().join("designation.bin");
+    let certificate_file = root.path().join("certificate.bin");
+    fs::write(
+        &designation_file,
+        hex::decode(string(&material, "designation")).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        &certificate_file,
+        hex::decode(string(&material, "certificate")).unwrap(),
+    )
+    .unwrap();
+
+    let mut login = tokio::process::Command::new(&binary);
+    login
+        .args(["control", "login"])
+        .arg(&device)
+        .env("HOWL_CONTROL_URL", &server.url)
+        .env("HOWL_CONTROL_AUDIENCE", hex::encode(AUDIENCE));
+    let login = login.output().await.unwrap();
+    assert!(
+        login.status.success(),
+        "{}",
+        String::from_utf8_lossy(&login.stderr)
+    );
+    let stdout = String::from_utf8(login.stdout).unwrap();
+    assert!(stdout.contains("ABCD-EFGH") && stdout.contains("https://github.com/login/device"));
+    assert_eq!(upstream.revoked.load(Ordering::SeqCst), 1);
+    let record = device.join("credentials");
+    assert_eq!(
+        fs::metadata(&record).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let mut before: Value = serde_json::from_slice(&fs::read(&record).unwrap()).unwrap();
+    let credentials = &before["credentials"];
+    assert!(!stdout.contains(string(credentials, "access_token")));
+    assert!(!stdout.contains(string(credentials, "refresh_token")));
+    before["access_expires"] = json!(1);
+    fs::write(&record, serde_json::to_vec(&before).unwrap()).unwrap();
+    let mut enroll = tokio::process::Command::new(&binary);
+    enroll
+        .args(["control", "enroll"])
+        .arg(&device)
+        .arg(&authority)
+        .arg(&designation_file)
+        .arg(&certificate_file)
+        .env_remove("HOWL_CONTROL_URL")
+        .env_remove("HOWL_CONTROL_AUDIENCE")
+        .env_remove("HOWL_CONTROL_SESSION_ID")
+        .env_remove("HOWL_CONTROL_ACCESS_TOKEN");
+    let enrolled = enroll.output().await.unwrap();
+    assert!(
+        enrolled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&enrolled.stderr)
+    );
+    let after: Value = serde_json::from_slice(&fs::read(&record).unwrap()).unwrap();
+    assert_ne!(
+        after["credentials"]["refresh_token"],
+        before["credentials"]["refresh_token"]
+    );
+    let row = owner
+        .get()
+        .await
+        .unwrap()
+        .query_one(
+            "SELECT records FROM howl_control.enrolled_devices WHERE device_id = $1",
+            &[&&identity.certificate().device_id()[..]],
+        )
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, Value>(0), material);
 }
