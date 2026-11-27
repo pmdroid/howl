@@ -130,3 +130,25 @@ howl webhook replay "$HOWL_STATE" webhooks.json observer-events "$HOWL_EVENT_ID"
 ```
 
 Rotate the signing secret or disable an endpoint by atomically replacing its protected config. Replace the receiver key together with the sender key. The worker binds queued events to the active endpoint configuration and checks channel access before sending. Its delivery status includes the endpoint name, event ID, attempt and outcome.
+
+### Trigger a Grok Bot routine
+
+Add a webhook trigger to the routine in Grok Bot. Copy the routine's **POST to** URL and **key** into an endpoint in the protected webhook configuration. [Grok Bot webhook setup](https://docs.x.ai/grok-bot/skills-routines-and-automations#webhooks)
+
+```json
+{
+  "endpoints": [
+    {
+      "name": "grok-bot",
+      "url": "<routine POST to URL>",
+      "grok_bot_key": "<routine key>",
+      "channels": ["<channel ID>"],
+      "events": ["run.completed"],
+      "enabled": true,
+      "include_content": false
+    }
+  ]
+}
+```
+
+Howl delivers the event as JSON with the routine key in the `Authorization` header. HTTP 200 confirms the routine started. The routine can use its own Howl MCP connection to fetch context or send a follow-up.

@@ -19,7 +19,8 @@ fn raw_endpoint(url: &str, allow_private_ips: Vec<IpAddr>) -> EndpointConfig {
     EndpointConfig {
         name: "receiver".into(),
         url: url.into(),
-        signing_secret: hex::encode([0x42; 32]),
+        signing_secret: Some(hex::encode([0x42; 32])),
+        grok_bot_key: None,
         channels: vec![hex::encode([0x20; 32])],
         events: vec![WebhookEventKind::MessageReceived],
         enabled: true,

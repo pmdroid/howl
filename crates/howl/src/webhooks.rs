@@ -12,7 +12,7 @@ use std::{
 use base64::{Engine, engine::general_purpose::STANDARD};
 use hmac::{Hmac, Mac};
 use howl_envelope::Id;
-use reqwest::{Client, StatusCode, Url, redirect::Policy};
+use reqwest::{Client, StatusCode, Url, header, redirect::Policy};
 use rustix::fs::OFlags;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -48,7 +48,10 @@ struct Configuration {
 struct EndpointConfig {
     name: String,
     url: String,
-    signing_secret: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    signing_secret: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    grok_bot_key: Option<String>,
     channels: Vec<String>,
     events: Vec<WebhookEventKind>,
     #[serde(default)]
@@ -59,10 +62,15 @@ struct EndpointConfig {
     allow_private_ips: Vec<IpAddr>,
 }
 
+enum Authentication {
+    Standard(Zeroizing<Id>),
+    GrokBot(header::HeaderValue),
+}
+
 struct Endpoint {
     name: String,
     url: Url,
-    secret: Zeroizing<Id>,
+    authentication: Authentication,
     revision: Id,
     channels: Vec<Id>,
     events: Vec<WebhookEventKind>,
@@ -72,11 +80,31 @@ struct Endpoint {
 
 impl Endpoint {
     fn compile(config: EndpointConfig, revision: Id) -> io::Result<Self> {
-        let signing_secret = Zeroizing::new(config.signing_secret);
-        let secret = Zeroizing::new(parse_id(&signing_secret)?);
-        if secret.iter().all(|byte| *byte == 0) {
-            return Err(config_error());
-        }
+        let authentication = match (
+            config.signing_secret.map(Zeroizing::new),
+            config.grok_bot_key.map(Zeroizing::new),
+        ) {
+            (Some(signing_secret), None) => {
+                let secret = Zeroizing::new(parse_id(&signing_secret)?);
+                if secret.iter().all(|byte| *byte == 0) {
+                    return Err(config_error());
+                }
+                Authentication::Standard(secret)
+            }
+            (None, Some(key))
+                if !key.is_empty()
+                    && key
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b"-._~+/=".contains(&byte)) =>
+            {
+                let bearer = Zeroizing::new(format!("Bearer {}", &*key));
+                let mut value =
+                    header::HeaderValue::from_str(&bearer).map_err(|_| config_error())?;
+                value.set_sensitive(true);
+                Authentication::GrokBot(value)
+            }
+            _ => return Err(config_error()),
+        };
         let url = Url::parse(&config.url).map_err(|_| config_error())?;
         let host = destination_host(&url).ok_or_else(config_error)?;
         let literal = host.parse::<IpAddr>().ok();
@@ -105,7 +133,7 @@ impl Endpoint {
         Ok(Self {
             name: config.name,
             url,
-            secret,
+            authentication,
             revision,
             channels,
             events: config.events,
@@ -363,20 +391,25 @@ async fn send(
     let Ok(client) = client else {
         return WebhookOutcome::Retry;
     };
-    let response = client
+    let request = client
         .post(endpoint.url.clone())
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .header("Webhook-Id", id)
-        .header("Webhook-Timestamp", timestamp.to_string())
-        .header(
-            "Webhook-Signature",
-            signature(&endpoint.secret, id, timestamp, body),
-        )
-        .body(body.to_owned())
-        .send()
-        .await;
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("Webhook-Id", id);
+    let request = match &endpoint.authentication {
+        Authentication::Standard(secret) => request
+            .header("Webhook-Timestamp", timestamp.to_string())
+            .header("Webhook-Signature", signature(secret, id, timestamp, body)),
+        Authentication::GrokBot(bearer) => request.header(header::AUTHORIZATION, bearer.clone()),
+    };
+    let response = request.body(body.to_owned()).send().await;
     match response.map(|response| response.status()) {
-        Ok(status) if status.is_success() => WebhookOutcome::Delivered,
+        Ok(status)
+            if status == StatusCode::OK
+                || (status.is_success()
+                    && matches!(endpoint.authentication, Authentication::Standard(_))) =>
+        {
+            WebhookOutcome::Delivered
+        }
         Ok(status)
             if status.is_server_error()
                 || matches!(
