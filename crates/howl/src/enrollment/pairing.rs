@@ -233,6 +233,41 @@ impl PairingOffer {
         })
     }
 
+    pub(super) fn verify_sequence(
+        &self,
+        designation: &Designation,
+        peer: &PeerCertificate,
+        sequence: u64,
+        now: u64,
+    ) -> io::Result<()> {
+        if self.check(designation, peer, now)?.sequence != sequence {
+            return Err(invalid(
+                "pairing offer already uses a different certificate sequence",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn issued(
+        &self,
+        state: &Path,
+        designation: &Designation,
+        peer: &PeerCertificate,
+    ) -> io::Result<DeviceCertificate> {
+        let created = u64::from_be_bytes(take(&self.0, OFFER.len() + 136));
+        let checked = self.check(designation, peer, created)?;
+        let state = StateDirectory::open(state)?;
+        let bytes =
+            state.read_bounded(&format!("pairing-used-{}", hex::encode(checked.nonce)), 512)?;
+        let certificate = DeviceCertificate::verify(&bytes, designation)?;
+        if !certificate.matches(peer) || certificate.sequence != checked.sequence {
+            return Err(invalid(
+                "issued device certificate does not match the pairing offer",
+            ));
+        }
+        Ok(certificate)
+    }
+
     fn check(
         &self,
         designation: &Designation,
