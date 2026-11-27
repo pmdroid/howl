@@ -10,6 +10,7 @@ mod pairing;
 pub(crate) mod profile;
 mod recovery;
 mod roster;
+pub mod roster_cli;
 mod roster_store;
 
 pub use membership::{Designation, DeviceCertificate, Floor, revoke, verify_revocation};
