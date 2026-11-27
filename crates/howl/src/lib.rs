@@ -17,7 +17,7 @@ mod local_control;
 pub mod node;
 
 pub mod delivery;
-mod discovery;
+pub mod discovery;
 pub mod observer;
 pub mod presence;
 
