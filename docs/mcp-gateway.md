@@ -92,6 +92,28 @@ Keep human approval on the enrolled operator device. The operator sets the signe
 
 The gateway emits request audit entries with the integration ID, HTTP method, and response status. Protect its service logs and keep credentials and payloads out of reverse-proxy log formats. Mesh peers continue to exchange encrypted signed envelopes. Keep the gateway bound to loopback when running a same-host proxy or private tunnel.
 
+## Talk to an ongoing agent
+
+On the agent's mesh node, create a `conversations.json` file in its state directory with mode `600`. Each entry grants one signed peer access to an ongoing conversation and selects the read-only repository snapshot for that conversation.
+
+```json
+{
+  "conversations": [
+    {
+      "channel": "<channel ID>",
+      "peer": "<operator device ID>",
+      "repository": "/absolute/path/to/repo",
+      "revision": "main",
+      "schedules": [
+        { "name": "check-in", "seconds": 3600, "instruction": "Summarize decisions from this conversation." }
+      ]
+    }
+  ]
+}
+```
+
+With that node's mesh daemon running, start `howl agent serve "$HOWL_STATE" claude "$HOWL_REPOSITORY_IMAGE"` using the environment for the selected host agent. In the TUI, select the agent as a direct peer and send a message. For MCP, configure a conversation entry with `integration` set to the signed integration ID shown in the gateway's chat events. Send through the `dm` tool and read the same direct conversation. When using direct routing, set `route` to the configured peer address.
+
 ## Deliver events to a webhook
 
 Give the webhook worker its own protected JSON configuration. Run it with the enrolled node state and pair each endpoint with the channels and event types the receiver has consent to process. Use metadata-only delivery when a receiver only needs to acknowledge or route an event. Set `include_content` to `true` when the receiver needs message content and the participants have authorized its disclosure.
