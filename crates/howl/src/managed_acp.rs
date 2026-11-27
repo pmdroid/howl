@@ -34,7 +34,10 @@ use tokio::{
 };
 use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec};
 
-use crate::observer::{ObserverProcess, ObserverProvider, Snapshot, WORKSPACE};
+use crate::claude_tunnel::ClaudeTunnel;
+use crate::observer::{
+    NativeClaudeProfile, ObserverProcess, ObserverProvider, Snapshot, WORKSPACE,
+};
 use crate::provider_broker::{self, Broker, Provider};
 use journal::Journal;
 
@@ -88,11 +91,18 @@ pub struct Harness {
     args: Vec<String>,
     provider: Option<(Provider, String)>,
     chatgpt: Option<ChatGptPlanAuth>,
+    native_claude: Option<NativeClaudeProfile>,
 }
 
 impl Harness {
     pub fn codex(image: String) -> Self {
         Self::new("codex", image, "/usr/local/bin/codex-acp", &[])
+    }
+
+    pub fn native_claude(image: String, profile: NativeClaudeProfile) -> Self {
+        let mut harness = Self::new("claude-native", image, "/fixture/claude-agent.sh", &[]);
+        harness.native_claude = Some(profile);
+        harness
     }
 
     pub fn grok(image: String) -> Self {
@@ -118,6 +128,7 @@ impl Harness {
             args: args.iter().map(|arg| (*arg).to_owned()).collect(),
             provider: None,
             chatgpt: None,
+            native_claude: None,
         }
     }
 
@@ -170,6 +181,10 @@ impl Harness {
             hash.update(b"chatgpt-plan-store");
             hash.update((store.len() as u64).to_be_bytes());
             hash.update(store);
+        }
+        if let Some(profile) = &self.native_claude {
+            hash.update(b"native-claude-profile");
+            hash.update(profile.name().as_bytes());
         }
         hash.finalize().into()
     }
@@ -287,6 +302,9 @@ impl ManagedSession {
         id: String,
         restore: Option<Restore>,
     ) -> Result<Self> {
+        if harness.native_claude.is_some() && harness.provider.is_some() {
+            return Err(Error::State);
+        }
         let broker = harness.broker().await?;
         Self::open_with_broker(root, provider, snapshot, harness, id, restore, broker).await
     }
@@ -323,6 +341,7 @@ impl ManagedSession {
         };
         let root = root.to_owned();
         let provider = provider.clone();
+        let native_claude = harness.native_claude.is_some();
         let (journal, process) = tokio::task::spawn_blocking(move || -> Result<_> {
             let journal = if let Some(restore) = restore {
                 let journal = Journal::existing(&root, expected)?;
@@ -347,6 +366,7 @@ impl ManagedSession {
                 &harness.executable,
                 &args,
                 &id,
+                harness.native_claude.as_ref(),
             ) {
                 Ok(process) => {
                     journal.update(|state| {
@@ -374,13 +394,24 @@ impl ManagedSession {
         } else {
             None
         };
+        let tunnel = if native_claude {
+            match ClaudeTunnel::attach(&process).await {
+                Ok(tunnel) => Some(tunnel),
+                Err(error) => {
+                    journal.update(|state| state.phase = Phase::Interrupted)?;
+                    return Err(error.into());
+                }
+            }
+        } else {
+            None
+        };
         let status = journal.subscribe();
         let (commands, requests) = mpsc::channel(32);
         let (events, _) = broadcast::channel(64);
         let (ready, initialized) = oneshot::channel();
         tokio::spawn(supervise(
             process,
-            broker,
+            (broker, tunnel),
             journal,
             requests,
             events.clone(),
@@ -469,7 +500,7 @@ fn check_restore(mode: Restore, state: &SessionState) -> Result<()> {
 
 async fn supervise(
     mut process: ObserverProcess,
-    _broker: Option<provider_broker::BrokerTask>,
+    _egress: (Option<provider_broker::BrokerTask>, Option<ClaudeTunnel>),
     journal: Journal,
     requests: mpsc::Receiver<Command>,
     events: broadcast::Sender<Event>,

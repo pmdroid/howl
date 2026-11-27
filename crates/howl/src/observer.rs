@@ -13,6 +13,8 @@ use tempfile::TempDir;
 
 pub use snapshot::Snapshot;
 
+const CLAUDE_PROFILE_LABEL: &str = "com.howl.native-claude";
+const CLAUDE_PROFILE_PATH: &str = "/claude-profile";
 const MANAGED_LABEL: &str = "com.howl.managed-session";
 const TOOL_PATH: &str = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin";
 pub const WORKSPACE: &str = "/workspace";
@@ -27,6 +29,8 @@ pub enum Error {
     UnsupportedImage,
     #[error("the harness executable must be an absolute container path")]
     InvalidExecutable,
+    #[error("a local Docker volume initialized for this Claude profile is required")]
+    NativeClaudeProfile,
     #[error("invalid commit or selection of tracked files")]
     InvalidSnapshot,
     #[error("snapshot path is outside policy: {}", .0.display())]
@@ -41,6 +45,34 @@ pub enum Error {
 }
 
 type Result<T> = std::result::Result<T, Error>;
+
+pub struct NativeClaudeProfile {
+    name: String,
+}
+
+impl NativeClaudeProfile {
+    pub fn new(name: &str) -> Result<Self> {
+        if name.is_empty()
+            || name.len() > 40
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        {
+            return Err(Error::NativeClaudeProfile);
+        }
+        Ok(Self {
+            name: name.to_owned(),
+        })
+    }
+
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn volume(&self) -> String {
+        format!("howl-claude-{}", self.name)
+    }
+}
 
 #[derive(Clone)]
 pub struct ObserverProvider {
@@ -105,7 +137,7 @@ impl ObserverProvider {
         executable: &Path,
         args: &[&str],
     ) -> Result<ObserverProcess> {
-        self.launch_isolated(snapshot, image, executable, args, None)
+        self.launch_isolated(snapshot, image, executable, args, None, None)
     }
 
     pub(crate) fn launch_managed(
@@ -115,11 +147,12 @@ impl ObserverProvider {
         executable: &Path,
         args: &[&str],
         session: &str,
+        claude: Option<&NativeClaudeProfile>,
     ) -> Result<ObserverProcess> {
         if !digest(session, &[32]) {
             return Err(Error::InvalidSnapshot);
         }
-        self.launch_isolated(snapshot, image, executable, args, Some(session))
+        self.launch_isolated(snapshot, image, executable, args, Some(session), claude)
     }
 
     fn launch_isolated(
@@ -129,11 +162,15 @@ impl ObserverProvider {
         executable: &Path,
         args: &[&str],
         session: Option<&str>,
+        claude: Option<&NativeClaudeProfile>,
     ) -> Result<ObserverProcess> {
         if !executable.is_absolute() {
             return Err(Error::InvalidExecutable);
         }
         self.verify_image(image)?;
+        let claude_volume = claude
+            .map(|profile| self.claude_volume(profile))
+            .transpose()?;
         let label = session.map(|session| format!("{MANAGED_LABEL}={session}"));
         let volume = self.create_volume(label.as_deref())?;
         let mount = format!(
@@ -172,6 +209,19 @@ impl ObserverProvider {
         create.arg("create");
         if let Some(label) = &label {
             create.args(["--label", label]);
+        }
+        if let Some(volume) = claude_volume {
+            create
+                .arg(format!("--name={volume}"))
+                .arg(format!(
+                    "--env=HTTPS_PROXY={}",
+                    crate::claude_tunnel::CLAUDE_PROXY
+                ))
+                .arg(format!("--env=CLAUDE_CONFIG_DIR={CLAUDE_PROFILE_PATH}"))
+                .arg("--mount")
+                .arg(format!(
+                    "type=volume,src={volume},dst={CLAUDE_PROFILE_PATH},volume-nocopy"
+                ));
         }
         create
             .args([
@@ -223,6 +273,30 @@ impl ObserverProvider {
             container: Some(container),
             _volume: volume,
         })
+    }
+
+    fn claude_volume(&self, profile: &NativeClaudeProfile) -> Result<String> {
+        let volume = profile.volume();
+        let bytes = self
+            .run(
+                self.command()
+                    .args(["volume", "inspect", "--format", "{{json .}}", &volume]),
+                "check native Claude profile",
+            )
+            .map_err(|_| Error::NativeClaudeProfile)?;
+        let metadata: Value =
+            serde_json::from_slice(&bytes).map_err(|_| Error::NativeClaudeProfile)?;
+        if metadata["Driver"] != "local"
+            || metadata["Scope"] != "local"
+            || metadata["Labels"][CLAUDE_PROFILE_LABEL] != profile.name()
+            || !(metadata["Options"].is_null()
+                || metadata["Options"]
+                    .as_object()
+                    .is_some_and(serde_json::Map::is_empty))
+        {
+            return Err(Error::NativeClaudeProfile);
+        }
+        Ok(volume)
     }
 
     fn verify_image(&self, image: &str) -> Result<()> {

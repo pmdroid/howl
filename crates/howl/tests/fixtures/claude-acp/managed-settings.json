@@ -1,0 +1,19 @@
+{
+  "disableClaudeAiConnectors": true,
+  "disableAllHooks": true,
+  "allowManagedMcpServersOnly": true,
+  "permissions": {
+    "deny": [
+      "Bash",
+      "PowerShell",
+      "Agent",
+      "WebFetch",
+      "WebSearch",
+      "Write",
+      "Edit",
+      "NotebookEdit",
+      "Read(//claude-profile/**)",
+      "Read(//scratch/**)"
+    ]
+  }
+}

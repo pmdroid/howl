@@ -15,6 +15,7 @@ pub mod channel;
 mod local_control;
 pub mod node;
 
+mod claude_tunnel;
 pub mod delivery;
 pub mod observer;
 pub mod presence;
