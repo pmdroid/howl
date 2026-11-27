@@ -9,13 +9,13 @@ pub use budget::{
     HumanCommand, Turn, WakeApproval, WakeOutcome, WakeTurnError,
 };
 pub(crate) use mailbox_outbox::MAILBOX_OUTBOX_BATCH;
-pub use messages::ChannelMessage;
+pub use messages::{ChannelEvent, ChannelMessage};
 pub use wake::{WakeClaim, WakeJob, WakeState};
 
 use std::{fs::File, io, ops::RangeInclusive, path::Path, time::Duration};
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
-use howl_envelope::AgentReply;
+use howl_envelope::{AgentReply, Body};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
@@ -332,7 +332,14 @@ impl DeliveryStore {
         recipients: &[Device],
         now: u64,
     ) -> Result<()> {
-        self.enqueue_frames(frame, bytes, recipients, EnqueueTime::Ordinary(now), None)
+        self.enqueue_frames(
+            frame,
+            bytes,
+            recipients,
+            EnqueueTime::Ordinary(now),
+            None,
+            None,
+        )
     }
 
     pub fn enqueue_routed(
@@ -343,6 +350,18 @@ impl DeliveryStore {
         route: &str,
         now: u64,
     ) -> Result<()> {
+        self.enqueue_routed_message(frame, bytes, recipient, route, now, None)
+    }
+
+    pub(crate) fn enqueue_routed_message(
+        &mut self,
+        frame: Frame,
+        bytes: &[u8],
+        recipient: Device,
+        route: &str,
+        now: u64,
+        body: Option<Body<&str>>,
+    ) -> Result<()> {
         if route.is_empty() || route.len() > 64 {
             return Err(Error::InvalidFrame);
         }
@@ -352,6 +371,7 @@ impl DeliveryStore {
             &[recipient],
             EnqueueTime::Ordinary(now),
             Some(route),
+            body,
         )
     }
 
@@ -376,6 +396,7 @@ impl DeliveryStore {
                 clock: &fresh_clock,
             },
             Some(route),
+            Some(Body::AgentReply(approved.reply)),
         )
     }
 
@@ -386,6 +407,7 @@ impl DeliveryStore {
         recipients: &[Device],
         time: EnqueueTime<'_>,
         route: Option<&str>,
+        body: Option<Body<&str>>,
     ) -> Result<()> {
         frame.validate(bytes)?;
         if frame.stream.sender != self.local {
@@ -509,6 +531,11 @@ impl DeliveryStore {
                 params![recipients[0].encode(), route],
             )?;
         }
+        if changed != 0
+            && let Some(body) = body
+        {
+            messages::record_outbound(&tx, row, recipients[0], now, body)?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -615,6 +642,9 @@ impl DeliveryStore {
         let mut statement = self.connection.prepare(
             "SELECT substr(stream, 33, 64), message, received, body FROM inbox
              WHERE substr(stream, 1, 32) = ?1 AND kind = 1 AND body IS NOT NULL
+             AND NOT EXISTS (
+                 SELECT 1 FROM channel_event_addresses WHERE cursor = inbox.id AND outbound = 1
+             )
              ORDER BY received DESC, id DESC LIMIT ?2",
         )?;
         Ok(statement
@@ -823,28 +853,22 @@ impl DeliveryStore {
                     frame.expires_at.to_be_bytes(), digest, bytes, kind, target, body,
                 ],
             )?;
+            let cursor = tx.last_insert_rowid();
+            if kind != 2 {
+                messages::record_inbound_recipient(&tx, cursor, bytes, self.local)?;
+            }
             if kind == 1 {
                 tx.execute(
                     "INSERT INTO chat_search (rowid, body) VALUES (?1, ?2)",
-                    params![tx.last_insert_rowid(), body],
+                    params![cursor, body],
                 )?;
             } else if let Some(reply) = agent_reply {
-                tx.execute(
-                    "INSERT INTO agent_replies (cursor, agent, role, in_reply_to, context_digest)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![
-                        tx.last_insert_rowid(),
-                        reply.agent,
-                        reply.role as u8,
-                        reply.in_reply_to,
-                        reply.context_digest
-                    ],
-                )?;
+                messages::record_agent_reply(&tx, cursor, reply)?;
             } else if kind == 2 {
                 tx.execute(
                     "INSERT INTO wake_queue (cursor, generation, state)
                      SELECT ?1, generation, 0 FROM wake_targets WHERE channel = ?2 AND target = ?3 AND status = 1",
-                    params![tx.last_insert_rowid(), frame.stream.channel, target],
+                    params![cursor, frame.stream.channel, target],
                 )?;
             }
         }

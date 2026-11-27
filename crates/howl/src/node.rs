@@ -26,6 +26,7 @@ use crate::{
     discovery::{self, HINT_LEN, RouteHint},
     enrollment::{ChannelPermission, profile::Profile},
     identity::{LocalIdentity, PeerCertificate, PeerTrust, StateDirectory},
+    interaction::LocalInteraction,
     local_control::{self, ControlServer},
     transport::{EndpointAddr, Network, ReceivedFrame, RelayUrl, Transport},
 };
@@ -38,6 +39,20 @@ const DELIVERY_KEY: &str = "delivery.key";
 const DELIVERY_DB: &str = "delivery.db";
 
 pub async fn run(state: &Path, listen: &str, relay: Option<&str>) -> io::Result<()> {
+    run_node(state, listen, relay, true).await
+}
+
+pub async fn run_client(state: &Path, listen: &str, relay: Option<&str>) -> io::Result<()> {
+    LocalInteraction::new(state).require_enrolled()?;
+    run_node(state, listen, relay, false).await
+}
+
+async fn run_node(
+    state: &Path,
+    listen: &str,
+    relay: Option<&str>,
+    accepts_wakes: bool,
+) -> io::Result<()> {
     let identity = Arc::new(LocalIdentity::load_or_create(state)?);
     let local = identity.certificate();
     let directory = StateDirectory::open(state)?;
@@ -56,7 +71,9 @@ pub async fn run(state: &Path, listen: &str, relay: Option<&str>) -> io::Result<
     let transport =
         Arc::new(Transport::bind(&identity, PeerTrust::open(state)?, network, bind).await?);
     let mut delivery = open_delivery(state, &directory, &local)?;
-    delivery.recover_wakes().map_err(io::Error::other)?;
+    if accepts_wakes {
+        delivery.recover_wakes().map_err(io::Error::other)?;
+    }
     let address = transport.address();
     for ip in address.ip_addrs() {
         println!("Listening {ip}");
@@ -86,6 +103,9 @@ pub async fn run(state: &Path, listen: &str, relay: Option<&str>) -> io::Result<
                     break Some(link);
                 }
                 let queued = request.and_then(|bytes| {
+                    if !accepts_wakes && bytes.first() == Some(&b'G') {
+                        return Err(forbidden("client-only device cannot grant inbound wake"));
+                    }
                     queue(state, &identity, &mut delivery, relay.is_some(), &bytes)
                 });
                 replies.spawn(async move { local_control::reply(&mut link, queued).await });
@@ -97,7 +117,7 @@ pub async fn run(state: &Path, listen: &str, relay: Option<&str>) -> io::Result<
             }
             incoming = transport.receive(), if deliveries.len() < DELIVERY_WORKERS => {
                 let Some(incoming) = incoming else { break None; };
-                match accept(state, &identity, &mut delivery, &incoming) {
+                match accept(state, &identity, &mut delivery, &incoming, accepts_wakes) {
                     Ok(Some(ack)) => {
                         deliveries.spawn(async move { incoming.reply(ack.as_bytes()).await });
                     }
@@ -251,12 +271,7 @@ pub async fn stop(state: &Path) -> io::Result<()> {
 }
 
 pub fn read(state: &Path, id: Id) -> io::Result<()> {
-    let identity = LocalIdentity::load_or_create(state)?;
-    let (delivery, _) = history_delivery(state, &identity, id)?;
-    for item in delivery
-        .channel_history(id, 100)
-        .map_err(io::Error::other)?
-    {
+    for item in LocalInteraction::new(state).history_messages(id, 100)? {
         let sender = hex::encode(item.sender.device);
         match item.body {
             Body::Chat(text) => println!("{sender} {} {text:?}", item.received_at),
@@ -282,11 +297,7 @@ pub fn read(state: &Path, id: Id) -> io::Result<()> {
 }
 
 pub fn status(state: &Path, channel: Id, message: Id) -> io::Result<()> {
-    let identity = LocalIdentity::load_or_create(state)?;
-    let (delivery, stream) = history_delivery(state, &identity, channel)?;
-    let results = delivery
-        .delivery_status(stream, message)
-        .map_err(io::Error::other)?;
+    let results = LocalInteraction::new(state).delivery_status(channel, message)?;
     if results.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -519,7 +530,7 @@ fn queue_frame(
             created_at: now,
             expires_at,
         },
-        body,
+        body.clone(),
         &signer,
         &[recipient(device_for(state, target)?, target)],
     )
@@ -536,7 +547,14 @@ fn queue_frame(
             unix_time,
             approved,
         ),
-        None => delivery.enqueue_routed(outbound, &sealed, device_for(state, target)?, &route, now),
+        None => delivery.enqueue_routed_message(
+            outbound,
+            &sealed,
+            device_for(state, target)?,
+            &route,
+            now,
+            Some(body),
+        ),
     }
     .map_err(io::Error::other)?;
     Ok(format!("queued {}", hex::encode(metadata.message_id)))
@@ -639,6 +657,7 @@ fn accept(
     identity: &LocalIdentity,
     delivery: &mut DeliveryStore,
     incoming: &ReceivedFrame,
+    accepts_wakes: bool,
 ) -> io::Result<Option<Acknowledgment>> {
     let bytes = &incoming.bytes;
     let peer = &incoming.peer;
@@ -656,6 +675,9 @@ fn accept(
     }
 
     let unverified = howl_envelope::inspect_unverified(bytes).map_err(io::Error::other)?;
+    if !accepts_wakes && unverified.intent == Intent::Wake {
+        return Err(forbidden("client-only device cannot receive wakes"));
+    }
     let receipt = accept_envelope(
         state,
         identity,

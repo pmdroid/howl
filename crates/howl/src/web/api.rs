@@ -10,7 +10,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use howl_envelope::{AgentRole, Body, Id};
+use howl_envelope::{AgentRole, Id};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -18,6 +18,7 @@ use super::Web;
 use crate::{
     channel::{Channel, MAX_MANIFEST_LEN},
     identity::{LocalIdentity, PeerCertificate, PeerTrust},
+    interaction::{LocalInteraction, Wake},
     node,
     observer::Snapshot,
     workflow,
@@ -112,13 +113,18 @@ pub(super) async fn command(State(web): State<Arc<Web>>, Json(input): Json<Comma
 
 async fn execute(web: Arc<Web>, input: Command) -> io::Result<Value> {
     let state = &web.directory;
+    let interaction = LocalInteraction::new(state);
     let receipt = match input {
         Command::Send {
             channel,
             peer,
             route,
             text,
-        } => node::send(state, id(&channel)?, id(&peer)?, &route, &text).await?,
+        } => {
+            interaction
+                .send(id(&channel)?, id(&peer)?, &route, &text)
+                .await?
+        }
         Command::Wake {
             channel,
             peer,
@@ -127,16 +133,16 @@ async fn execute(web: Arc<Web>, input: Command) -> io::Result<Value> {
             target,
             lifetime,
         } => {
-            node::send_wake(
-                state,
-                id(&channel)?,
-                id(&peer)?,
-                &route,
-                id(&target)?,
-                lifetime,
-                &text,
-            )
-            .await?
+            interaction
+                .wake(Wake {
+                    channel: id(&channel)?,
+                    peer: id(&peer)?,
+                    route: &route,
+                    target: id(&target)?,
+                    lifetime,
+                    text: &text,
+                })
+                .await?
         }
         Command::Grant {
             channel,
@@ -154,15 +160,12 @@ async fn execute(web: Arc<Web>, input: Command) -> io::Result<Value> {
                 .map_err(io::Error::other)?;
         }
     };
-    let message = receipt
-        .strip_prefix("queued ")
-        .ok_or_else(|| io::Error::other("Invalid mesh receipt"))?;
-    id(message)?;
-    Ok(json!({ "message": message }))
+    serde_json::to_value(receipt).map_err(io::Error::other)
 }
 
 fn execute_local(state: &Path, input: Command) -> io::Result<Value> {
     let identity = LocalIdentity::load_or_create(state)?;
+    let interaction = LocalInteraction::new(state);
     match input {
         Command::Overview => overview(state, &identity),
         Command::Create { peers } => {
@@ -192,7 +195,7 @@ fn execute_local(state: &Path, input: Command) -> io::Result<Value> {
             Ok(device_view(&peer))
         }
         Command::Pause { channel, root } => {
-            workflow::pause(state, id(&channel)?, id(&root)?)?;
+            interaction.cancel(id(&channel)?, id(&root)?)?;
             Ok(json!({ "paused": true }))
         }
         Command::Repository {
@@ -211,30 +214,8 @@ fn execute_local(state: &Path, input: Command) -> io::Result<Value> {
         }
         Command::Conversation { channel } => {
             let channel = id(&channel)?;
-            let (delivery, _) = node::history_delivery(state, &identity, channel)?;
-            let messages = delivery
-                .channel_history(channel, 100)
-                .map_err(io::Error::other)?
-                .into_iter()
-                .rev()
-                .map(|item| {
-                    let (text, role) = match item.body {
-                        Body::Chat(text) => (text, None),
-                        Body::AgentReply(reply) => (reply.text, Some(reply.role.name())),
-                        Body::Wake { text, .. } => (text, Some("wake")),
-                    };
-                    json!({
-                        "message": hex::encode(item.message),
-                        "sender": hex::encode(item.sender.device),
-                        "time": item.received_at,
-                        "text": text,
-                        "role": role,
-                    })
-                })
-                .collect::<Vec<_>>();
-            let work = delivery
-                .workflow_status(channel, node::unix_time()?)
-                .map_err(io::Error::other)?;
+            let messages = interaction.history(channel, 100)?;
+            let work = interaction.history_status(channel)?;
             Ok(json!({ "messages": messages, "work": work }))
         }
         Command::Search { channel, query } => {
@@ -251,11 +232,8 @@ fn execute_local(state: &Path, input: Command) -> io::Result<Value> {
             Ok(json!({ "matches": messages }))
         }
         Command::Delivery { channel, message } => {
-            let channel = id(&channel)?;
-            let (delivery, stream) = node::history_delivery(state, &identity, channel)?;
-            let items = delivery
-                .delivery_status(stream, id(&message)?)
-                .map_err(io::Error::other)?
+            let items = interaction
+                .delivery_status(id(&channel)?, id(&message)?)?
                 .into_iter()
                 .map(|item| {
                     json!({
