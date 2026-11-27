@@ -183,6 +183,7 @@ pub(super) fn record_outbound(
         Body::Chat(text) => (1, None, *text),
         Body::AgentReply(reply) => (3, None, reply.text),
         Body::Wake { session, text } => (4, Some(session), *text),
+        Body::CancelWake { .. } => return Err(Error::InvalidFrame),
     };
     connection.execute(
         "INSERT INTO inbox (stream, message, sequence, epoch, received, expires, digest, kind, target, body)

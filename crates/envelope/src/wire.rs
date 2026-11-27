@@ -16,7 +16,9 @@ pub fn validate_routing(routing: Routing, intent: Intent) -> Result<(), Error> {
         return Err(Error::Encoding);
     }
     match intent {
-        Intent::Chat | Intent::AgentReply | Intent::IntegrationChat if routing.expires_at == 0 => {
+        Intent::Chat | Intent::AgentReply | Intent::IntegrationChat | Intent::CancelWake
+            if routing.expires_at == 0 =>
+        {
             Ok(())
         }
         Intent::Wake | Intent::IntegrationWake
@@ -71,6 +73,10 @@ pub fn pad(body: Body<&str>, integration: Option<Id>) -> Result<Zeroizing<Vec<u8
             bytes.extend_from_slice(&session);
             text
         }
+        Body::CancelWake { wake } => {
+            bytes.extend_from_slice(&wake);
+            ""
+        }
         Body::AgentReply(reply) if !reply.text.is_empty() => {
             bytes.extend_from_slice(&reply.agent);
             bytes.push(reply.role as u8);
@@ -114,6 +120,13 @@ pub fn unpad(intent: Intent, plaintext: &[u8]) -> Result<(Body<String>, Option<I
                 session,
                 text: text(logical)?,
             }
+        }
+        Intent::CancelWake => {
+            let wake = take(&mut logical)?;
+            if !logical.is_empty() {
+                return Err(Error::Encoding);
+            }
+            Body::CancelWake { wake }
         }
         Intent::AgentReply => {
             let agent = take(&mut logical)?;
@@ -190,6 +203,7 @@ pub fn parse(frame: &[u8]) -> Result<Decoded<'_>, Error> {
         [WIRE_VERSION, 3] => Intent::AgentReply,
         [WIRE_VERSION, 4] => Intent::IntegrationChat,
         [WIRE_VERSION, 5] => Intent::IntegrationWake,
+        [WIRE_VERSION, 6] => Intent::CancelWake,
         _ => return Err(Error::Encoding),
     };
     let channel = take(&mut bytes)?;

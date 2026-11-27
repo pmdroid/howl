@@ -1,3 +1,4 @@
+pub(crate) mod cursors;
 pub(crate) mod resources;
 pub(crate) mod subscriptions;
 pub(crate) mod tasks;

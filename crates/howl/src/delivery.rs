@@ -5,6 +5,7 @@ mod messages;
 #[cfg(test)]
 mod reply_tests;
 mod wake;
+mod webhook_queue;
 pub use budget::{
     ApprovedWake, BudgetError, BudgetLimit, BudgetLimits, ConversationBudget, HumanAction,
     HumanCommand, Turn, WakeApproval, WakeOutcome, WakeTurnError,
@@ -17,6 +18,7 @@ pub(crate) use integration_runs::{
 pub(crate) use mailbox_outbox::MAILBOX_OUTBOX_BATCH;
 pub use messages::{ChannelEvent, ChannelMessage};
 pub use wake::{WakeClaim, WakeJob, WakeState};
+pub(crate) use webhook_queue::{WebhookAttempt, WebhookEventKind, WebhookFilter, WebhookOutcome};
 
 use std::{fs::File, io, ops::RangeInclusive, path::Path, time::Duration};
 
@@ -104,6 +106,7 @@ impl Frame {
 pub enum Payload<'a> {
     Chat(&'a str),
     Wake { target: Id, text: &'a str },
+    CancelWake { wake: Id },
     AgentReply(AgentReply<&'a str>),
 }
 
@@ -785,6 +788,7 @@ impl DeliveryStore {
                 };
                 (kind, Some(target), text, None)
             }
+            Payload::CancelWake { wake } if frame.expires_at == 0 => (5, Some(wake), "", None),
             Payload::AgentReply(reply)
                 if frame.expires_at == 0
                     && !reply.text.is_empty()
@@ -904,11 +908,26 @@ impl DeliveryStore {
                 messages::record_agent_reply(&tx, cursor, reply)?;
                 integration_runs::record_reply(&tx, frame, reply, now)?;
             } else if kind == 2 {
+                let cancelled = tx.query_row(
+                    "SELECT EXISTS (
+                        SELECT 1 FROM peer_wake_cancellations
+                        WHERE channel = ?1 AND sender = ?2 AND wake = ?3 AND valid_through >= ?4
+                    )",
+                    params![
+                        frame.stream.channel,
+                        frame.stream.sender.encode(),
+                        frame.message,
+                        now.to_be_bytes(),
+                    ],
+                    |row| row.get::<_, bool>(0),
+                )?;
                 tx.execute(
                     "INSERT INTO wake_queue (cursor, generation, state)
-                     SELECT ?1, generation, 0 FROM wake_targets WHERE channel = ?2 AND target = ?3 AND status = 1",
-                    params![cursor, frame.stream.channel, target],
+                     SELECT ?1, generation, ?4 FROM wake_targets WHERE channel = ?2 AND target = ?3 AND status = 1",
+                    params![cursor, frame.stream.channel, target, if cancelled { 4 } else { 0 }],
                 )?;
+            } else if kind == 5 {
+                wake::record_peer_cancel(&tx, frame, target.ok_or(Error::InvalidFrame)?, now)?;
             }
         }
         tx.commit()?;

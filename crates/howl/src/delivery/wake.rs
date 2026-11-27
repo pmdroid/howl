@@ -2,7 +2,45 @@ use std::io;
 
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 
-use super::{DeliveryStore, Device, Error, Id, Result, Stream, field};
+use super::{DeliveryStore, Device, Error, Frame, Id, Result, Stream, field};
+
+pub(super) fn record_peer_cancel(
+    connection: &Connection,
+    frame: Frame,
+    wake: Id,
+    now: u64,
+) -> Result<()> {
+    let channel = frame.stream.channel;
+    let sender = frame.stream.sender.encode();
+    connection.execute(
+        "DELETE FROM peer_wake_cancellations WHERE valid_through < ?1",
+        [now.to_be_bytes()],
+    )?;
+    connection.execute(
+        "INSERT INTO peer_wake_cancellations (channel, sender, wake, valid_through)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT (channel, sender, wake) DO UPDATE SET valid_through =
+         max(valid_through, excluded.valid_through)",
+        params![channel, sender, wake, now.saturating_add(300).to_be_bytes()],
+    )?;
+    connection.execute(
+        "UPDATE budget_turns SET state = 2 WHERE state = 1 AND id IN (
+             SELECT b.turn FROM budget_wakes b JOIN wake_queue q ON q.execution = b.execution
+             JOIN inbox i ON i.id = q.cursor WHERE q.state = 2 AND i.kind = 2
+             AND i.message = ?3 AND substr(i.stream, 1, 32) = ?1 AND substr(i.stream, 33, 64) = ?2
+         )",
+        params![channel, sender, wake],
+    )?;
+    connection.execute(
+        "UPDATE wake_queue SET state = CASE WHEN state = 2 THEN 5 ELSE 4 END
+         WHERE state IN (0, 1, 2) AND cursor IN (
+             SELECT id FROM inbox WHERE message = ?3 AND substr(stream, 1, 32) = ?1
+             AND substr(stream, 33, 64) = ?2 AND kind = 2
+         )",
+        params![channel, sender, wake],
+    )?;
+    Ok(())
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(i64)]
