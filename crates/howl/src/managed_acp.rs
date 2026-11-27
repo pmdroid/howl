@@ -1,8 +1,12 @@
 mod chatgpt;
+mod host;
 mod journal;
+mod repository;
 mod v2;
 
 pub use chatgpt::ChatGptPlanAuth;
+pub use host::HostClaude;
+use repository::RepositoryEndpoint;
 
 use std::{
     future::Future,
@@ -20,9 +24,10 @@ use agent_client_protocol::{
         ConnectionTo,
         schema::{
             CancelNotification, CloseSessionRequest, InitializeRequest, LoadSessionRequest,
-            NewSessionRequest, PermissionOptionKind, PromptRequest, RequestPermissionOutcome,
-            RequestPermissionRequest, RequestPermissionResponse, ResumeSessionRequest,
-            SelectedPermissionOutcome, SessionId, SessionNotification, StopReason,
+            McpServer, NewSessionRequest, PermissionOptionKind, PromptRequest,
+            RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+            ResumeSessionRequest, SelectedPermissionOutcome, SessionId, SessionNotification,
+            StopReason,
         },
     },
 };
@@ -57,6 +62,8 @@ pub enum Error {
     ChatGptAuth,
     #[error("managed session storage or pipes failed")]
     Io(#[from] io::Error),
+    #[error("invalid trusted host agent configuration")]
+    HostAgent,
     #[error("invalid managed session state")]
     State,
     #[error("the session is supervised by another process")]
@@ -94,6 +101,7 @@ pub struct Harness {
     args: Vec<String>,
     provider: Option<(Provider, String)>,
     chatgpt: Option<ChatGptPlanAuth>,
+    host_claude: Option<HostClaude>,
     prefer_v2: bool,
 }
 
@@ -125,8 +133,23 @@ impl Harness {
             args: args.iter().map(|arg| (*arg).to_owned()).collect(),
             provider: None,
             chatgpt: None,
+            host_claude: None,
             prefer_v2: false,
         }
+    }
+
+    pub fn host_claude(repository_image: String, claude: HostClaude) -> Self {
+        let mut harness = Self::new(
+            "claude-host",
+            repository_image,
+            "/usr/local/bin/node",
+            &[
+                "-e",
+                r#"process.stdout.write("ready\n"); setInterval(() => {}, 1000)"#,
+            ],
+        );
+        harness.host_claude = Some(claude);
+        harness
     }
 
     pub fn with_provider(mut self, provider: Provider, model: &str) -> Self {
@@ -187,6 +210,9 @@ impl Harness {
         if self.prefer_v2 {
             hash.update(b"acp-v2");
         }
+        if let Some(host) = &self.host_claude {
+            host.fingerprint(&mut hash);
+        }
         hash.finalize().into()
     }
 }
@@ -239,6 +265,7 @@ pub enum Close {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PermissionDecision {
+    AllowOnce,
     RejectOnce,
     Cancelled,
 }
@@ -310,6 +337,11 @@ impl ManagedSession {
         id: String,
         restore: Option<Restore>,
     ) -> Result<Self> {
+        if harness.host_claude.is_some()
+            && (harness.provider.is_some() || harness.prefer_v2 || restore.is_some())
+        {
+            return Err(Error::HostAgent);
+        }
         let broker = harness.broker().await?;
         Self::open_with_broker(root, provider, snapshot, harness, id, restore, broker).await
     }
@@ -346,9 +378,14 @@ impl ManagedSession {
             phase: Phase::Starting,
         };
         let prefer_v2 = harness.prefer_v2;
+        let host = harness.host_claude;
+        let harness = Harness {
+            host_claude: None,
+            ..harness
+        };
         let root = root.to_owned();
         let provider = provider.clone();
-        let (journal, process) = tokio::task::spawn_blocking(move || -> Result<_> {
+        let (journal, mut process) = tokio::task::spawn_blocking(move || -> Result<_> {
             let journal = if let Some(restore) = restore {
                 let journal = Journal::existing(&root, expected)?;
                 let state = journal.state();
@@ -388,6 +425,17 @@ impl ManagedSession {
         .await
         .map_err(|_| Error::Disconnected)??;
 
+        let host = if let Some(host) = host {
+            match start_host_claude(&mut process, host).await {
+                Ok(host) => Some(host),
+                Err(error) => {
+                    journal.update(|state| state.phase = Phase::Interrupted)?;
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
         let broker = if let Some(broker) = broker {
             match broker.attach(&process).await {
                 Ok(task) => Some(task),
@@ -409,8 +457,9 @@ impl ManagedSession {
             restore: restore.unwrap_or(Restore::Fresh),
             channels: Arc::new(Mutex::new(Some((requests, ready)))),
             mode: ClientMode::V1,
+            workspace: host.as_ref().map(|host| host.workspace.clone()),
         };
-        tokio::spawn(supervise(process, broker, client, prefer_v2));
+        tokio::spawn(supervise(process, broker, client, prefer_v2, host));
         initialized.await.map_err(|_| Error::Disconnected)??;
         Ok(Self {
             commands,
@@ -491,16 +540,69 @@ fn check_restore(mode: Restore, state: &SessionState) -> Result<()> {
     }
 }
 
+struct HostSession {
+    process: host::HostProcess,
+    workspace: HostWorkspace,
+    _repository: RepositoryEndpoint,
+}
+
+#[derive(Clone)]
+struct HostWorkspace {
+    cwd: PathBuf,
+    server: McpServer,
+}
+
+async fn start_host_claude(process: &mut ObserverProcess, host: HostClaude) -> Result<HostSession> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let stdout = ChildStdout::from_std(process.take_stdout().ok_or(Error::Disconnected)?)?;
+    let mut ready = String::new();
+    timeout(
+        Duration::from_secs(10),
+        BufReader::new(stdout).read_line(&mut ready),
+    )
+    .await
+    .map_err(|_| Error::TimedOut)??;
+    if ready != "ready\n" {
+        return Err(Error::Disconnected);
+    }
+    let repository = RepositoryEndpoint::start(process)?;
+    let server = repository.mcp_server(host.node())?;
+    let process = host.start()?;
+    let workspace = HostWorkspace {
+        cwd: process.cwd.clone(),
+        server,
+    };
+    Ok(HostSession {
+        process,
+        workspace,
+        _repository: repository,
+    })
+}
+
 async fn supervise(
     mut process: ObserverProcess,
     _broker: Option<provider_broker::BrokerTask>,
     client: Driver,
     prefer_v2: bool,
+    mut host: Option<HostSession>,
 ) {
+    let (input, output, errors) = match &mut host {
+        Some(host) => (
+            host.process.child.stdin.take(),
+            host.process.child.stdout.take(),
+            host.process.child.stderr.take(),
+        ),
+        None => (
+            process.take_stdin(),
+            process.take_stdout(),
+            process.take_stderr(),
+        ),
+    };
     let result = (
-        process.take_stdin().map(ChildStdin::from_std).transpose(),
-        process.take_stdout().map(ChildStdout::from_std).transpose(),
-        process.take_stderr().map(ChildStderr::from_std).transpose(),
+        input.map(ChildStdin::from_std).transpose(),
+        output.map(ChildStdout::from_std).transpose(),
+        errors.map(ChildStderr::from_std).transpose(),
     );
     let journal = client.journal.clone();
     if let (Ok(Some(input)), Ok(Some(output)), Ok(Some(mut errors))) = result {
@@ -562,7 +664,11 @@ async fn supervise(
         let _ = journal.update(|state| state.phase = Phase::Interrupted);
     }
     if matches!(
-        tokio::task::spawn_blocking(move || process.stop()).await,
+        tokio::task::spawn_blocking(move || {
+            drop(host);
+            process.stop()
+        })
+        .await,
         Ok(Ok(()))
     ) {
         let _ = journal.update(|state| state.container = None);
@@ -589,6 +695,7 @@ struct Driver {
     restore: Restore,
     channels: Arc<Mutex<Option<DriverChannels>>>,
     mode: ClientMode,
+    workspace: Option<HostWorkspace>,
 }
 
 impl Driver {
@@ -628,10 +735,12 @@ async fn drive_v1(
         restore,
         channels,
         mode,
+        workspace,
     } = driver;
     let notifications = journal.subscribe();
     let permission_state = journal.subscribe();
     let updates = events.clone();
+    let host_workspace = workspace.is_some();
     Client
         .v1()
         .on_receive_notification(
@@ -652,17 +761,31 @@ async fn drive_v1(
                     state.phase == Phase::Active
                         && state.remote_session.as_deref() == Some(request.session_id.0.as_ref())
                 };
-                let reject = in_turn
-                    .then(|| {
-                        request
-                            .options
-                            .iter()
-                            .find(|option| option.kind == PermissionOptionKind::RejectOnce)
-                    })
-                    .flatten();
-                let (decision, outcome) = if let Some(option) = reject {
+                let repository_read = host_workspace
+                    && matches!(
+                        request.tool_call.fields.name.as_deref(),
+                        Some(
+                            "mcp__howl_repository__read_file"
+                                | "mcp__howl_repository__list_directory"
+                        )
+                    );
+                let (kind, selected) = if repository_read {
                     (
+                        PermissionOptionKind::AllowOnce,
+                        PermissionDecision::AllowOnce,
+                    )
+                } else {
+                    (
+                        PermissionOptionKind::RejectOnce,
                         PermissionDecision::RejectOnce,
+                    )
+                };
+                let option = in_turn
+                    .then(|| request.options.iter().find(|option| option.kind == kind))
+                    .flatten();
+                let (decision, outcome) = if let Some(option) = option {
+                    (
+                        selected,
                         RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
                             option.option_id.clone(),
                         )),
@@ -688,7 +811,7 @@ async fn drive_v1(
         .connect_with(transport, async move |connection| {
             let closed = connection.incoming_closed();
             let serve = async {
-                let session = initialize_v1(&connection, &journal, restore, mode).await;
+                let session = initialize_v1(&connection, &journal, restore, mode, workspace).await;
                 let Some((requests, ready)) = channels.lock().unwrap().take() else {
                     return;
                 };
@@ -727,6 +850,7 @@ async fn initialize_v1(
     journal: &Journal,
     restore: Restore,
     mode: ClientMode,
+    workspace: Option<HostWorkspace>,
 ) -> Result<SessionId> {
     let mut request = InitializeRequest::new(ProtocolVersion::V1);
     if matches!(mode, ClientMode::FallbackV1) {
@@ -751,15 +875,19 @@ async fn initialize_v1(
     }
     let reported = initialized.agent_capabilities;
     let capabilities = Capabilities {
-        load: reported.load_session,
-        resume: reported.session_capabilities.resume.is_some(),
+        load: workspace.is_none() && reported.load_session,
+        resume: workspace.is_none() && reported.session_capabilities.resume.is_some(),
         close: reported.session_capabilities.close.is_some(),
     };
     record_capabilities(journal, ProtocolVersion::V1, capabilities, restore)?;
     let session = if restore == Restore::Fresh {
-        call(connection.send_request(NewSessionRequest::new(WORKSPACE)))
-            .await?
-            .session_id
+        let request = match workspace {
+            Some(workspace) => {
+                NewSessionRequest::new(workspace.cwd).mcp_servers(vec![workspace.server])
+            }
+            None => NewSessionRequest::new(WORKSPACE),
+        };
+        call(connection.send_request(request)).await?.session_id
     } else {
         let state = journal.state();
         check_restore(restore, &state)?;
