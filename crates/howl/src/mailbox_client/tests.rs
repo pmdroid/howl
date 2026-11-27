@@ -153,7 +153,7 @@ fn receipt_waits_for_commit_and_retries_without_duplicate_history() {
     assert_eq!(receipt.digest(), row.digest);
     assert_eq!(
         receipt.acknowledgment().recipient(),
-        node::device(&pair.bob.certificate())
+        node::device_for(&pair.state, &pair.bob.certificate()).unwrap()
     );
     let replay = ingest(&pair.state, mailbox_row(&frame)).unwrap();
     assert!(!replay.inserted());
@@ -201,7 +201,7 @@ fn hosted_wakes_stay_in_history_even_with_a_current_direct_grant() {
     db.establish_wake_time(now).unwrap();
     db.enable_network_wake_target(
         pair.channel,
-        node::device(&pair.alice.certificate()),
+        node::device_for(&pair.state, &pair.alice.certificate()).unwrap(),
         target,
         1,
     )

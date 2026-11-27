@@ -114,6 +114,7 @@ async fn main() -> ExitCode {
         }
         [group, command @ ..] if group == "enrollment" => howl::enrollment::cli::run(command),
         [group, command @ ..] if group == "workflow" => workflow_command(command).await,
+        [group, command @ ..] if group == "roster" => howl::enrollment::roster_cli::run(command),
         [command, state, channel, peer, route] if command == "send" => {
             let (Ok(channel), Ok(peer), Some(route)) =
                 (parse_id(channel), parse_id(peer), route.to_str())

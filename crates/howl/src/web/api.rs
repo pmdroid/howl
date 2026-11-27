@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 use super::Web;
 use crate::{
     channel::{Channel, MAX_MANIFEST_LEN},
-    identity::{LocalIdentity, PeerCertificate, PeerTrust, StateDirectory},
+    identity::{LocalIdentity, PeerCertificate, PeerTrust},
     node,
     observer::Snapshot,
     workflow,
@@ -163,7 +163,6 @@ async fn execute(web: Arc<Web>, input: Command) -> io::Result<Value> {
 
 fn execute_local(state: &Path, input: Command) -> io::Result<Value> {
     let identity = LocalIdentity::load_or_create(state)?;
-    let local = identity.certificate();
     match input {
         Command::Overview => overview(state, &identity),
         Command::Create { peers } => {
@@ -211,26 +210,26 @@ fn execute_local(state: &Path, input: Command) -> io::Result<Value> {
             )
         }
         Command::Conversation { channel } => {
-            let channel = *Channel::load(state, &identity, &id(&channel)?)?.id();
-            let delivery = node::open_delivery(state, &StateDirectory::open(state)?, &local)?;
+            let channel = id(&channel)?;
+            let (delivery, _) = node::history_delivery(state, &identity, channel)?;
             let messages = delivery
                 .channel_history(channel, 100)
                 .map_err(io::Error::other)?
                 .into_iter()
                 .rev()
-                .filter_map(|item| {
+                .map(|item| {
                     let (text, role) = match item.body {
                         Body::Chat(text) => (text, None),
                         Body::AgentReply(reply) => (reply.text, Some(reply.role.name())),
-                        Body::Wake { .. } => return None,
+                        Body::Wake { text, .. } => (text, Some("wake")),
                     };
-                    Some(json!({
+                    json!({
                         "message": hex::encode(item.message),
                         "sender": hex::encode(item.sender.device),
                         "time": item.received_at,
                         "text": text,
                         "role": role,
-                    }))
+                    })
                 })
                 .collect::<Vec<_>>();
             let work = delivery
@@ -239,12 +238,12 @@ fn execute_local(state: &Path, input: Command) -> io::Result<Value> {
             Ok(json!({ "messages": messages, "work": work }))
         }
         Command::Search { channel, query } => {
-            let channel = *Channel::load(state, &identity, &id(&channel)?)?.id();
+            let channel = id(&channel)?;
             let query = query.trim();
             if query.is_empty() || query.len() > 256 || query.contains('\0') {
                 return Err(invalid("Enter a search phrase up to 256 bytes"));
             }
-            let delivery = node::open_delivery(state, &StateDirectory::open(state)?, &local)?;
+            let (delivery, _) = node::history_delivery(state, &identity, channel)?;
             let phrase = format!("\"{}\"", query.replace('"', "\"\""));
             let messages = delivery
                 .search_chat(channel, &phrase, 100)
@@ -252,10 +251,10 @@ fn execute_local(state: &Path, input: Command) -> io::Result<Value> {
             Ok(json!({ "matches": messages }))
         }
         Command::Delivery { channel, message } => {
-            let channel = *Channel::load(state, &identity, &id(&channel)?)?.id();
-            let delivery = node::open_delivery(state, &StateDirectory::open(state)?, &local)?;
+            let channel = id(&channel)?;
+            let (delivery, stream) = node::history_delivery(state, &identity, channel)?;
             let items = delivery
-                .delivery_status(node::local_stream(channel, &local), id(&message)?)
+                .delivery_status(stream, id(&message)?)
                 .map_err(io::Error::other)?
                 .into_iter()
                 .map(|item| {
@@ -289,7 +288,27 @@ fn overview(state: &Path, identity: &LocalIdentity) -> io::Result<Value> {
             .strip_prefix("channel-")
             .and_then(|value| id(value).ok())
         {
-            channels.push(channel_view(&Channel::load(state, identity, &channel)?));
+            channels.push(channel_view(&Channel::load_manual(
+                state, identity, &channel,
+            )?));
+        } else if let Some(channel) = name
+            .strip_prefix("roster-")
+            .and_then(|name| name.strip_suffix("-0000"))
+            .and_then(|name| id(name).ok())
+        {
+            let view = match Channel::load(state, identity, &channel) {
+                Ok(channel) => channel_view(&channel),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::PermissionDenied | io::ErrorKind::InvalidData
+                    ) =>
+                {
+                    json!({ "id": hex::encode(channel), "manifest": "", "members": [] })
+                }
+                Err(error) => return Err(error),
+            };
+            channels.push(view);
         } else if let Ok(device) = id(name) {
             peers.push(device_view(&trust.pinned(&device)?));
         }

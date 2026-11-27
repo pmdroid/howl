@@ -17,6 +17,7 @@ const REVOKE: u8 = 2;
 pub struct RosterStore {
     state: StateDirectory,
     channel: Id,
+    prefix: String,
 }
 
 struct History {
@@ -30,7 +31,24 @@ impl RosterStore {
         Ok(Self {
             state: StateDirectory::open(path)?,
             channel,
+            prefix: format!("roster-{}", hex::encode(channel)),
         })
+    }
+
+    pub(crate) fn account_revocations(path: &Path, account: Id) -> io::Result<Self> {
+        Ok(Self {
+            state: StateDirectory::open(path)?,
+            channel: [0; 32],
+            prefix: format!("enrollment-revocations-{}", hex::encode(account)),
+        })
+    }
+
+    pub fn has_history(&self) -> io::Result<bool> {
+        match self.state.read_bounded(&self.name(0), MAX_ENTRY as u64) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 
     pub fn load(&self, authority: &Authority) -> io::Result<RosterChain> {
@@ -120,7 +138,7 @@ impl RosterStore {
     }
 
     fn name(&self, index: usize) -> String {
-        format!("roster-{}-{index:04x}", hex::encode(self.channel))
+        format!("{}-{index:04x}", self.prefix)
     }
 }
 
