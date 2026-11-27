@@ -16,7 +16,7 @@ use howl::{
     managed_acp::{Harness, HostClaude, HostCodex, HostGrok},
     node,
     observer::{ObserverProvider, Snapshot},
-    remote_mcp, serve_gateway, web,
+    remote_mcp, serve_gateway, tui, web,
     workflow::{self, RunTurn},
 };
 use howl_envelope::AgentRole;
@@ -218,6 +218,7 @@ async fn main() -> ExitCode {
         [command, state, channel] if command == "read" => {
             parse_id(channel).and_then(|channel| node::read(Path::new(state), channel))
         }
+        [command, state] if command == "tui" => tui::run(Path::new(state)).await,
         [command, state, channel] if command == "agents" => parse_id(channel)
             .and_then(|channel| LocalInteraction::new(Path::new(state)).agents(channel))
             .and_then(print_json),
