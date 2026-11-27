@@ -8,7 +8,7 @@ use std::{
 
 use agent_client_protocol::v1::schema::{ContentBlock, SessionUpdate, StopReason};
 use howl::{
-    managed_acp::{Event, Harness, HostClaude, ManagedSession},
+    managed_acp::{Event, Harness, HostClaude, HostGrok, ManagedSession},
     observer::{ObserverProvider, Snapshot},
 };
 
@@ -35,7 +35,7 @@ async fn host_acp_uses_only_the_docker_repository_mcp() {
     .unwrap();
     fs::set_permissions(&adapter, fs::Permissions::from_mode(0o700)).unwrap();
     let host = HostClaude::new(node, adapter, "/bin/false".into(), temp.path().into()).unwrap();
-    check_repository_prompt(host).await;
+    check_repository_prompt(|image| Harness::host_claude(image, host)).await;
 }
 
 #[tokio::test]
@@ -48,10 +48,22 @@ async fn live_host_claude_uses_docker_repository_tools() {
         configured("HOME"),
     )
     .unwrap();
-    check_repository_prompt(host).await;
+    check_repository_prompt(|image| Harness::host_claude(image, host)).await;
 }
 
-async fn check_repository_prompt(host: HostClaude) {
+#[tokio::test]
+#[ignore = "requires an installed, natively signed-in Grok CLI and a Linux Docker observer"]
+async fn live_host_grok_uses_docker_repository_tools() {
+    let host = HostGrok::new(
+        configured("HOWL_HOST_NODE"),
+        configured("HOWL_HOST_GROK"),
+        configured("HOWL_HOST_GROK_AUTH_PATH"),
+    )
+    .unwrap();
+    check_repository_prompt(|image| Harness::host_grok(image, host)).await;
+}
+
+async fn check_repository_prompt(harness: impl FnOnce(String) -> Harness) {
     let socket = configured("HOWL_OBSERVER_DOCKER_SOCKET");
     let image = std::env::var("HOWL_HOST_REPOSITORY_IMAGE").unwrap();
     let provider = ObserverProvider::connect(&socket).unwrap();
@@ -72,7 +84,7 @@ async fn check_repository_prompt(host: HostClaude) {
         &temp.path().join("journal"),
         &provider,
         snapshot,
-        Harness::host_claude(image, host),
+        harness(image),
     )
     .await
     .unwrap();

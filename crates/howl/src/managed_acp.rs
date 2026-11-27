@@ -5,7 +5,8 @@ mod repository;
 mod v2;
 
 pub use chatgpt::ChatGptPlanAuth;
-pub use host::HostClaude;
+use host::HostAgent;
+pub use host::{HostClaude, HostGrok};
 use repository::RepositoryEndpoint;
 
 use std::{
@@ -101,7 +102,7 @@ pub struct Harness {
     args: Vec<String>,
     provider: Option<(Provider, String)>,
     chatgpt: Option<ChatGptPlanAuth>,
-    host_claude: Option<HostClaude>,
+    host: Option<HostAgent>,
     prefer_v2: bool,
 }
 
@@ -133,14 +134,22 @@ impl Harness {
             args: args.iter().map(|arg| (*arg).to_owned()).collect(),
             provider: None,
             chatgpt: None,
-            host_claude: None,
+            host: None,
             prefer_v2: false,
         }
     }
 
     pub fn host_claude(repository_image: String, claude: HostClaude) -> Self {
+        Self::host_agent("claude-host", repository_image, HostAgent::Claude(claude))
+    }
+
+    pub fn host_grok(repository_image: String, grok: HostGrok) -> Self {
+        Self::host_agent("grok-host", repository_image, HostAgent::Grok(grok))
+    }
+
+    fn host_agent(name: &str, repository_image: String, host: HostAgent) -> Self {
         let mut harness = Self::new(
-            "claude-host",
+            name,
             repository_image,
             "/usr/local/bin/node",
             &[
@@ -148,7 +157,7 @@ impl Harness {
                 r#"process.stdout.write("ready\n"); setInterval(() => {}, 1000)"#,
             ],
         );
-        harness.host_claude = Some(claude);
+        harness.host = Some(host);
         harness
     }
 
@@ -210,7 +219,7 @@ impl Harness {
         if self.prefer_v2 {
             hash.update(b"acp-v2");
         }
-        if let Some(host) = &self.host_claude {
+        if let Some(host) = &self.host {
             host.fingerprint(&mut hash);
         }
         hash.finalize().into()
@@ -337,7 +346,7 @@ impl ManagedSession {
         id: String,
         restore: Option<Restore>,
     ) -> Result<Self> {
-        if harness.host_claude.is_some()
+        if harness.host.is_some()
             && (harness.provider.is_some() || harness.prefer_v2 || restore.is_some())
         {
             return Err(Error::HostAgent);
@@ -378,9 +387,9 @@ impl ManagedSession {
             phase: Phase::Starting,
         };
         let prefer_v2 = harness.prefer_v2;
-        let host = harness.host_claude;
+        let host = harness.host;
         let harness = Harness {
-            host_claude: None,
+            host: None,
             ..harness
         };
         let root = root.to_owned();
@@ -426,7 +435,7 @@ impl ManagedSession {
         .map_err(|_| Error::Disconnected)??;
 
         let host = if let Some(host) = host {
-            match start_host_claude(&mut process, host).await {
+            match start_host_agent(&mut process, host).await {
                 Ok(host) => Some(host),
                 Err(error) => {
                     journal.update(|state| state.phase = Phase::Interrupted)?;
@@ -552,7 +561,7 @@ struct HostWorkspace {
     server: McpServer,
 }
 
-async fn start_host_claude(process: &mut ObserverProcess, host: HostClaude) -> Result<HostSession> {
+async fn start_host_agent(process: &mut ObserverProcess, host: HostAgent) -> Result<HostSession> {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
     let stdout = ChildStdout::from_std(process.take_stdout().ok_or(Error::Disconnected)?)?;
