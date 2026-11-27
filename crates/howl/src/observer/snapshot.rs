@@ -10,6 +10,7 @@ use std::{
     process::{Command, Stdio},
 };
 
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 use super::{Error, Result, digest, process_error};
@@ -21,6 +22,7 @@ const MAX_SNAPSHOT: usize = 16 * 1024 * 1024;
 pub struct Snapshot {
     pub(super) directory: TempDir,
     commit: String,
+    selection: [u8; 32],
 }
 
 impl Snapshot {
@@ -76,6 +78,16 @@ impl Snapshot {
             return Err(Error::InvalidSnapshot);
         }
 
+        let mut selection = Sha256::new();
+        selection.update(b"howl/snapshot/v1\0");
+        selection.update([commit.len() as u8]);
+        selection.update(commit.as_bytes());
+        for (path, hash) in &entries {
+            selection.update((path.len() as u16).to_be_bytes());
+            selection.update(path.as_bytes());
+            selection.update(hash.as_bytes());
+        }
+        let selection = selection.finalize().into();
         let directory = tempfile::Builder::new()
             .prefix("howl-snapshot-")
             .tempdir()?;
@@ -83,7 +95,15 @@ impl Snapshot {
         fs::create_dir(&tree)?;
         fs::set_permissions(&tree, fs::Permissions::from_mode(0o755))?;
         materialize(&repository, &tree, entries)?;
-        Ok(Self { directory, commit })
+        Ok(Self {
+            directory,
+            commit,
+            selection,
+        })
+    }
+
+    pub fn selection(&self) -> [u8; 32] {
+        self.selection
     }
 
     pub fn commit(&self) -> &str {

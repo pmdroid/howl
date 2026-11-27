@@ -1,14 +1,17 @@
 use rmcp::{
-    Json, ServerHandler, ServiceExt,
-    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{CallToolResult, ContentBlock, ProtocolVersion, ServerCapabilities, ServerConfig},
+    ErrorData, Json, ServerHandler, ServiceExt,
+    handler::server::{router::tool::ToolRouter, tool::IntoCallToolResult, wrapper::Parameters},
+    model::{
+        CallToolResponse, CallToolResult, ContentBlock, ProtocolVersion, ServerCapabilities,
+        ServerConfig,
+    },
     schemars::{self, JsonSchema},
     tool, tool_handler, tool_router,
 };
 
 use serde::Serialize;
 
-use crate::{Call, ChannelArgs, Client, DirectArgs, Empty, PostArgs, ReadArgs, Reply};
+use crate::{Call, ChannelArgs, Client, DirectArgs, Empty, Failure, PostArgs, ReadArgs, Reply};
 
 #[derive(Clone)]
 struct Shim {
@@ -21,13 +24,19 @@ struct ToolReply {
     reply: Reply,
 }
 
+impl IntoCallToolResult for Failure {
+    fn into_call_tool_result(self) -> Result<CallToolResponse, ErrorData> {
+        CallToolResult::error(vec![ContentBlock::text(self.to_string())]).into_call_tool_result()
+    }
+}
+
 #[tool_router(router = tools)]
 impl Shim {
     #[tool(description = "List agents available to this credential")]
     async fn list_agents(
         &self,
         Parameters(args): Parameters<Empty>,
-    ) -> Result<Json<ToolReply>, CallToolResult> {
+    ) -> Result<Json<ToolReply>, Failure> {
         self.invoke(Call::ListAgents(args)).await
     }
 
@@ -35,7 +44,7 @@ impl Shim {
     async fn list_channels(
         &self,
         Parameters(args): Parameters<Empty>,
-    ) -> Result<Json<ToolReply>, CallToolResult> {
+    ) -> Result<Json<ToolReply>, Failure> {
         self.invoke(Call::ListChannels(args)).await
     }
 
@@ -43,7 +52,7 @@ impl Shim {
     async fn post(
         &self,
         Parameters(args): Parameters<PostArgs>,
-    ) -> Result<Json<ToolReply>, CallToolResult> {
+    ) -> Result<Json<ToolReply>, Failure> {
         self.invoke(Call::Post(args)).await
     }
 
@@ -51,7 +60,7 @@ impl Shim {
     async fn dm(
         &self,
         Parameters(args): Parameters<DirectArgs>,
-    ) -> Result<Json<ToolReply>, CallToolResult> {
+    ) -> Result<Json<ToolReply>, Failure> {
         self.invoke(Call::Dm(args)).await
     }
 
@@ -59,7 +68,7 @@ impl Shim {
     async fn read(
         &self,
         Parameters(args): Parameters<ReadArgs>,
-    ) -> Result<Json<ToolReply>, CallToolResult> {
+    ) -> Result<Json<ToolReply>, Failure> {
         self.invoke(Call::Read(args)).await
     }
 
@@ -67,7 +76,7 @@ impl Shim {
     async fn status(
         &self,
         Parameters(args): Parameters<Empty>,
-    ) -> Result<Json<ToolReply>, CallToolResult> {
+    ) -> Result<Json<ToolReply>, Failure> {
         self.invoke(Call::Status(args)).await
     }
 
@@ -75,16 +84,15 @@ impl Shim {
     async fn pass(
         &self,
         Parameters(args): Parameters<ChannelArgs>,
-    ) -> Result<Json<ToolReply>, CallToolResult> {
+    ) -> Result<Json<ToolReply>, Failure> {
         self.invoke(Call::Pass(args)).await
     }
 
-    async fn invoke(&self, call: Call) -> Result<Json<ToolReply>, CallToolResult> {
+    async fn invoke(&self, call: Call) -> Result<Json<ToolReply>, Failure> {
         self.client
             .call(call)
             .await
             .map(|reply| Json(ToolReply { reply }))
-            .map_err(|error| CallToolResult::error(vec![ContentBlock::text(error.to_string())]))
     }
 }
 
