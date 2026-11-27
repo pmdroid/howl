@@ -306,6 +306,10 @@ pub struct ManagedSession {
 }
 
 impl ManagedSession {
+    pub(crate) fn reap_observers(root: &Path, provider: &ObserverProvider) -> Result<()> {
+        Journal::reap_observers(root, provider)
+    }
+
     pub async fn start(
         root: &Path,
         provider: &ObserverProvider,
