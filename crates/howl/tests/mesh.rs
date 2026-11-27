@@ -71,36 +71,43 @@ fn start(state: &Path) -> (Node, String) {
     panic!("node did not start");
 }
 
-#[tokio::test]
-async fn trusted_peers_exchange_durable_chat_through_the_cli() {
-    let root = tempfile::tempdir().unwrap();
-    let alice = root.path().join("alice");
-    let bob = root.path().join("bob");
-    let alice_cert = LocalIdentity::load_or_create(&alice).unwrap().certificate();
-    let bob_cert = LocalIdentity::load_or_create(&bob).unwrap().certificate();
-    PeerTrust::open(&alice)
+fn pair(alice: &Path, bob: &Path) -> (String, String, [u8; 32]) {
+    let alice_cert = LocalIdentity::load_or_create(alice).unwrap().certificate();
+    let bob_cert = LocalIdentity::load_or_create(bob).unwrap().certificate();
+    PeerTrust::open(alice)
         .unwrap()
         .pin(&bob_cert, &bob_cert.fingerprint())
         .unwrap();
-    PeerTrust::open(&bob)
+    PeerTrust::open(bob)
         .unwrap()
         .pin(&alice_cert, &alice_cert.fingerprint())
         .unwrap();
     let bob_device = hex::encode(bob_cert.device_id());
     let alice_device = *alice_cert.device_id();
 
-    let manifest = successful(cli(&["channel", "create"], &alice, &[&bob_device]));
+    let manifest = successful(cli(&["channel", "create"], alice, &[&bob_device]));
     let mut lines = manifest.lines();
     let channel = lines.next().unwrap().strip_prefix("Channel ").unwrap();
     let token = lines.next().unwrap().strip_prefix("Manifest ").unwrap();
-    successful(cli(&["channel", "join"], &bob, &[token]));
+    successful(cli(&["channel", "join"], bob, &[token]));
 
+    (channel.to_owned(), bob_device, alice_device)
+}
+
+#[tokio::test]
+async fn trusted_peers_exchange_durable_chat_through_the_cli() {
+    let root = tempfile::tempdir().unwrap();
+    let alice = root.path().join("alice");
+    let bob = root.path().join("bob");
+    let (channel, bob_device, alice_device) = pair(&alice, &bob);
+    let channel = channel.as_str();
+    let bob_device = bob_device.as_str();
     let (mut alice_node, _) = start(&alice);
     let (mut bob_node, bob_address) = start(&bob);
     let mut sender = Command::new(env!("CARGO_BIN_EXE_howl"))
         .arg("send")
         .arg(&alice)
-        .args([channel, &bob_device, &bob_address])
+        .args([channel, bob_device, &bob_address])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -130,15 +137,16 @@ async fn trusted_peers_exchange_durable_chat_through_the_cli() {
     assert!(inbox.contains("hello from Alice"));
 
     let channel_id = hex::decode(channel).unwrap().try_into().unwrap();
-    let reviewer = howl_envelope::AgentRole::Reviewer.agent_id(bob_cert.device_id());
-    let architect = howl_envelope::AgentRole::Architect.agent_id(bob_cert.device_id());
+    let bob_id: [u8; 32] = hex::decode(bob_device).unwrap().try_into().unwrap();
+    let reviewer = howl_envelope::AgentRole::Reviewer.agent_id(&bob_id);
+    let architect = howl_envelope::AgentRole::Architect.agent_id(&bob_id);
     node::grant_wake(&bob, channel_id, alice_device, reviewer, 1)
         .await
         .unwrap();
     let blocked = node::send_wake(
         &alice,
         channel_id,
-        *bob_cert.device_id(),
+        bob_id,
         &bob_address,
         architect,
         30,
@@ -149,7 +157,7 @@ async fn trusted_peers_exchange_durable_chat_through_the_cli() {
     let allowed = node::send_wake(
         &alice,
         channel_id,
-        *bob_cert.device_id(),
+        bob_id,
         &bob_address,
         reviewer,
         30,
@@ -184,4 +192,80 @@ async fn trusted_peers_exchange_durable_chat_through_the_cli() {
     assert!(bob_node.0.wait().unwrap().success());
     let restarted_read = successful(cli(&["read"], &bob, &[channel]));
     assert_eq!(inbox, restarted_read);
+}
+
+#[tokio::test]
+async fn signed_address_hint_routes_after_reader_restart() {
+    let root = tempfile::tempdir().unwrap();
+    let alice = root.path().join("alice");
+    let bob = root.path().join("bob");
+    let (channel, bob_device, _) = pair(&alice, &bob);
+    let (mut alice_node, _) = start(&alice);
+    let (mut bob_node, bob_address) = start(&bob);
+
+    let unknown = root.path().join("unknown");
+    let wrong_hint = successful(cli(&["mesh", "hint", "export"], &unknown, &[&bob_address]));
+    assert!(
+        !cli(&["mesh", "hint", "import"], &alice, &[wrong_hint.trim()])
+            .status
+            .success()
+    );
+    let first_hint = successful(cli(&["mesh", "hint", "export"], &bob, &["127.0.0.1:1"]));
+    successful(cli(
+        &["mesh", "hint", "import"],
+        &alice,
+        &[first_hint.trim()],
+    ));
+    let valid_hint = successful(cli(&["mesh", "hint", "export"], &bob, &[&bob_address]));
+    successful(cli(
+        &["mesh", "hint", "import"],
+        &alice,
+        &[valid_hint.trim()],
+    ));
+    successful(cli(
+        &["mesh", "hint", "import"],
+        &alice,
+        &[valid_hint.trim()],
+    ));
+    assert!(
+        !cli(&["mesh", "hint", "import"], &alice, &[first_hint.trim()])
+            .status
+            .success()
+    );
+
+    successful(cli(&["mesh", "stop"], &alice, &[]));
+    assert!(alice_node.0.wait().unwrap().success());
+    let (mut alice_node, _) = start(&alice);
+    let channel_id = hex::decode(&channel).unwrap().try_into().unwrap();
+    let bob_id = hex::decode(bob_device).unwrap().try_into().unwrap();
+    let receipt = node::send(
+        &alice,
+        channel_id,
+        bob_id,
+        "-",
+        "hello through the cached hint",
+    )
+    .await
+    .unwrap();
+    let message = receipt.strip_prefix("queued ").unwrap();
+    let until = Instant::now() + Duration::from_secs(15);
+    loop {
+        let report = successful(cli(&["status"], &alice, &[&channel, message]));
+        if report.contains("delivered") {
+            break;
+        }
+        assert!(
+            Instant::now() < until,
+            "cached hint did not deliver: {report}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        successful(cli(&["read"], &bob, &[&channel])).contains("hello through the cached hint")
+    );
+
+    successful(cli(&["mesh", "stop"], &alice, &[]));
+    successful(cli(&["mesh", "stop"], &bob, &[]));
+    assert!(alice_node.0.wait().unwrap().success());
+    assert!(bob_node.0.wait().unwrap().success());
 }
