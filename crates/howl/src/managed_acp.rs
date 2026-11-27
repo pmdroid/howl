@@ -755,3 +755,6 @@ async fn call<T: Send + 'static>(request: SentRequest<T>) -> Result<T> {
 fn remote_error(error: agent_client_protocol::Error) -> Error {
     Error::Remote(error.code.value())
 }
+
+#[cfg(test)]
+mod provider_tests;

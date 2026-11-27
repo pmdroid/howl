@@ -118,6 +118,21 @@ impl Broker {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn fixture(provider: Provider, model: &str, port: u16) -> Self {
+        Self {
+            provider,
+            client: Client::builder()
+                .no_proxy()
+                .redirect(Policy::none())
+                .build()
+                .unwrap(),
+            key: Zeroizing::new("fixture-host-key".to_owned()),
+            origin: format!("http://127.0.0.1:{port}"),
+            model: model.to_owned(),
+        }
+    }
+
     pub(crate) async fn attach(self, observer: &ObserverProcess) -> Result<BrokerTask, Error> {
         timeout(Duration::from_secs(10), self.attach_when_running(observer))
             .await
