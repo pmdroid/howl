@@ -210,11 +210,16 @@ fn snapshot(repository: &Path) -> Snapshot {
 fn fixture_harness(stage: &str) -> Harness {
     let image = std::env::var("HOWL_MANAGED_FIXTURE_IMAGE")
         .expect("set the pinned Docker image with Node.js");
+    let agent = if stage == "reviewer" {
+        "reviewer"
+    } else {
+        "architect"
+    };
     Harness::new(
-        stage,
+        agent,
         image,
         "/usr/local/bin/node",
-        &["-e", include_str!("fixtures/acp/workflow-agent.cjs"), stage],
+        &["-e", include_str!("fixtures/acp/workflow-agent.cjs"), agent],
     )
 }
 

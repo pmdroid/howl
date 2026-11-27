@@ -216,7 +216,7 @@ impl Harness {
         Ok(Some(broker))
     }
 
-    fn fingerprint(&self) -> [u8; 32] {
+    pub(crate) fn fingerprint(&self) -> [u8; 32] {
         let mut hash = Sha256::new();
         hash.update(b"howl/observer-harness/v1\0");
         for value in [

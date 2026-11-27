@@ -118,3 +118,10 @@ CREATE TABLE IF NOT EXISTS wake_replies (
     cursor INTEGER PRIMARY KEY REFERENCES wake_queue(cursor),
     envelope INTEGER NOT NULL REFERENCES outbox(id)
 ) STRICT;
+CREATE TABLE IF NOT EXISTS conversation_turns (
+    wake_cursor INTEGER PRIMARY KEY REFERENCES wake_queue(cursor),
+    reply_cursor INTEGER NOT NULL REFERENCES inbox(id),
+    scope BLOB NOT NULL CHECK (length(scope) = 32),
+    instruction TEXT NOT NULL
+) STRICT;
+CREATE INDEX IF NOT EXISTS conversation_turns_latest ON conversation_turns(scope, reply_cursor DESC);

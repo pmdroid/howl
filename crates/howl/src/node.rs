@@ -663,7 +663,7 @@ pub fn queue_agent_reply(
         },
         Body::AgentReply(approved.reply),
         0,
-        Some(approved.execution),
+        Some(approved),
     )
 }
 
@@ -674,7 +674,7 @@ fn queue_frame(
     destination: Destination,
     body: Body<&str>,
     lifetime: u16,
-    execution: Option<Id>,
+    approved: Option<ApprovedAgentReply<&str>>,
 ) -> io::Result<String> {
     let Destination {
         channel,
@@ -747,16 +747,9 @@ fn queue_frame(
     };
     let key_seed = zeroize::Zeroizing::new(identity.signing_key().to_bytes());
     let signer = howl_envelope::SigningKey::from_bytes(&key_seed);
-    let approved = match (&body, execution) {
-        (Body::AgentReply(reply), Some(execution)) => Some(ApprovedAgentReply {
-            execution,
-            reply: *reply,
-        }),
-        (Body::AgentReply(_), None) | (_, Some(_)) => {
-            return Err(invalid("invalid reply approval"));
-        }
-        _ => None,
-    };
+    if matches!(&body, Body::AgentReply(_)) != approved.is_some() {
+        return Err(invalid("invalid reply approval"));
+    }
     let routing = Routing {
         channel,
         sender: address(stream.sender),

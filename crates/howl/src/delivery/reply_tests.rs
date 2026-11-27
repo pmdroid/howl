@@ -326,6 +326,7 @@ fn only_the_linked_running_wake_can_publish_and_finish_in_one_transaction() {
     store.reserve_sequence(outgoing.stream).unwrap();
     let publication = ApprovedAgentReply {
         execution: claim.execution,
+        conversation_scope: Some([21; 32]),
         reply: AgentReply {
             agent,
             role: actor,
@@ -401,6 +402,8 @@ fn only_the_linked_running_wake_can_publish_and_finish_in_one_transaction() {
     assert_eq!(events[1].message.message, outgoing.message);
     assert!(matches!(&events[1].message.body, Body::AgentReply(reply) if reply.text == "draft"));
 
+    drop(store);
+    let mut store = DeliveryStore::open(&root.path().join("delivery.db"), &[9; 32], LOCAL).unwrap();
     let next = Frame {
         sequence: 2,
         ..frame(PEER, 17, 40)
@@ -409,6 +412,21 @@ fn only_the_linked_running_wake_can_publish_and_finish_in_one_transaction() {
         .accept_network_wake(next, b"next signed wake", payload, || Ok(11), &signer)
         .unwrap();
     let claim = store.claim_wake(CHANNEL, agent, 11).unwrap().unwrap();
+    let scope = publication.conversation_scope.unwrap();
+    assert_eq!(
+        store.observer_history(&claim, scope).unwrap(),
+        [(String::from("draft a plan"), String::from("draft"))]
+    );
+    assert!(store.observer_history(&claim, [22; 32]).unwrap().is_empty());
+    messages::record_integration(&store.connection, claim.cursor, [23; 32]).unwrap();
+    assert!(store.observer_history(&claim, scope).unwrap().is_empty());
+    store
+        .connection
+        .execute(
+            "DELETE FROM integration_events WHERE cursor = ?1",
+            [claim.cursor],
+        )
+        .unwrap();
     let approval = WakeApproval {
         claim: &claim,
         nonce: [18; 32],
@@ -427,6 +445,7 @@ fn only_the_linked_running_wake_can_publish_and_finish_in_one_transaction() {
     store.reserve_sequence(outgoing.stream).unwrap();
     let publication = ApprovedAgentReply {
         execution: claim.execution,
+        conversation_scope: publication.conversation_scope,
         reply: AgentReply {
             in_reply_to: next.message,
             ..publication.reply
@@ -460,6 +479,10 @@ fn only_the_linked_running_wake_can_publish_and_finish_in_one_transaction() {
             .unwrap()
             .is_empty()
     );
+    store.prune(CHANNEL, 0, 30).unwrap();
+    assert_eq!(store.observer_history(&claim, scope).unwrap().len(), 1);
+    store.prune(CHANNEL, 12, 30).unwrap();
+    assert!(store.observer_history(&claim, scope).unwrap().is_empty());
 }
 
 #[test]

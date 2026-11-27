@@ -114,6 +114,7 @@ pub enum Payload<'a> {
 pub struct ApprovedAgentReply<Text> {
     pub execution: Id,
     pub reply: AgentReply<Text>,
+    pub conversation_scope: Option<Id>,
 }
 
 enum EnqueueTime<'a> {
@@ -601,6 +602,15 @@ impl DeliveryStore {
         {
             let recipient = (recipients.len() == 1).then_some(recipients[0]);
             let cursor = messages::record_outbound(&tx, row, recipient, now, body)?;
+            if let Some(scope) = approved.and_then(|approval| approval.conversation_scope)
+                && let Some(wake_cursor) = reply_cursor
+            {
+                tx.execute(
+                    "INSERT INTO conversation_turns (wake_cursor, reply_cursor, scope, instruction)
+                     SELECT id, ?2, ?3, body FROM inbox WHERE id = ?1",
+                    params![wake_cursor, cursor, scope],
+                )?;
+            }
             if let Some(integration) = integration {
                 messages::record_integration(&tx, cursor, integration.actor)?;
             }
@@ -1023,6 +1033,12 @@ impl DeliveryStore {
                SELECT id FROM inbox WHERE substr(stream, 1, 32) = ?1 AND kind = 1 AND received < ?2
              )",
             params![channel, old_chat],
+        )?;
+        tx.execute(
+            "DELETE FROM conversation_turns WHERE reply_cursor IN (
+                SELECT id FROM inbox WHERE substr(stream, 1, 32) = ?1 AND (received < ?2 OR epoch < ?3)
+             )",
+            params![channel, old_chat, epoch],
         )?;
         tx.execute(
             "UPDATE inbox SET body = NULL WHERE substr(stream, 1, 32) = ?1
