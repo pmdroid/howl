@@ -76,6 +76,19 @@ async fn main() -> ExitCode {
             };
             node::run(Path::new(state), listen, relay).await
         }
+        [group, command, action, state, address]
+            if group == "mesh" && command == "hint" && action == "export" =>
+        {
+            required_text(address)
+                .and_then(|address| address.parse().map_err(io::Error::other))
+                .and_then(|address| node::export_hint(Path::new(state), address))
+                .map(|hint| println!("{hint}"))
+        }
+        [group, command, action, state, hint]
+            if group == "mesh" && command == "hint" && action == "import" =>
+        {
+            required_text(hint).and_then(|hint| node::import_hint(Path::new(state), hint))
+        }
         [group, action, state] if group == "mesh" && action == "stop" => {
             node::stop(Path::new(state)).await
         }

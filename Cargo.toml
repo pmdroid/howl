@@ -1,5 +1,10 @@
 [workspace]
-members = ["crates/envelope", "crates/howl", "crates/local-mcp"]
+members = [
+    "crates/control-plane",
+    "crates/envelope",
+    "crates/howl",
+    "crates/local-mcp",
+]
 resolver = "3"
 
 [workspace.package]

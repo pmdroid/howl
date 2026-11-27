@@ -23,6 +23,7 @@ use crate::{
         ACK_LENGTH, ACK_TAG, Acknowledgment, ApprovedAgentReply, DeliveryStore, Device, Frame,
         Payload, Stream,
     },
+    discovery::{self, HINT_LEN, RouteHint},
     identity::{LocalIdentity, PeerCertificate, PeerTrust, StateDirectory},
     local_control::{self, ControlServer},
     transport::{EndpointAddr, Network, ReceivedFrame, RelayUrl, Transport},
@@ -108,7 +109,7 @@ pub async fn run(state: &Path, listen: &str, relay: Option<&str>) -> io::Result<
                 let slots = DELIVERY_WORKERS - deliveries.len();
                 let attempts = delivery.claim_due(None, unix_time()?, slots).map_err(io::Error::other)?;
                 for attempt in attempts {
-                    match target_address(state, relay.as_ref(), &attempt) {
+                    match target_address(state, &delivery, relay.as_ref(), &attempt) {
                         Ok(destination) => {
                             let transport = Arc::clone(&transport);
                             deliveries.spawn(async move {
@@ -134,6 +135,32 @@ pub async fn run(state: &Path, listen: &str, relay: Option<&str>) -> io::Result<
     drop(control);
     if let Some(mut link) = stop_link {
         local_control::reply(&mut link, Ok("stopped".to_owned())).await?;
+    }
+    Ok(())
+}
+
+pub fn export_hint(state: &Path, address: SocketAddr) -> io::Result<String> {
+    let identity = LocalIdentity::load_or_create(state)?;
+    let hint = RouteHint::issue(&identity, address, discovery::now()?)?;
+    Ok(hex::encode(hint.as_bytes()))
+}
+
+pub fn import_hint(state: &Path, encoded: &str) -> io::Result<()> {
+    let mut bytes = [0; HINT_LEN];
+    hex::decode_to_slice(encoded, &mut bytes)
+        .map_err(|_| invalid("invalid address hint encoding"))?;
+    let hint = RouteHint::from_bytes(bytes);
+    let peer = PeerTrust::open(state)?.pinned(hint.device())?;
+    if hint.address(&peer, discovery::now()?)?.is_none() {
+        return Err(invalid("address hint expired"));
+    }
+    let identity = LocalIdentity::load_or_create(state)?;
+    let directory = StateDirectory::open(state)?;
+    let delivery = open_delivery(state, &directory, &identity.certificate())?;
+    if !delivery.import_hint(&hint).map_err(io::Error::other)? {
+        return Err(invalid(
+            "address hint is older than or conflicts with the saved hint",
+        ));
     }
     Ok(())
 }
@@ -304,7 +331,12 @@ fn queue(
         .ok_or_else(|| invalid("invalid peer route"))?;
     let route = parse_route(route)?;
     if route.is_none() && !has_relay {
-        return Err(invalid("peer address or relay is required"));
+        let peer = PeerTrust::open(state)?.pinned(peer)?;
+        if cached_address(delivery, &peer)?.is_none() {
+            return Err(invalid(
+                "peer address, signed address hint, or relay is required",
+            ));
+        }
     }
     let address = Destination {
         channel: *channel,
@@ -511,6 +543,7 @@ fn channel_peer<'a>(
 
 fn target_address(
     state: &Path,
+    delivery: &DeliveryStore,
     relay: Option<&RelayUrl>,
     attempt: &crate::delivery::Attempt,
 ) -> io::Result<EndpointAddr> {
@@ -520,20 +553,40 @@ fn target_address(
             "stored peer route does not match the pinned device",
         ));
     }
-    let route = attempt
-        .route
-        .as_deref()
-        .ok_or_else(|| invalid("peer route is missing"))?;
+    let explicit = parse_route(attempt.route.as_deref().unwrap_or("-").as_bytes())?;
+    let address = match explicit {
+        Some(address) => Some(address),
+        None => match cached_address(delivery, &peer) {
+            Ok(address) => address,
+            Err(_) if relay.is_some() => None,
+            Err(error) => return Err(error),
+        },
+    };
     let mut destination = EndpointAddr::new(peer.endpoint());
-    if let Some(address) = parse_route(route.as_bytes())? {
+    if let Some(address) = address {
         destination = destination.with_ip_addr(address);
     } else if relay.is_none() {
-        return Err(invalid("peer address or relay is required"));
+        return Err(invalid(
+            "peer address, signed address hint, or relay is required",
+        ));
     }
     if let Some(url) = relay {
         destination = destination.with_relay_url(url.clone());
     }
     Ok(destination)
+}
+
+fn cached_address(
+    delivery: &DeliveryStore,
+    peer: &PeerCertificate,
+) -> io::Result<Option<SocketAddr>> {
+    match delivery
+        .peer_hint(peer.device_id())
+        .map_err(io::Error::other)?
+    {
+        Some(hint) => hint.address(peer, discovery::now()?),
+        None => Ok(None),
+    }
 }
 
 fn accept(
