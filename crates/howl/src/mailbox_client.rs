@@ -9,6 +9,10 @@ use crate::{
     node::{self, EnvelopeSource},
 };
 
+mod hosted;
+
+pub use hosted::{PullReport, pull};
+
 pub struct MailboxEnvelope<'a> {
     pub channel: Id,
     pub epoch: u64,
