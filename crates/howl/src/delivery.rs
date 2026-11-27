@@ -1,14 +1,17 @@
 mod budget;
+mod messages;
 mod wake;
 pub use budget::{
     ApprovedWake, BudgetError, BudgetLimit, BudgetLimits, ConversationBudget, HumanAction,
     HumanCommand, Turn, WakeApproval, WakeOutcome, WakeTurnError,
 };
+pub use messages::ChannelMessage;
 pub use wake::{WakeClaim, WakeJob, WakeState};
 
 use std::{fs::File, io, ops::RangeInclusive, path::Path, time::Duration};
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+use howl_envelope::AgentReply;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
@@ -89,6 +92,13 @@ impl Frame {
 pub enum Payload<'a> {
     Chat(&'a str),
     Wake { target: Id, text: &'a str },
+    AgentReply(AgentReply<&'a str>),
+}
+
+#[derive(Clone, Copy)]
+pub struct ApprovedAgentReply<Text> {
+    pub execution: Id,
+    pub reply: AgentReply<Text>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -280,7 +290,7 @@ impl DeliveryStore {
         recipients: &[Device],
         now: u64,
     ) -> Result<()> {
-        self.enqueue_frames(frame, bytes, recipients, now, None)
+        self.enqueue_frames(frame, bytes, recipients, now, None, None)
     }
 
     pub fn enqueue_routed(
@@ -294,7 +304,22 @@ impl DeliveryStore {
         if route.is_empty() || route.len() > 64 {
             return Err(Error::InvalidFrame);
         }
-        self.enqueue_frames(frame, bytes, &[recipient], now, Some(route))
+        self.enqueue_frames(frame, bytes, &[recipient], now, Some(route), None)
+    }
+
+    pub(crate) fn enqueue_agent_reply(
+        &mut self,
+        frame: Frame,
+        bytes: &[u8],
+        recipient: Device,
+        route: &str,
+        now: u64,
+        approved: ApprovedAgentReply<&str>,
+    ) -> Result<()> {
+        if route.is_empty() || route.len() > 64 {
+            return Err(Error::InvalidFrame);
+        }
+        self.enqueue_frames(frame, bytes, &[recipient], now, Some(route), Some(approved))
     }
 
     fn enqueue_frames(
@@ -304,6 +329,7 @@ impl DeliveryStore {
         recipients: &[Device],
         now: u64,
         route: Option<&str>,
+        approved: Option<ApprovedAgentReply<&str>>,
     ) -> Result<()> {
         frame.validate(bytes)?;
         if frame.stream.sender != self.local {
@@ -325,6 +351,9 @@ impl DeliveryStore {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_epoch(&tx, frame)?;
+        let reply_cursor = approved
+            .map(|approval| approved_reply_cursor(&tx, frame, recipients[0], approval, now))
+            .transpose()?;
         let stream = frame.stream.encode();
         let sequence = frame.sequence.to_be_bytes();
         let reserved = tx
@@ -351,7 +380,7 @@ impl DeliveryStore {
                 bytes,
             ],
         )?;
-        if changed == 0 {
+        let row = if changed == 0 {
             let existing = tx.query_row(
                 "SELECT id, digest FROM outbox
                  WHERE stream = ?1 AND message = ?2 AND sequence = ?3 AND epoch = ?4 AND expires = ?5",
@@ -370,6 +399,7 @@ impl DeliveryStore {
             if digest != saved_digest || recipients != saved {
                 return Err(Error::Conflict);
             }
+            id
         } else {
             let row = tx.last_insert_rowid();
             for recipient in &recipients {
@@ -378,6 +408,23 @@ impl DeliveryStore {
                     params![row, recipient.encode(), now.to_be_bytes()],
                 )?;
             }
+            row
+        };
+        if let (Some(approved), Some(cursor)) = (approved, reply_cursor) {
+            let added = tx.execute(
+                "INSERT INTO wake_replies (cursor, envelope) VALUES (?1, ?2) ON CONFLICT DO NOTHING",
+                params![cursor, row],
+            )?;
+            if added == 0
+                && !tx.query_row(
+                    "SELECT envelope = ?2 FROM wake_replies WHERE cursor = ?1",
+                    params![cursor, row],
+                    |row| row.get::<_, bool>(0),
+                )?
+            {
+                return Err(Error::Conflict);
+            }
+            finish_reply(&tx, cursor, approved.execution)?;
         }
         if let Some(route) = route {
             tx.execute(
@@ -529,27 +576,69 @@ impl DeliveryStore {
         now: u64,
         local_signer: &SigningKey,
     ) -> Result<Receipt> {
+        self.accept_payload(frame, bytes, payload, now, local_signer, false)
+    }
+
+    pub(crate) fn accept_network_wake(
+        &mut self,
+        frame: Frame,
+        bytes: &[u8],
+        payload: Payload<'_>,
+        now: u64,
+        local_signer: &SigningKey,
+    ) -> Result<Receipt> {
+        self.accept_payload(frame, bytes, payload, now, local_signer, true)
+    }
+
+    fn accept_payload(
+        &mut self,
+        frame: Frame,
+        bytes: &[u8],
+        payload: Payload<'_>,
+        now: u64,
+        local_signer: &SigningKey,
+        require_network_grant: bool,
+    ) -> Result<Receipt> {
         frame.validate(bytes)?;
-        let (kind, target, body) = match payload {
+        let (kind, target, body, agent_reply) = match payload {
             Payload::Chat(body)
                 if frame.expires_at == 0 && !body.is_empty() && body.len() <= 65_536 =>
             {
-                (1, None, body)
+                (1, None, body, None)
             }
             Payload::Wake { target, text } if frame.expires_at != 0 && text.len() <= 65_504 => {
                 self.observe_wake_time(now)?;
                 if now < frame.created_at.saturating_sub(30) || now >= frame.expires_at {
                     return Err(Error::Expired);
                 }
-                (2, Some(target), text)
+                (2, Some(target), text, None)
+            }
+            Payload::AgentReply(reply)
+                if frame.expires_at == 0
+                    && !reply.text.is_empty()
+                    && reply.text.len() <= 65_435
+                    && reply.agent == reply.role.agent_id(&frame.stream.sender.device) =>
+            {
+                (3, None, reply.text, Some(reply))
             }
             _ => return Err(Error::InvalidFrame),
         };
+        if require_network_grant && kind != 2 {
+            return Err(Error::InvalidFrame);
+        }
 
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_epoch(&tx, frame)?;
+        if require_network_grant {
+            let target = target.ok_or(Error::WakeGrant)?;
+            if wake::grant_generation(&tx, frame.stream.channel, frame.stream.sender, target)?
+                .is_none()
+            {
+                return Err(Error::WakeGrant);
+            }
+        }
         if kind == 2 {
             let current: bool = tx.query_row(
                 "SELECT wake_clock <= ?1 FROM store WHERE singleton = 1",
@@ -614,6 +703,18 @@ impl DeliveryStore {
                 tx.execute(
                     "INSERT INTO chat_search (rowid, body) VALUES (?1, ?2)",
                     params![tx.last_insert_rowid(), body],
+                )?;
+            } else if let Some(reply) = agent_reply {
+                tx.execute(
+                    "INSERT INTO agent_replies (cursor, agent, role, in_reply_to, context_digest)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        tx.last_insert_rowid(),
+                        reply.agent,
+                        reply.role as u8,
+                        reply.in_reply_to,
+                        reply.context_digest
+                    ],
                 )?;
             } else {
                 tx.execute(
@@ -700,7 +801,7 @@ impl DeliveryStore {
         )?;
         tx.execute(
             "UPDATE inbox SET body = NULL WHERE substr(stream, 1, 32) = ?1
-             AND ((kind = 1 AND received < ?2) OR (kind = 2 AND (epoch < ?3 OR expires <= ?4)))",
+             AND ((kind IN (1, 3) AND received < ?2) OR (kind = 2 AND (epoch < ?3 OR expires <= ?4)))",
             params![channel, old_chat, epoch, now],
         )?;
         tx.execute(
@@ -749,6 +850,60 @@ impl DeliveryStore {
         File::open(parent)?.sync_all()?;
         Ok(())
     }
+}
+
+fn approved_reply_cursor(
+    connection: &Connection,
+    frame: Frame,
+    recipient: Device,
+    approved: ApprovedAgentReply<&str>,
+    now: u64,
+) -> Result<i64> {
+    let reply = approved.reply;
+    let now = now.to_be_bytes();
+    connection
+        .query_row(
+            "SELECT w.cursor FROM wake_queue w JOIN inbox i ON i.id = w.cursor
+             JOIN wake_targets t ON t.channel = ?1 AND t.target = i.target AND t.generation = w.generation
+             JOIN wake_authorizations a ON a.channel = t.channel AND a.target = t.target
+                 AND a.generation = t.generation AND a.sender = ?2
+             JOIN budget_wakes b ON b.execution = w.execution
+             JOIN budget_turns v ON v.id = b.turn
+             JOIN budget_roots r ON r.root = v.root
+             WHERE substr(i.stream, 1, 32) = ?1 AND substr(i.stream, 33, 64) = ?2
+                 AND i.message = ?3 AND i.target = ?4 AND i.epoch = ?5
+                 AND i.kind = 2 AND w.state = 2 AND v.state = 1 AND v.agent = ?4
+                 AND t.status = 1 AND r.paused = 0 AND i.expires > ?6 AND r.expires > ?6
+                 AND w.execution = ?7",
+            params![
+                frame.stream.channel,
+                recipient.encode(),
+                reply.in_reply_to,
+                reply.agent,
+                frame.epoch.to_be_bytes(),
+                now,
+                approved.execution,
+            ],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or(Error::WakeGrant)
+}
+
+fn finish_reply(connection: &Connection, cursor: i64, execution: Id) -> Result<()> {
+    let wake = connection.execute(
+        "UPDATE wake_queue SET state = 3 WHERE cursor = ?1 AND execution = ?2 AND state = 2",
+        params![cursor, execution],
+    )?;
+    let turn = connection.execute(
+        "UPDATE budget_turns SET state = 0 WHERE state = 1 AND id =
+            (SELECT turn FROM budget_wakes WHERE execution = ?1)",
+        [execution],
+    )?;
+    if wake != 1 || turn != 1 {
+        return Err(Error::WakeGrant);
+    }
+    Ok(())
 }
 
 fn require_epoch(connection: &Connection, frame: Frame) -> Result<()> {
