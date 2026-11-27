@@ -228,3 +228,6 @@ fn header_value<'a>(headers: &'a HeaderMap, name: &'static str) -> Result<&'a st
         .and_then(|value| value.to_str().ok())
         .ok_or(Error::Unauthorized)
 }
+
+#[cfg(test)]
+mod tests;
