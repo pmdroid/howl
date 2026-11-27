@@ -38,7 +38,7 @@ const DELIVERY_KEY: &str = "delivery.key";
 const DELIVERY_DB: &str = "delivery.db";
 
 pub async fn run(state: &Path, listen: &str, relay: Option<&str>) -> io::Result<()> {
-    let identity = LocalIdentity::load_or_create(state)?;
+    let identity = Arc::new(LocalIdentity::load_or_create(state)?);
     let local = identity.certificate();
     let directory = StateDirectory::open(state)?;
     let control = ControlServer::bind(state)?;
@@ -112,8 +112,15 @@ pub async fn run(state: &Path, listen: &str, relay: Option<&str>) -> io::Result<
                     match target_address(state, &identity, &delivery, relay.as_ref(), &attempt) {
                         Ok(destination) => {
                             let transport = Arc::clone(&transport);
+                            let identity = Arc::clone(&identity);
+                            let state = state.to_owned();
                             deliveries.spawn(async move {
-                                transport.send(&attempt.recipient.device, destination, &attempt.frame).await
+                                transport.send_authorized(
+                                    &attempt.recipient.device,
+                                    destination,
+                                    &attempt.frame,
+                                    || check_outbound(&state, &identity, &attempt),
+                                ).await
                             });
                         }
                         Err(error) => eprintln!("Delivery queued for retry. {error}"),
@@ -245,12 +252,7 @@ pub async fn stop(state: &Path) -> io::Result<()> {
 
 pub fn read(state: &Path, id: Id) -> io::Result<()> {
     let identity = LocalIdentity::load_or_create(state)?;
-    Channel::known(state, &identity, &id)?;
-    let delivery = open_delivery(
-        state,
-        &StateDirectory::open(state)?,
-        &identity.certificate(),
-    )?;
+    let (delivery, _) = history_delivery(state, &identity, id)?;
     for item in delivery
         .channel_history(id, 100)
         .map_err(io::Error::other)?
@@ -281,11 +283,9 @@ pub fn read(state: &Path, id: Id) -> io::Result<()> {
 
 pub fn status(state: &Path, channel: Id, message: Id) -> io::Result<()> {
     let identity = LocalIdentity::load_or_create(state)?;
-    Channel::known(state, &identity, &channel)?;
-    let local = identity.certificate();
-    let delivery = open_delivery(state, &StateDirectory::open(state)?, &local)?;
+    let (delivery, stream) = history_delivery(state, &identity, channel)?;
     let results = delivery
-        .delivery_status(local_stream(state, channel, &local)?, message)
+        .delivery_status(stream, message)
         .map_err(io::Error::other)?;
     if results.is_empty() {
         return Err(io::Error::new(
@@ -568,21 +568,7 @@ fn target_address(
     relay: Option<&RelayUrl>,
     attempt: &crate::delivery::Attempt,
 ) -> io::Result<EndpointAddr> {
-    let metadata = howl_envelope::inspect_unverified(&attempt.frame).map_err(io::Error::other)?;
-    let roster = Channel::load(state, identity, &metadata.routing.channel)?;
-    let permission = if metadata.intent == Intent::Wake {
-        ChannelPermission::Wake
-    } else {
-        ChannelPermission::Send
-    };
-    if roster.epoch() != metadata.routing.epoch
-        || !roster.allows(identity.certificate().device_id(), permission)
-        || !roster.allows(&attempt.recipient.device, ChannelPermission::Receive)
-    {
-        return Err(forbidden(
-            "outbox frame no longer has current signed channel authority",
-        ));
-    }
+    check_outbound(state, identity, attempt)?;
     let peer = PeerTrust::open(state)?.pinned(&attempt.recipient.device)?;
     if device_for(state, &peer)? != attempt.recipient {
         return Err(invalid(
@@ -610,6 +596,29 @@ fn target_address(
         destination = destination.with_relay_url(url.clone());
     }
     Ok(destination)
+}
+
+fn check_outbound(
+    state: &Path,
+    identity: &LocalIdentity,
+    attempt: &crate::delivery::Attempt,
+) -> io::Result<()> {
+    let metadata = howl_envelope::inspect_unverified(&attempt.frame).map_err(io::Error::other)?;
+    let roster = Channel::load(state, identity, &metadata.routing.channel)?;
+    let permission = if metadata.intent == Intent::Wake {
+        ChannelPermission::Wake
+    } else {
+        ChannelPermission::Send
+    };
+    if roster.epoch() != metadata.routing.epoch
+        || !roster.allows(identity.certificate().device_id(), permission)
+        || !roster.allows(&attempt.recipient.device, ChannelPermission::Receive)
+    {
+        return Err(forbidden(
+            "outbox frame no longer has current signed channel authority",
+        ));
+    }
+    Ok(())
 }
 
 fn cached_address(
@@ -770,6 +779,24 @@ pub(crate) fn accept_envelope(
     .map_err(io::Error::other)
 }
 
+pub(crate) fn history_delivery(
+    state: &Path,
+    identity: &LocalIdentity,
+    channel: Id,
+) -> io::Result<(DeliveryStore, Stream)> {
+    let local = identity.certificate();
+    let directory = StateDirectory::open(state)?;
+    if Channel::history_is_enrolled(state, identity, &channel)? {
+        let delivery = open_delivery(state, &directory, &local)?;
+        return Ok((delivery, local_stream(state, channel, &local)?));
+    }
+    let key = directory.key(DELIVERY_KEY)?;
+    let device = device_with_account(&local, None);
+    let delivery =
+        DeliveryStore::open(&state.join(DELIVERY_DB), &key, device).map_err(io::Error::other)?;
+    Ok((delivery, stream_from_device(channel, &local, device)))
+}
+
 pub(crate) fn open_delivery(
     state: &Path,
     directory: &StateDirectory,
@@ -820,14 +847,22 @@ pub(crate) fn local_stream(
     channel: Id,
     certificate: &PeerCertificate,
 ) -> io::Result<Stream> {
+    Ok(stream_from_device(
+        channel,
+        certificate,
+        device_for(state, certificate)?,
+    ))
+}
+
+fn stream_from_device(channel: Id, certificate: &PeerCertificate, device: Device) -> Stream {
     let mut hash = Sha256::new();
     hash.update(b"howl/key/v1/device-signing\0");
     hash.update(certificate.signing_public());
-    Ok(Stream {
+    Stream {
         channel,
-        sender: device_for(state, certificate)?,
+        sender: device,
         signing_key: hash.finalize().into(),
-    })
+    }
 }
 
 fn frame(metadata: Metadata) -> Frame {

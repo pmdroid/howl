@@ -295,6 +295,25 @@ async fn enrolled_peers_stop_new_delivery_after_signed_revocation() {
     let b = LocalIdentity::load_or_create(&bob).unwrap();
     let a_peer = a.certificate();
     let b_peer = b.certificate();
+    let (legacy_channel, _, _) = pair(&alice, &bob);
+    let legacy_id = hex::decode(&legacy_channel).unwrap().try_into().unwrap();
+    let (mut legacy_a, _) = start(&alice);
+    let (mut legacy_b, legacy_address) = start(&bob);
+    let legacy_receipt = node::send(
+        &alice,
+        legacy_id,
+        *b_peer.device_id(),
+        &legacy_address,
+        "recorded before enrollment",
+    )
+    .await
+    .unwrap();
+    let legacy_message = legacy_receipt.strip_prefix("queued ").unwrap();
+    wait_for_text(&bob, &legacy_channel, "recorded before enrollment").await;
+    successful(cli(&["mesh", "stop"], &alice, &[]));
+    successful(cli(&["mesh", "stop"], &bob, &[]));
+    assert!(legacy_a.0.wait().unwrap().success());
+    assert!(legacy_b.0.wait().unwrap().success());
     let root = SigningKey::from_bytes(&[1; 32]);
     let offline = SigningKey::from_bytes(&[2; 32]);
     let signer = SigningKey::from_bytes(&[3; 32]);
@@ -363,6 +382,21 @@ async fn enrolled_peers_stop_new_delivery_after_signed_revocation() {
         .strip_prefix("Proof ")
         .unwrap();
     successful(cli(&["roster", "apply"], &bob, &[channel, proof]));
+    let second = successful(cli(&["channel", "create"], &alice, &[&bob_device]));
+    let second_channel = second
+        .lines()
+        .next()
+        .unwrap()
+        .strip_prefix("Channel ")
+        .unwrap();
+    let second_manifest = second
+        .lines()
+        .nth(1)
+        .unwrap()
+        .strip_prefix("Manifest ")
+        .unwrap();
+    successful(cli(&["channel", "join"], &bob, &[second_manifest]));
+    let second_id = hex::decode(second_channel).unwrap().try_into().unwrap();
 
     let (mut a_node, _) = start(&alice);
     let (mut b_node, bob_address) = start(&bob);
@@ -377,14 +411,18 @@ async fn enrolled_peers_stop_new_delivery_after_signed_revocation() {
     .await
     .unwrap();
     assert!(queued.starts_with("queued "));
-    let until = Instant::now() + Duration::from_secs(12);
-    loop {
-        if successful(cli(&["read"], &bob, &[channel])).contains("signed before removal") {
-            break;
-        }
-        assert!(Instant::now() < until, "signed delivery did not reach Bob");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    wait_for_text(&bob, channel, "signed before removal").await;
+    let queued = node::send(
+        &alice,
+        second_id,
+        *b_peer.device_id(),
+        &bob_address,
+        "second channel",
+    )
+    .await
+    .unwrap();
+    assert!(queued.starts_with("queued "));
+    wait_for_text(&bob, second_channel, "second channel").await;
 
     let revocation = successful(cli(
         &["roster", "revoke"],
@@ -413,9 +451,40 @@ async fn enrolled_peers_stop_new_delivery_after_signed_revocation() {
         .await
         .is_err()
     );
+    assert!(
+        node::send(
+            &alice,
+            second_id,
+            *b_peer.device_id(),
+            &bob_address,
+            "after account revocation"
+        )
+        .await
+        .is_err()
+    );
     assert!(successful(cli(&["read"], &bob, &[channel])).contains("signed before removal"));
+    assert!(successful(cli(&["read"], &bob, &[second_channel])).contains("second channel"));
+    assert!(
+        successful(cli(&["read"], &bob, &[&legacy_channel])).contains("recorded before enrollment")
+    );
+    assert!(
+        successful(cli(&["status"], &alice, &[&legacy_channel, legacy_message]))
+            .contains(&bob_device)
+    );
+
     successful(cli(&["mesh", "stop"], &alice, &[]));
     successful(cli(&["mesh", "stop"], &bob, &[]));
     assert!(a_node.0.wait().unwrap().success());
     assert!(b_node.0.wait().unwrap().success());
+}
+
+async fn wait_for_text(state: &Path, channel: &str, text: &str) {
+    let until = Instant::now() + Duration::from_secs(12);
+    loop {
+        if successful(cli(&["read"], state, &[channel])).contains(text) {
+            return;
+        }
+        assert!(Instant::now() < until, "delivery did not reach the reader");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }

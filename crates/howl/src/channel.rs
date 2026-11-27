@@ -101,6 +101,14 @@ impl Channel {
         if let Some(profile) = Profile::load(state, &local.certificate())? {
             return Self::load_enrolled(state, local, id, profile);
         }
+        Self::load_manual(state, local, id)
+    }
+
+    pub(crate) fn load_manual(
+        state: &Path,
+        local: &LocalIdentity,
+        id: &[u8; 32],
+    ) -> io::Result<Self> {
         let manifest =
             StateDirectory::open(state)?.read_bounded(&filename(id), MAX_MANIFEST_LEN as u64)?;
         let channel = Self::verify(local, &PeerTrust::open(state)?, &manifest)?;
@@ -110,17 +118,16 @@ impl Channel {
         Ok(channel)
     }
 
-    pub(crate) fn known(state: &Path, local: &LocalIdentity, id: &[u8; 32]) -> io::Result<()> {
-        if Profile::account(state)?.is_some() {
-            if RosterStore::open(state, *id)?.has_history()? {
-                return Ok(());
-            }
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "unknown signed channel",
-            ));
+    pub(crate) fn history_is_enrolled(
+        state: &Path,
+        local: &LocalIdentity,
+        id: &[u8; 32],
+    ) -> io::Result<bool> {
+        if Profile::account(state)?.is_some() && RosterStore::open(state, *id)?.has_history()? {
+            return Ok(true);
         }
-        Self::load(state, local, id).map(|_| ())
+        Self::load_manual(state, local, id)?;
+        Ok(false)
     }
 
     fn load_enrolled(
@@ -131,6 +138,7 @@ impl Channel {
     ) -> io::Result<Self> {
         let mut history = RosterStore::open(state, *id)?.load(&profile.authority)?;
         history.learn_designation(&profile.designation);
+        history.merge_revocations(&profile.revocations()?.load(&profile.authority)?);
         let roster = history.active(&profile.designation)?.clone();
         let local = identity.certificate();
         let mut members = Vec::new();

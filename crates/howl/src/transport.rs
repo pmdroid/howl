@@ -164,6 +164,17 @@ impl Transport {
         address: EndpointAddr,
         frame: &[u8],
     ) -> io::Result<()> {
+        self.send_authorized(peer_device_id, address, frame, || Ok(()))
+            .await
+    }
+
+    pub(crate) async fn send_authorized(
+        &self,
+        peer_device_id: &[u8; 32],
+        address: EndpointAddr,
+        frame: &[u8],
+        authorize: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<()> {
         validate_frame(frame)?;
         let _slot = within(STREAM_TIMEOUT, async {
             self.send_slots.acquire().await.map_err(io::Error::other)
@@ -181,6 +192,7 @@ impl Transport {
                 return Err(error);
             }
         };
+        authorize()?;
         write_frame(&connection, stream, frame).await
     }
 

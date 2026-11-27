@@ -247,6 +247,22 @@ impl RosterChain {
         }
     }
 
+    pub(crate) fn merge_revocations(&mut self, source: &Self) {
+        for (address, &sequence) in &source.floors {
+            self.raise_floor(
+                address.account,
+                Floor {
+                    device: address.device,
+                    sequence,
+                },
+            );
+        }
+    }
+
+    pub(crate) fn revoked_through(&self, address: DeviceAddress) -> u64 {
+        self.floors.get(&address).copied().unwrap_or_default()
+    }
+
     fn raise_floor(&mut self, account: Id, floor: Floor) {
         self.floors
             .entry(DeviceAddress {
