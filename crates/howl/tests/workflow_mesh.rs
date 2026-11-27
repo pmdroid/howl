@@ -1,6 +1,7 @@
 use std::{
     fs,
     io::{BufRead, BufReader},
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::{Child, Command, Output, Stdio},
     sync::mpsc,
@@ -243,6 +244,93 @@ fn configured(name: &str) -> PathBuf {
     std::env::var_os(name)
         .unwrap_or_else(|| panic!("set {name}"))
         .into()
+}
+
+#[tokio::test]
+#[ignore = "requires a local Linux Docker engine and a pinned image with Node.js"]
+async fn ordinary_direct_messages_continue_the_same_acp_session() {
+    let root = tempfile::tempdir().unwrap();
+    let alice = root.path().join("alice");
+    let bob = root.path().join("bob");
+    let alice_cert = LocalIdentity::load_or_create(&alice).unwrap().certificate();
+    let bob_cert = LocalIdentity::load_or_create(&bob).unwrap().certificate();
+    let alice_device = *alice_cert.device_id();
+    let bob_device = *bob_cert.device_id();
+    PeerTrust::open(&alice)
+        .unwrap()
+        .pin(&bob_cert, &bob_cert.fingerprint())
+        .unwrap();
+    PeerTrust::open(&bob)
+        .unwrap()
+        .pin(&alice_cert, &alice_cert.fingerprint())
+        .unwrap();
+    let manifest = stdout(mesh_cli(
+        &["channel", "create"],
+        &alice,
+        &[&hex::encode(bob_device)],
+    ));
+    let mut lines = manifest.lines();
+    let channel = id(lines.next().unwrap().strip_prefix("Channel ").unwrap());
+    let token = lines.next().unwrap().strip_prefix("Manifest ").unwrap();
+    stdout(mesh_cli(&["channel", "join"], &bob, &[token]));
+    let mut alice_node = Node::start(&alice);
+    let mut bob_node = Node::start(&bob);
+    let (repository, revision) = repository(root.path(), "conversation-repo", "selected\n");
+    let config = bob.join("conversations.json");
+    fs::write(
+        &config,
+        serde_json::json!({ "conversations": [{
+            "channel": hex::encode(channel), "peer": hex::encode(alice_device),
+            "route": alice_node.route, "repository": repository, "revision": revision,
+        }]})
+        .to_string(),
+    )
+    .unwrap();
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+    let image = std::env::var("HOWL_MANAGED_FIXTURE_IMAGE").unwrap();
+    let agent = howl::ongoing::serve(&bob, observer(), move || {
+        Ok(Harness::new(
+            "conversation-fixture",
+            image.clone(),
+            "/usr/local/bin/node",
+            &["-e", include_str!("fixtures/acp/ongoing-agent.cjs")],
+        ))
+    });
+    let exchange = async {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        for (prompt, reply) in [("remember", "turn-1-remember"), ("recall", "turn-2-recall")] {
+            let receipt = node::send(&alice, channel, bob_device, &bob_node.route, prompt)
+                .await
+                .unwrap();
+            let source = delivered(&alice, channel, &receipt, bob_device).await;
+            let channel = hex::encode(channel);
+            let reply_seen = tokio::time::timeout(WAIT, async {
+                loop {
+                    let history = stdout(mesh_cli(&["read"], &alice, &[&channel]));
+                    if history.lines().any(|line| {
+                        line.starts_with("agent ")
+                            && line.contains(&hex::encode(source))
+                            && line.contains(reply)
+                    }) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            })
+            .await;
+            assert!(
+                reply_seen.is_ok(),
+                "{}",
+                stdout(mesh_cli(&["read"], &alice, &[&channel]))
+            );
+        }
+    };
+    tokio::select! {
+        completed = agent => panic!("agent finished early: {completed:?}"),
+        () = exchange => {},
+    }
+    alice_node.stop(&alice).await;
+    bob_node.stop(&bob).await;
 }
 
 fn native_harness(stage: &str) -> Harness {
