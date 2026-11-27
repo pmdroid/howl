@@ -28,6 +28,7 @@ pub mod presence;
 pub mod managed_acp;
 
 pub mod provider_broker;
+pub mod remote_mcp;
 
 pub mod workflow;
 
