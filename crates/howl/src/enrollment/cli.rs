@@ -1,3 +1,8 @@
+mod recovery;
+mod renewal;
+
+pub(crate) use renewal::{peer_records, profile_records};
+
 use std::{
     ffi::{OsStr, OsString},
     io,
@@ -8,7 +13,7 @@ use ed25519_dalek::SigningKey;
 use zeroize::Zeroizing;
 
 use crate::{
-    identity::{CERTIFICATE_LEN, LocalIdentity, PeerCertificate, PeerTrust, StateDirectory},
+    identity::{CERTIFICATE_LEN, LocalIdentity, PeerCertificate, StateDirectory},
     node,
 };
 
@@ -28,7 +33,7 @@ const RESPONSE: &str = "response";
 const INVITATION: &str = "invitation";
 const RECORD_LIMIT: u64 = 128 * 1024;
 
-pub const HELP: &str = "Usage: howl enrollment init STATE OFFLINE_KEYS\n       howl enrollment identity STATE EXCHANGE\n       howl enrollment authority STATE\n       howl enrollment offer STATE EXCHANGE VERIFIED_FINGERPRINT SEQUENCE SECRET_DIR\n       howl enrollment respond STATE EXCHANGE VERIFIED_ACCOUNT VERIFIED_HEAD VERIFIED_DESIGNATION SECRET_DIR\n       howl enrollment certify STATE EXCHANGE\n       howl enrollment certificate STATE EXCHANGE\n       howl enrollment accept STATE EXCHANGE VERIFIED_ACCOUNT VERIFIED_HEAD VERIFIED_DESIGNATION\n       howl enrollment peer STATE EXCHANGE";
+pub const HELP: &str = "Usage: howl enrollment init STATE OFFLINE_KEYS\n       howl enrollment identity STATE EXCHANGE\n       howl enrollment authority STATE\n       howl enrollment offer STATE EXCHANGE VERIFIED_FINGERPRINT SEQUENCE SECRET_DIR\n       howl enrollment respond STATE EXCHANGE VERIFIED_ACCOUNT VERIFIED_HEAD VERIFIED_DESIGNATION SECRET_DIR\n       howl enrollment certify STATE EXCHANGE\n       howl enrollment certificate STATE EXCHANGE\n       howl enrollment accept STATE EXCHANGE VERIFIED_ACCOUNT VERIFIED_HEAD VERIFIED_DESIGNATION\n       howl enrollment peer STATE EXCHANGE\n       howl enrollment recover-export STATE OFFLINE_KEYS PACKAGE_DIR UNLOCK_DIR\n       howl enrollment recover NEW_STATE PACKAGE_DIR UNLOCK_DIR NEW_OFFLINE_KEYS VERIFIED_ACCOUNT VERIFIED_HEAD";
 
 pub fn run(args: &[OsString]) -> io::Result<()> {
     match args {
@@ -92,6 +97,24 @@ pub fn run(args: &[OsString]) -> io::Result<()> {
         }
         [command, state, exchange] if command == "peer" => {
             import_peer(Path::new(state), Path::new(exchange))?;
+        }
+        [command, state, offline, package, unlock] if command == "recover-export" => {
+            recovery::export(
+                Path::new(state),
+                Path::new(offline),
+                Path::new(package),
+                Path::new(unlock),
+            )?;
+        }
+        [command, state, package, unlock, offline, account, head] if command == "recover" => {
+            recovery::recover(
+                Path::new(state),
+                Path::new(package),
+                Path::new(unlock),
+                Path::new(offline),
+                id(account)?,
+                id(head)?,
+            )?;
         }
         _ => {
             return Err(invalid(
@@ -249,16 +272,7 @@ fn accept(
     let identity = LocalIdentity::load_or_create(state)?;
     let local = identity.certificate();
     let certificate = certificate(&exchange, &designation, &local)?;
-    let pinned = AuthorityStore::open(state)?;
-    pinned.initialize(authority.records(), head.account, head.digest)?;
-    if pinned.current()? != head {
-        return Err(invalid(
-            "local authority head differs from the approved head",
-        ));
-    }
-    let directory = StateDirectory::open(state)?;
-    write_exact(&directory, DESIGNATION, designation.as_bytes())?;
-    write_exact(&directory, CERTIFICATE, certificate.as_bytes())?;
+    renewal::accept(state, &authority, &designation, &certificate, &local)?;
     println!("Device enrolled.");
     Ok(())
 }
@@ -266,14 +280,19 @@ fn accept(
 fn import_peer(state: &Path, exchange: &Path) -> io::Result<()> {
     separate(&[state, exchange])?;
     let directory = StateDirectory::open(state)?;
-    let head = AuthorityStore::open(state)?.current()?;
-    let designation = designation(&directory, head)?;
+    let authority = AuthorityStore::open(state)?.load()?;
+    let designation = designation(&directory, authority.head()?)?;
     let exchange = StateDirectory::open(exchange)?;
     let peer = peer(&exchange)?;
     let certificate = certificate(&exchange, &designation, &peer)?;
-    let filename = format!("enrollment-peer-{}", hex::encode(peer.device_id()));
-    write_exact(&directory, &filename, certificate.as_bytes())?;
-    PeerTrust::open(state)?.pin(&peer, &peer.fingerprint())?;
+    renewal::import_peer(
+        state,
+        &directory,
+        &authority,
+        &designation,
+        &certificate,
+        &peer,
+    )?;
     println!("Enrolled peer trusted.");
     Ok(())
 }
@@ -294,7 +313,11 @@ fn checked_authority(
 }
 
 fn designation(directory: &StateDirectory, head: AuthorityHead) -> io::Result<Designation> {
-    Designation::verify(&directory.read_bounded(DESIGNATION, RECORD_LIMIT)?, head)
+    let bytes = match profile_records(directory)? {
+        Some((designation, _)) => designation,
+        None => directory.read_bounded(DESIGNATION, 165_000)?,
+    };
+    Designation::verify(&bytes, head)
 }
 
 fn checked_designation(
