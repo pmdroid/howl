@@ -7,7 +7,7 @@ use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::identity::{PeerCertificate, verify};
 
-use super::authority::{AuthorityHead, Id, check_signatures, invalid, sign, take};
+use super::authority::{Authority, AuthorityHead, Id, check_signatures, invalid, sign, take};
 
 const DESIGNATION: &[u8] = b"howl/identity/v1/membership-signer\0";
 const DEVICE: &[u8] = b"howl/identity/v1/device\0";
@@ -99,6 +99,14 @@ impl Designation {
             sequence,
             floors,
         })
+    }
+
+    pub fn from_history(bytes: &[u8], authority: &Authority) -> io::Result<Self> {
+        let fields = bytes
+            .strip_prefix(DESIGNATION)
+            .filter(|fields| fields.len() >= 64)
+            .ok_or_else(|| invalid("invalid membership signer record"))?;
+        Self::verify(bytes, authority.known_head(take(fields, 32))?)
     }
 
     pub fn as_bytes(&self) -> &[u8] {
