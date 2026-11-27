@@ -1,21 +1,23 @@
 mod chatgpt;
 mod journal;
+mod v2;
 
 pub use chatgpt::ChatGptPlanAuth;
 
 use std::{
+    future::Future,
     io,
     os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
 use agent_client_protocol::{
-    Agent, Client, ConnectTo, Lines,
+    Agent, Client, ConnectTo, Lines, Protocol,
     schema::ProtocolVersion,
     v1::{
-        ConnectionTo, SentRequest,
+        ConnectionTo,
         schema::{
             CancelNotification, CloseSessionRequest, InitializeRequest, LoadSessionRequest,
             NewSessionRequest, PermissionOptionKind, PromptRequest, RequestPermissionOutcome,
@@ -73,6 +75,10 @@ pub enum Error {
     TimedOut,
     #[error("ACP agent does not support {0}")]
     Unsupported(&'static str),
+    #[error("ACP agent ended the turn without a supported stop reason")]
+    UnreportedStop,
+    #[error("ACP agent reported a turn failure")]
+    TurnFailed,
     #[error("ACP agent rejected the request (code {0})")]
     Remote(i32),
     #[error("invalid ACP prompt or time limit")]
@@ -88,6 +94,7 @@ pub struct Harness {
     args: Vec<String>,
     provider: Option<(Provider, String)>,
     chatgpt: Option<ChatGptPlanAuth>,
+    prefer_v2: bool,
 }
 
 impl Harness {
@@ -118,6 +125,7 @@ impl Harness {
             args: args.iter().map(|arg| (*arg).to_owned()).collect(),
             provider: None,
             chatgpt: None,
+            prefer_v2: false,
         }
     }
 
@@ -130,6 +138,11 @@ impl Harness {
     pub fn with_chatgpt_plan(mut self, model: &str, auth: ChatGptPlanAuth) -> Self {
         self.provider = Some((Provider::ChatGptPlan, model.to_owned()));
         self.chatgpt = Some(auth);
+        self
+    }
+
+    pub fn with_acp_v2(mut self) -> Self {
+        self.prefer_v2 = true;
         self
     }
 
@@ -171,6 +184,9 @@ impl Harness {
             hash.update((store.len() as u64).to_be_bytes());
             hash.update(store);
         }
+        if self.prefer_v2 {
+            hash.update(b"acp-v2");
+        }
         hash.finalize().into()
     }
 }
@@ -203,6 +219,8 @@ pub struct SessionState {
     pub remote_session: Option<String>,
     pub container: Option<String>,
     pub capabilities: Capabilities,
+    #[serde(default)]
+    pub protocol_version: Option<ProtocolVersion>,
     pub phase: Phase,
 }
 
@@ -228,6 +246,11 @@ pub enum PermissionDecision {
 #[derive(Clone, Debug)]
 pub enum Event {
     Update(Box<SessionNotification>),
+    UpdateV2(Box<agent_client_protocol::v2::schema::UpdateSessionNotification>),
+    PermissionV2 {
+        offered: Vec<agent_client_protocol::v2::schema::PermissionOptionKind>,
+        decision: PermissionDecision,
+    },
     Permission {
         offered: Vec<PermissionOptionKind>,
         decision: PermissionDecision,
@@ -319,8 +342,10 @@ impl ManagedSession {
             remote_session: None,
             container: None,
             capabilities: Capabilities::default(),
+            protocol_version: None,
             phase: Phase::Starting,
         };
+        let prefer_v2 = harness.prefer_v2;
         let root = root.to_owned();
         let provider = provider.clone();
         let (journal, process) = tokio::task::spawn_blocking(move || -> Result<_> {
@@ -378,15 +403,14 @@ impl ManagedSession {
         let (commands, requests) = mpsc::channel(32);
         let (events, _) = broadcast::channel(64);
         let (ready, initialized) = oneshot::channel();
-        tokio::spawn(supervise(
-            process,
-            broker,
-            journal,
-            requests,
-            events.clone(),
-            restore.unwrap_or(Restore::Fresh),
-            ready,
-        ));
+        let client = Driver {
+            journal: Arc::new(journal),
+            events: events.clone(),
+            restore: restore.unwrap_or(Restore::Fresh),
+            channels: Arc::new(Mutex::new(Some((requests, ready)))),
+            mode: ClientMode::V1,
+        };
+        tokio::spawn(supervise(process, broker, client, prefer_v2));
         initialized.await.map_err(|_| Error::Disconnected)??;
         Ok(Self {
             commands,
@@ -470,18 +494,15 @@ fn check_restore(mode: Restore, state: &SessionState) -> Result<()> {
 async fn supervise(
     mut process: ObserverProcess,
     _broker: Option<provider_broker::BrokerTask>,
-    journal: Journal,
-    requests: mpsc::Receiver<Command>,
-    events: broadcast::Sender<Event>,
-    restore: Restore,
-    ready: oneshot::Sender<Result<()>>,
+    client: Driver,
+    prefer_v2: bool,
 ) {
     let result = (
         process.take_stdin().map(ChildStdin::from_std).transpose(),
         process.take_stdout().map(ChildStdout::from_std).transpose(),
         process.take_stderr().map(ChildStderr::from_std).transpose(),
     );
-    let journal = Arc::new(journal);
+    let journal = client.journal.clone();
     if let (Ok(Some(input)), Ok(Some(output)), Ok(Some(mut errors))) = result {
         let discard = tokio::spawn(async move {
             let _ = tokio::io::copy(&mut errors, &mut tokio::io::sink()).await;
@@ -492,18 +513,50 @@ async fn supervise(
         );
         let incoming = FramedRead::new(output, LinesCodec::new_with_max_length(MAX_ACP_MESSAGE))
             .map_err(io::Error::other);
-        drive(
-            Lines::new(outgoing, incoming),
-            journal.clone(),
-            requests,
-            events,
-            restore,
-            ready,
-        )
-        .await;
+        let transport = Lines::new(outgoing, incoming);
+        if prefer_v2 {
+            let fallback = client.clone();
+            let v2 = client.clone();
+            let mut transport = Some(transport);
+            let connection = Client
+                .protocol_connector()
+                .with_v1(move || Driver {
+                    mode: ClientMode::FallbackV1,
+                    ..fallback.clone()
+                })
+                .with_v2(move || Driver {
+                    mode: ClientMode::V2,
+                    ..v2.clone()
+                })
+                .connect_to(move || OnceTransport(transport.take()));
+            let mut startup = journal.subscribe();
+            let started = async {
+                startup
+                    .wait_for(|state| {
+                        matches!(state.phase, Phase::Ready | Phase::Active | Phase::Closed)
+                    })
+                    .await
+                    .map(|_| ())
+            };
+            tokio::pin!(connection);
+            let result = tokio::select! {
+                result = &mut connection => result.map_err(remote_error),
+                result = timeout(REQUEST_LIMIT * 2, started) => {
+                    match result {
+                        Ok(Ok(_)) => connection.await.map_err(remote_error),
+                        Ok(Err(_)) => Err(Error::Disconnected),
+                        Err(_) => Err(Error::TimedOut),
+                    }
+                }
+            };
+            client.fail_uninitialized(result.err().unwrap_or(Error::Disconnected));
+        } else {
+            let result = client.clone().connect_to(transport).await;
+            client.fail_uninitialized(result.err().map_or(Error::Disconnected, remote_error));
+        }
         discard.abort();
     } else {
-        let _ = ready.send(Err(Error::Disconnected));
+        client.fail_uninitialized(Error::Disconnected);
     }
     if journal.state().phase != Phase::Closed {
         let _ = journal.update(|state| state.phase = Phase::Interrupted);
@@ -516,18 +569,70 @@ async fn supervise(
     }
 }
 
-async fn drive(
-    transport: impl ConnectTo<Client> + 'static,
+struct OnceTransport<T>(Option<T>);
+
+impl<T: ConnectTo<Client>> ConnectTo<Client> for OnceTransport<T> {
+    async fn connect_to(self, peer: impl ConnectTo<Agent>) -> agent_client_protocol::Result<()> {
+        match self.0 {
+            Some(transport) => transport.connect_to(peer).await,
+            None => Err(agent_client_protocol::Error::internal_error()),
+        }
+    }
+}
+
+type DriverChannels = (mpsc::Receiver<Command>, oneshot::Sender<Result<()>>);
+
+#[derive(Clone)]
+struct Driver {
     journal: Arc<Journal>,
-    requests: mpsc::Receiver<Command>,
     events: broadcast::Sender<Event>,
     restore: Restore,
-    ready: oneshot::Sender<Result<()>>,
-) {
+    channels: Arc<Mutex<Option<DriverChannels>>>,
+    mode: ClientMode,
+}
+
+impl Driver {
+    fn fail_uninitialized(&self, error: Error) {
+        if let Some((_, ready)) = self.channels.lock().unwrap().take() {
+            let _ = ready.send(Err(error));
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ClientMode {
+    V1,
+    FallbackV1,
+    V2,
+}
+
+impl ConnectTo<Agent> for Driver {
+    async fn connect_to(
+        self,
+        transport: impl ConnectTo<Client>,
+    ) -> agent_client_protocol::Result<()> {
+        match self.mode {
+            ClientMode::V1 | ClientMode::FallbackV1 => drive_v1(transport, self).await,
+            ClientMode::V2 => v2::drive(transport, self).await,
+        }
+    }
+}
+
+async fn drive_v1(
+    transport: impl ConnectTo<Client>,
+    driver: Driver,
+) -> agent_client_protocol::Result<()> {
+    let Driver {
+        journal,
+        events,
+        restore,
+        channels,
+        mode,
+    } = driver;
     let notifications = journal.subscribe();
     let permission_state = journal.subscribe();
     let updates = events.clone();
-    let _ = Client
+    Client
         .v1()
         .on_receive_notification(
             async move |notification: SessionNotification, _| {
@@ -583,16 +688,28 @@ async fn drive(
         .connect_with(transport, async move |connection| {
             let closed = connection.incoming_closed();
             let serve = async {
-                let session = match initialize(&connection, &journal, restore).await {
-                    Ok(session) => session,
+                let session = initialize_v1(&connection, &journal, restore, mode).await;
+                let Some((requests, ready)) = channels.lock().unwrap().take() else {
+                    return;
+                };
+                match session {
+                    Ok(session) => {
+                        if ready.send(Ok(())).is_ok() {
+                            serve_session(
+                                &V1Session {
+                                    connection: &connection,
+                                    session,
+                                },
+                                &journal,
+                                requests,
+                            )
+                            .await;
+                        }
+                    }
                     Err(error) => {
                         let _ = journal.update(|state| state.phase = Phase::Interrupted);
                         let _ = ready.send(Err(error));
-                        return;
                     }
-                };
-                if ready.send(Ok(())).is_ok() {
-                    serve_session(&connection, &journal, requests, session).await;
                 }
             };
             tokio::select! {
@@ -602,16 +719,33 @@ async fn drive(
             }
             Ok(())
         })
-        .await;
+        .await
 }
 
-async fn initialize(
+async fn initialize_v1(
     connection: &ConnectionTo<Agent>,
     journal: &Journal,
     restore: Restore,
+    mode: ClientMode,
 ) -> Result<SessionId> {
-    let initialized =
-        call(connection.send_request(InitializeRequest::new(ProtocolVersion::V1))).await?;
+    let mut request = InitializeRequest::new(ProtocolVersion::V1);
+    if matches!(mode, ClientMode::FallbackV1) {
+        use agent_client_protocol::v1::schema::{
+            BooleanConfigOptionCapabilities, ClientCapabilities, ClientSessionCapabilities,
+            Implementation, SessionConfigOptionsCapabilities,
+        };
+        request = request
+            .client_info(Implementation::new("howl", env!("CARGO_PKG_VERSION")))
+            .client_capabilities(
+                ClientCapabilities::new().session(
+                    ClientSessionCapabilities::new().config_options(
+                        SessionConfigOptionsCapabilities::new()
+                            .boolean(BooleanConfigOptionCapabilities::new()),
+                    ),
+                ),
+            );
+    }
+    let initialized = call(connection.send_request(request)).await?;
     if initialized.protocol_version != ProtocolVersion::V1 {
         return Err(Error::Unsupported("ACP v1"));
     }
@@ -621,7 +755,7 @@ async fn initialize(
         resume: reported.session_capabilities.resume.is_some(),
         close: reported.session_capabilities.close.is_some(),
     };
-    journal.update(|state| state.capabilities = capabilities)?;
+    record_capabilities(journal, ProtocolVersion::V1, capabilities, restore)?;
     let session = if restore == Restore::Fresh {
         call(connection.send_request(NewSessionRequest::new(WORKSPACE)))
             .await?
@@ -633,14 +767,37 @@ async fn initialize(
         load(connection, restore, session.clone()).await?;
         session
     };
-    if session.0.is_empty() || session.0.len() > 1024 || session.0.chars().any(char::is_control) {
+    record_session(journal, &session.0)?;
+    Ok(session)
+}
+
+fn record_capabilities(
+    journal: &Journal,
+    version: ProtocolVersion,
+    capabilities: Capabilities,
+    restore: Restore,
+) -> Result<()> {
+    let state = journal.state();
+    if restore != Restore::Fresh
+        && state.remote_session.is_some()
+        && state.protocol_version.unwrap_or(ProtocolVersion::V1) != version
+    {
+        return Err(Error::ScopeChanged);
+    }
+    journal.update(|state| {
+        state.protocol_version = Some(version);
+        state.capabilities = capabilities;
+    })
+}
+
+fn record_session(journal: &Journal, id: &str) -> Result<()> {
+    if id.is_empty() || id.len() > 1024 || id.chars().any(char::is_control) {
         return Err(Error::State);
     }
     journal.update(|state| {
-        state.remote_session = Some(session.0.to_string());
+        state.remote_session = Some(id.to_owned());
         state.phase = Phase::Ready;
-    })?;
-    Ok(session)
+    })
 }
 
 async fn load(
@@ -660,11 +817,57 @@ async fn load(
     Ok(())
 }
 
+trait SessionWire: Sync {
+    fn prompt(&self, text: String) -> impl Future<Output = Result<StopReason>> + Send;
+    fn cancel(&self) -> Result<()>;
+
+    fn cancel_idle(&self) -> Result<()> {
+        Err(Error::Idle)
+    }
+
+    fn restore(&self, mode: Restore) -> impl Future<Output = Result<()>> + Send;
+    fn close(&self) -> impl Future<Output = Result<()>> + Send;
+}
+
+struct V1Session<'a> {
+    connection: &'a ConnectionTo<Agent>,
+    session: SessionId,
+}
+
+impl SessionWire for V1Session<'_> {
+    async fn prompt(&self, text: String) -> Result<StopReason> {
+        self.connection
+            .send_request(PromptRequest::new(self.session.clone(), vec![text.into()]))
+            .block_task()
+            .await
+            .map(|response| response.stop_reason)
+            .map_err(remote_error)
+    }
+
+    fn cancel(&self) -> Result<()> {
+        self.connection
+            .send_notification(CancelNotification::new(self.session.clone()))
+            .map_err(|_| Error::Disconnected)
+    }
+
+    async fn restore(&self, mode: Restore) -> Result<()> {
+        load(self.connection, mode, self.session.clone()).await
+    }
+
+    async fn close(&self) -> Result<()> {
+        call(
+            self.connection
+                .send_request(CloseSessionRequest::new(self.session.clone())),
+        )
+        .await
+        .map(|_| ())
+    }
+}
+
 async fn serve_session(
-    connection: &ConnectionTo<Agent>,
+    wire: &impl SessionWire,
     journal: &Journal,
     mut requests: mpsc::Receiver<Command>,
-    session: SessionId,
 ) {
     while let Some(request) = requests.recv().await {
         match request {
@@ -673,8 +876,7 @@ async fn serve_session(
                     let _ = reply.send(Err(error));
                     return;
                 }
-                let (result, keep_running) =
-                    drive_turn(connection, &mut requests, session.clone(), text, limit).await;
+                let (result, keep_running) = drive_turn(wire, &mut requests, text, limit).await;
                 let phase = if keep_running {
                     Phase::Ready
                 } else {
@@ -688,11 +890,11 @@ async fn serve_session(
                 }
             }
             Command::Cancel(reply) => {
-                let _ = reply.send(Err(Error::Idle));
+                let _ = reply.send(wire.cancel_idle());
             }
             Command::Restore { mode, reply } => {
                 let result = match check_restore(mode, &journal.state()) {
-                    Ok(()) => load(connection, mode, session.clone()).await,
+                    Ok(()) => wire.restore(mode).await,
                     Err(error) => Err(error),
                 };
                 let _ = reply.send(result);
@@ -700,9 +902,7 @@ async fn serve_session(
             Command::Close(reply) => {
                 let result = match journal.update(|state| state.phase = Phase::Closed) {
                     Ok(()) if journal.state().capabilities.close => {
-                        call(connection.send_request(CloseSessionRequest::new(session)))
-                            .await
-                            .map(|_| Close::Remote)
+                        wire.close().await.map(|_| Close::Remote)
                     }
                     Ok(()) => Ok(Close::Local),
                     Err(error) => Err(error),
@@ -722,15 +922,12 @@ enum Interruption {
 }
 
 async fn drive_turn(
-    connection: &ConnectionTo<Agent>,
+    wire: &impl SessionWire,
     requests: &mut mpsc::Receiver<Command>,
-    session: SessionId,
     text: String,
     limit: Duration,
 ) -> (Result<StopReason>, bool) {
-    let turn = connection
-        .send_request(PromptRequest::new(session.clone(), vec![text.into()]))
-        .block_task();
+    let turn = wire.prompt(text);
     let deadline = sleep(limit);
     tokio::pin!(turn, deadline);
     let mut interruption = Interruption::None;
@@ -740,14 +937,14 @@ async fn drive_turn(
                 if interruption == Interruption::Timeout {
                     return (Err(Error::TimedOut), true);
                 }
-                return (result.map(|response| response.stop_reason).map_err(remote_error), true);
+                return (result, true);
             }
             _ = &mut deadline => {
                 if interruption != Interruption::None {
                     let error = if interruption == Interruption::Cancel { Error::Disconnected } else { Error::TimedOut };
                     return (Err(error), false);
                 }
-                if connection.send_notification(CancelNotification::new(session.clone())).is_err() {
+                if wire.cancel().is_err() {
                     return (Err(Error::TimedOut), false);
                 }
                 interruption = Interruption::Timeout;
@@ -759,7 +956,7 @@ async fn drive_turn(
                 Some(Command::Close(reply)) => { let _ = reply.send(Err(Error::Busy)); }
                 Some(Command::Cancel(reply)) => {
                     if interruption == Interruption::None {
-                        let sent = connection.send_notification(CancelNotification::new(session.clone()));
+                        let sent = wire.cancel();
                         if sent.is_err() {
                             let _ = reply.send(Err(Error::Disconnected));
                             return (Err(Error::Disconnected), false);
@@ -775,7 +972,9 @@ async fn drive_turn(
     }
 }
 
-async fn call<T: Send + 'static>(request: SentRequest<T>) -> Result<T> {
+async fn call<T: Send + 'static, P: Protocol>(
+    request: agent_client_protocol::SentRequest<T, P>,
+) -> Result<T> {
     timeout(REQUEST_LIMIT, request.block_task())
         .await
         .map_err(|_| Error::TimedOut)?

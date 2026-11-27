@@ -176,6 +176,7 @@ mod tests {
             remote_session: None,
             container: None,
             capabilities: Capabilities::default(),
+            protocol_version: None,
             phase: Phase::Starting,
         };
         let open = Journal::new(&directory, fixture.clone()).unwrap();

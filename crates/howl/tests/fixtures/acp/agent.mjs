@@ -13,6 +13,7 @@ let permissionReply;
 lines.on("line", (line) => {
   const { id, method, params, result } = JSON.parse(line);
   if (method === "initialize") {
+    if (process.argv.includes("--expect-v2-offer") && params.protocolVersion !== 2) process.exit(48);
     reply(id, {
       protocolVersion: 1,
       agentInfo: { name: "howl-acp-fixture", version: "1" },
