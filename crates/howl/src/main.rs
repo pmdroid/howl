@@ -417,13 +417,15 @@ async fn run_workflow(args: &[OsString]) -> io::Result<()> {
     let (flags, paths) = options.split_at(separator);
     let paths = paths[1..].iter().map(PathBuf::from).collect::<Vec<_>>();
     let mut editable = false;
+    let mut whole_repository = false;
     let mut context = Vec::new();
     let mut cause = None;
     let mut paired = flags;
     if let Some((flag, rest)) = paired.split_first()
-        && flag == "--edit"
+        && (flag == "--edit" || flag == "--repo-read")
     {
-        editable = true;
+        whole_repository = true;
+        editable = flag == "--edit";
         paired = rest;
     }
     for option in paired.chunks(2) {
@@ -444,14 +446,16 @@ async fn run_workflow(args: &[OsString]) -> io::Result<()> {
     };
     let driver = required_text(driver)?;
     let mut harness = host_harness(driver, required_text(image)?.to_owned())?;
-    let snapshot = if editable && paths.is_empty() {
-        harness = harness.with_editable_workspace();
+    let snapshot = if whole_repository && paths.is_empty() {
+        if editable {
+            harness = harness.with_editable_workspace();
+        }
         Snapshot::from_repository(Path::new(repo), required_text(commit)?)
-    } else if !editable && !paths.is_empty() {
+    } else if !whole_repository && !paths.is_empty() {
         Snapshot::from_commit(Path::new(repo), required_text(commit)?, &paths)
     } else {
         return Err(invalid_input(
-            "use --edit -- for a repository or list approved paths after --",
+            "use --edit -- or --repo-read -- for a repository, or list approved paths after --",
         ));
     }
     .map_err(io::Error::other)?;
