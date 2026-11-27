@@ -13,14 +13,14 @@ pub struct ChannelMessage {
 
 const MESSAGES: &str = "
     SELECT substr(i.stream, 33, 64), i.message, i.received, i.body,
-           i.kind, a.agent, a.role, a.in_reply_to, a.context_digest
+           i.kind, a.agent, a.role, a.in_reply_to, a.context_digest, i.target
     FROM inbox i LEFT JOIN agent_replies a ON a.cursor = i.id
-    WHERE substr(i.stream, 1, 32) = ?1 AND i.kind IN (1, 3) AND i.body IS NOT NULL";
+    WHERE substr(i.stream, 1, 32) = ?1 AND i.body IS NOT NULL";
 
 impl DeliveryStore {
     pub fn channel_history(&self, channel: Id, limit: usize) -> Result<Vec<ChannelMessage>> {
         let mut statement = self.connection.prepare(&format!(
-            "{MESSAGES} ORDER BY i.received DESC, i.id DESC LIMIT ?2"
+            "{MESSAGES} AND i.kind IN (1, 3, 4) ORDER BY i.received DESC, i.id DESC LIMIT ?2"
         ))?;
         Ok(statement
             .query_map(params![channel, limit.min(256) as u32], read)?
@@ -36,7 +36,7 @@ impl DeliveryStore {
         Ok(self
             .connection
             .query_row(
-                &format!("{MESSAGES} AND substr(i.stream, 33, 64) = ?2 AND i.message = ?3"),
+                &format!("{MESSAGES} AND i.kind IN (1, 3) AND substr(i.stream, 33, 64) = ?2 AND i.message = ?3"),
                 params![channel, sender.encode(), message],
                 read,
             )
@@ -56,6 +56,10 @@ fn read(row: &Row<'_>) -> rusqlite::Result<ChannelMessage> {
             context_digest: row.get(8)?,
             text,
         }),
+        4 => Body::Wake {
+            session: row.get(9)?,
+            text,
+        },
         _ => return Err(rusqlite::Error::InvalidQuery),
     };
     Ok(ChannelMessage {
