@@ -19,6 +19,7 @@ pub struct WakeClaim {
     pub execution: Id,
     pub cursor: i64,
     pub message: Id,
+    pub frame_digest: Id,
     pub stream: Stream,
     pub epoch: u64,
     pub target: Id,
@@ -91,9 +92,10 @@ impl DeliveryStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute("UPDATE wake_targets SET status = 2 WHERE status = 1", [])?;
         tx.execute("UPDATE wake_queue SET state = 4 WHERE state = 1", [])?;
-        let uncertain = tx.execute("UPDATE wake_queue SET state = 5 WHERE state = 2", [])?;
+        let (linked, _) = recover_linked_wakes(&tx)?;
+        let standalone = tx.execute("UPDATE wake_queue SET state = 5 WHERE state = 2", [])?;
         tx.commit()?;
-        Ok(uncertain)
+        Ok(linked + standalone)
     }
 
     pub fn claim_wake(&mut self, channel: Id, target: Id, now: u64) -> Result<Option<WakeClaim>> {
@@ -113,7 +115,7 @@ impl DeliveryStore {
         getrandom::fill(&mut execution).map_err(io::Error::other)?;
         let claim = tx
             .query_row(
-                "SELECT i.id, i.message, i.target, i.expires, i.stream, i.epoch, w.generation
+                "SELECT i.id, i.message, i.target, i.expires, i.stream, i.epoch, w.generation, i.digest
                  FROM wake_queue w JOIN inbox i ON i.id = w.cursor
                  JOIN channels c ON c.channel = substr(i.stream, 1, 32) AND c.epoch = i.epoch
                  JOIN wake_targets t ON t.channel = c.channel AND t.target = i.target
@@ -135,6 +137,10 @@ impl DeliveryStore {
         Ok(claim)
     }
 
+    pub fn preview_claimed_wake(&self, execution: Id) -> Result<Option<WakeJob>> {
+        Ok(claimed_job(&self.connection, execution)?)
+    }
+
     pub fn start_wake(
         &mut self,
         execution: Id,
@@ -144,18 +150,7 @@ impl DeliveryStore {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let job = tx
-            .query_row(
-                "SELECT i.id, i.message, i.target, i.expires, i.stream, i.epoch, w.generation, i.body
-                 FROM wake_queue w JOIN inbox i ON i.id = w.cursor
-                 JOIN channels c ON c.channel = substr(i.stream, 1, 32) AND c.epoch = i.epoch
-                 JOIN wake_targets t ON t.channel = c.channel AND t.target = i.target
-                   AND t.generation = w.generation AND t.status = 1
-                 WHERE w.execution = ?1 AND w.state = 1 AND i.kind = 2 AND i.body IS NOT NULL",
-                [execution],
-                |row| Ok(WakeJob { claim: read_claim(row, execution)?, text: row.get(7)? }),
-            )
-            .optional()?;
+        let job = claimed_job(&tx, execution)?;
         let authorized = job.as_ref().is_some_and(|job| authorize(&job.claim));
         let now = fresh_clock()?;
         record_wake_time(&tx, now)?;
@@ -165,17 +160,15 @@ impl DeliveryStore {
         } else {
             WakeState::Cancelled
         };
-        tx.execute(
-            "UPDATE wake_queue SET state = ?1 WHERE execution = ?2 AND state = 1",
-            params![state as i64, execution],
-        )?;
+        set_claim_state(&tx, execution, state)?;
         tx.commit()?;
         Ok(job)
     }
 
     pub fn finish_wake(&self, execution: Id) -> Result<bool> {
         let changed = self.connection.execute(
-            "UPDATE wake_queue SET state = 3 WHERE execution = ?1 AND state = 2",
+            "UPDATE wake_queue SET state = 3 WHERE execution = ?1 AND state = 2
+             AND NOT EXISTS (SELECT 1 FROM budget_wakes WHERE execution = ?1)",
             [execution],
         )?;
         Ok(changed == 1)
@@ -192,7 +185,8 @@ impl DeliveryStore {
 
     pub fn mark_wake_uncertain(&self, execution: Id) -> Result<bool> {
         let changed = self.connection.execute(
-            "UPDATE wake_queue SET state = 5 WHERE execution = ?1 AND state = 2",
+            "UPDATE wake_queue SET state = 5 WHERE execution = ?1 AND state = 2
+             AND NOT EXISTS (SELECT 1 FROM budget_wakes WHERE execution = ?1)",
             [execution],
         )?;
         Ok(changed == 1)
@@ -218,6 +212,54 @@ impl DeliveryStore {
     }
 }
 
+pub(super) fn recover_linked_wakes(connection: &Connection) -> rusqlite::Result<(usize, usize)> {
+    let wakes = connection.execute(
+        "UPDATE wake_queue SET state = 5 WHERE state = 2
+         AND execution IN (SELECT execution FROM budget_wakes)",
+        [],
+    )?;
+    let turns = connection.execute(
+        "UPDATE budget_turns SET state = 2 WHERE state = 1
+         AND id IN (SELECT turn FROM budget_wakes)",
+        [],
+    )?;
+    Ok((wakes, turns))
+}
+
+pub(super) fn claimed_job(
+    connection: &Connection,
+    execution: Id,
+) -> rusqlite::Result<Option<WakeJob>> {
+    connection
+        .query_row(
+            "SELECT i.id, i.message, i.target, i.expires, i.stream, i.epoch, w.generation, i.digest, i.body
+                 FROM wake_queue w JOIN inbox i ON i.id = w.cursor
+                 JOIN channels c ON c.channel = substr(i.stream, 1, 32) AND c.epoch = i.epoch
+                 JOIN wake_targets t ON t.channel = c.channel AND t.target = i.target
+                   AND t.generation = w.generation AND t.status = 1
+                 WHERE w.execution = ?1 AND w.state = 1 AND i.kind = 2 AND i.body IS NOT NULL",
+            [execution],
+            |row| {
+                Ok(WakeJob {
+                    claim: read_claim(row, execution)?,
+                    text: row.get(8)?,
+                })
+            },
+        )
+        .optional()
+}
+
+pub(super) fn set_claim_state(
+    connection: &Connection,
+    execution: Id,
+    state: WakeState,
+) -> rusqlite::Result<usize> {
+    connection.execute(
+        "UPDATE wake_queue SET state = ?1 WHERE execution = ?2 AND state = 1",
+        params![state as i64, execution],
+    )
+}
+
 pub(super) fn record_wake_time(connection: &Connection, now: u64) -> Result<()> {
     let changed = connection.execute(
         "UPDATE store SET wake_clock = ?1 WHERE wake_clock <= ?1",
@@ -235,6 +277,7 @@ fn read_claim(row: &Row<'_>, execution: Id) -> rusqlite::Result<WakeClaim> {
         execution,
         cursor: row.get(0)?,
         message: row.get(1)?,
+        frame_digest: row.get(7)?,
         stream: Stream {
             channel: field(&stream, 0),
             sender: Device::decode(field(&stream, 32)),

@@ -1,7 +1,8 @@
 mod budget;
 mod wake;
 pub use budget::{
-    BudgetError, BudgetLimit, BudgetLimits, ConversationBudget, HumanAction, HumanCommand, Turn,
+    ApprovedWake, BudgetError, BudgetLimit, BudgetLimits, ConversationBudget, HumanAction,
+    HumanCommand, Turn, WakeApproval, WakeOutcome, WakeTurnError,
 };
 pub use wake::{WakeClaim, WakeJob, WakeState};
 

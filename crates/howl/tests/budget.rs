@@ -1,7 +1,8 @@
 use ed25519_dalek::{Signer, SigningKey};
 use howl::delivery::{
-    BudgetError, BudgetLimit, BudgetLimits, ConversationBudget, DeliveryStore, Device, HumanAction,
-    HumanCommand, Id, Turn,
+    BudgetError, BudgetLimit, BudgetLimits, ConversationBudget, DeliveryStore, Device, Frame,
+    HumanAction, HumanCommand, Id, Payload, Stream, Turn, WakeApproval, WakeClaim, WakeOutcome,
+    WakeState, WakeTurnError,
 };
 
 const LOCAL: Device = Device {
@@ -315,4 +316,345 @@ fn delayed_signed_pause_is_terminal_after_local_receipt_and_restart() {
         budget.apply_human(continuation, &signature, 15),
         Err(BudgetError::Limit(BudgetLimit::Paused))
     ));
+}
+
+const WAKE_STREAM: Stream = Stream {
+    channel: [42; 32],
+    sender: OTHER,
+    signing_key: [43; 32],
+};
+const WAKE_TARGET: Id = [44; 32];
+
+fn accept_and_claim_wake(store: &mut DeliveryStore, sequence: u64, now: u64) -> WakeClaim {
+    let message = [sequence as u8; 32];
+    store
+        .accept_authenticated(
+            Frame {
+                stream: WAKE_STREAM,
+                message,
+                sequence,
+                epoch: 1,
+                created_at: now,
+                expires_at: now + 20,
+            },
+            &message,
+            Payload::Wake {
+                target: WAKE_TARGET,
+                text: "Analyze the fixture repository",
+            },
+            now,
+            &human(),
+        )
+        .unwrap();
+    store
+        .claim_wake(WAKE_STREAM.channel, WAKE_TARGET, now)
+        .unwrap()
+        .unwrap()
+}
+
+fn open_wake_store(path: &std::path::Path) -> DeliveryStore {
+    let mut store = DeliveryStore::open(path, &STORE_KEY, LOCAL).unwrap();
+    store.set_epoch(WAKE_STREAM.channel, 1).unwrap();
+    store.establish_wake_time(10).unwrap();
+    store
+        .enable_wake_target(WAKE_STREAM.channel, WAKE_TARGET, 1)
+        .unwrap();
+    store
+}
+
+fn approve(claim: &WakeClaim, nonce: u8) -> WakeApproval<'_> {
+    WakeApproval {
+        nonce: [nonce; 32],
+        expires_at: 40,
+        claim,
+        agent: A,
+        cause: None,
+    }
+}
+
+fn authorized(claim: &WakeClaim, agent: Id) -> bool {
+    claim.stream == WAKE_STREAM && claim.target == WAKE_TARGET && agent == A
+}
+
+#[test]
+fn exact_wake_approval_and_budget_admission_commit_together() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("approved-wakes");
+    let mut store = open_wake_store(&path);
+    let first = accept_and_claim_wake(&mut store, 1, 10);
+    let second = accept_and_claim_wake(&mut store, 2, 11);
+    drop(store);
+    let before_upgrade = rusqlite::Connection::open(&path).unwrap();
+    before_upgrade
+        .pragma_update(None, "key", format!("x'{}'", hex::encode(STORE_KEY)))
+        .unwrap();
+    before_upgrade
+        .execute("DROP TABLE budget_wakes", [])
+        .unwrap();
+    drop(before_upgrade);
+    let mut store = DeliveryStore::open(&path, &STORE_KEY, LOCAL).unwrap();
+    let preview = store
+        .preview_claimed_wake(first.execution)
+        .unwrap()
+        .unwrap();
+    assert_eq!(preview.claim, first);
+    assert_eq!(preview.text, "Analyze the fixture repository");
+
+    let policy = BudgetLimits {
+        concurrent: 1,
+        ..limits()
+    };
+    let mut budget = store
+        .conversation_budget(policy, human().verifying_key())
+        .unwrap();
+
+    let approval = approve(&first, 1);
+    let signature = human().sign(&approval.signing_bytes(LOCAL)).to_bytes();
+    assert!(matches!(
+        budget.start_approved_wake(
+            WakeApproval {
+                agent: B,
+                ..approval
+            },
+            &signature,
+            || Ok(11),
+            authorized
+        ),
+        Err(WakeTurnError::Approval),
+    ));
+    assert!(matches!(
+        budget.start_approved_wake(
+            WakeApproval {
+                claim: &second,
+                ..approval
+            },
+            &signature,
+            || Ok(11),
+            authorized
+        ),
+        Err(WakeTurnError::Approval),
+    ));
+    let started = budget
+        .start_approved_wake(approval, &signature, || Ok(11), authorized)
+        .unwrap();
+    assert_eq!(&started.job.claim, &first);
+    assert_eq!(started.job.text, "Analyze the fixture repository");
+    assert_eq!(started.turn.agent, A);
+    assert_eq!(started.deadline(), first.expires_at);
+
+    let second_approval = approve(&second, 2);
+    let second_signature = human()
+        .sign(&second_approval.signing_bytes(LOCAL))
+        .to_bytes();
+    assert!(matches!(
+        budget.start_approved_wake(second_approval, &second_signature, || Ok(12), authorized),
+        Err(WakeTurnError::Budget(BudgetError::Limit(
+            BudgetLimit::Concurrent
+        ))),
+    ));
+    drop(store);
+
+    let mut store = DeliveryStore::open(&path, &STORE_KEY, LOCAL).unwrap();
+    assert_eq!(
+        store.wake_state(first.execution).unwrap(),
+        Some(WakeState::Running)
+    );
+    assert_eq!(
+        store.wake_state(second.execution).unwrap(),
+        Some(WakeState::Claimed)
+    );
+    assert!(!store.finish_wake(first.execution).unwrap());
+    assert!(!store.mark_wake_uncertain(first.execution).unwrap());
+    assert_eq!(
+        store.wake_state(first.execution).unwrap(),
+        Some(WakeState::Running)
+    );
+    let mut budget = store
+        .conversation_budget(policy, human().verifying_key())
+        .unwrap();
+    assert!(!budget.finish_turn(started.turn.id).unwrap());
+    budget.may_run(started.turn.id, 12).unwrap();
+    assert!(matches!(
+        budget.start_approved_wake(approval, &signature, || Ok(12), authorized),
+        Err(WakeTurnError::Unavailable),
+    ));
+    assert_eq!(
+        budget
+            .finish_approved_wake(first.execution, WakeOutcome::Finished)
+            .unwrap(),
+        Some(WakeOutcome::Finished),
+    );
+    assert_eq!(
+        budget
+            .finish_approved_wake(first.execution, WakeOutcome::Finished)
+            .unwrap(),
+        None,
+    );
+
+    let next = budget
+        .start_approved_wake(second_approval, &second_signature, || Ok(13), authorized)
+        .unwrap();
+    assert_eq!(&next.job.claim, &second);
+    assert_eq!(
+        budget
+            .finish_approved_wake(second.execution, WakeOutcome::Uncertain)
+            .unwrap(),
+        Some(WakeOutcome::Uncertain),
+    );
+    assert!(matches!(
+        budget.may_run(next.turn.id, 13),
+        Err(BudgetError::Cause)
+    ));
+    assert_eq!(
+        store.wake_state(first.execution).unwrap(),
+        Some(WakeState::Finished)
+    );
+    assert_eq!(
+        store.wake_state(second.execution).unwrap(),
+        Some(WakeState::Uncertain)
+    );
+}
+
+#[test]
+fn wake_admission_rechecks_fresh_time_grant_and_root_pause() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("approved-wakes");
+    let mut store = open_wake_store(&path);
+    let expired = accept_and_claim_wake(&mut store, 1, 10);
+    let source = accept_and_claim_wake(&mut store, 2, 20);
+    let next = accept_and_claim_wake(&mut store, 3, 21);
+    let denied = accept_and_claim_wake(&mut store, 4, 22);
+    let mut budget = store
+        .conversation_budget(limits(), human().verifying_key())
+        .unwrap();
+
+    let approval = approve(&expired, 1);
+    let signature = human().sign(&approval.signing_bytes(LOCAL)).to_bytes();
+    assert!(matches!(
+        budget.start_approved_wake(approval, &signature, || Ok(30), authorized),
+        Err(WakeTurnError::Unavailable),
+    ));
+    assert!(matches!(
+        budget.start_approved_wake(approval, &signature, || Ok(29), authorized),
+        Err(WakeTurnError::Delivery(howl::delivery::Error::WakeClock)),
+    ));
+    let approval = approve(&source, 2);
+    let signature = human().sign(&approval.signing_bytes(LOCAL)).to_bytes();
+    let running = budget
+        .start_approved_wake(approval, &signature, || Ok(30), authorized)
+        .unwrap();
+
+    let pause = command(
+        3,
+        HumanAction::Pause {
+            root: running.turn.root,
+        },
+        0,
+    );
+    let signature = human().sign(&pause.signing_bytes(LOCAL)).to_bytes();
+    budget.apply_human(pause, &signature, 30).unwrap();
+    assert_eq!(
+        budget
+            .finish_approved_wake(source.execution, WakeOutcome::Finished)
+            .unwrap(),
+        Some(WakeOutcome::Uncertain),
+    );
+    let continuation = WakeApproval {
+        cause: Some(running.turn.id),
+        ..approve(&next, 4)
+    };
+    let signature = human().sign(&continuation.signing_bytes(LOCAL)).to_bytes();
+    assert!(matches!(
+        budget.start_approved_wake(continuation, &signature, || Ok(30), authorized),
+        Err(WakeTurnError::Budget(BudgetError::Limit(
+            BudgetLimit::Paused
+        ))),
+    ));
+
+    let approval = approve(&denied, 5);
+    let signature = human().sign(&approval.signing_bytes(LOCAL)).to_bytes();
+    assert!(matches!(
+        budget.start_approved_wake(approval, &signature, || Ok(31), |_, _| false),
+        Err(WakeTurnError::Unavailable),
+    ));
+    assert_eq!(
+        store.wake_state(expired.execution).unwrap(),
+        Some(WakeState::Cancelled)
+    );
+    assert_eq!(
+        store.wake_state(next.execution).unwrap(),
+        Some(WakeState::Claimed)
+    );
+    assert_eq!(
+        store.wake_state(denied.execution).unwrap(),
+        Some(WakeState::Cancelled)
+    );
+}
+
+#[test]
+fn either_recovery_entry_point_marks_linked_and_standalone_work_uncertain() {
+    for recover_wakes_first in [true, false] {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("approved-wakes");
+        let mut store = open_wake_store(&path);
+        let linked = accept_and_claim_wake(&mut store, 1, 10);
+        let standalone = accept_and_claim_wake(&mut store, 2, 10);
+        store
+            .start_wake(standalone.execution, || Ok(10), |_| true)
+            .unwrap()
+            .unwrap();
+
+        let mut budget = store
+            .conversation_budget(limits(), human().verifying_key())
+            .unwrap();
+        let independent_turn = begin(&mut budget, 1, B, 10);
+        let approval = approve(&linked, 2);
+        let signature = human().sign(&approval.signing_bytes(LOCAL)).to_bytes();
+        let turn = budget
+            .start_approved_wake(approval, &signature, || Ok(10), authorized)
+            .unwrap()
+            .turn;
+        drop(store);
+
+        let mut reopened = DeliveryStore::open(&path, &STORE_KEY, LOCAL).unwrap();
+        if recover_wakes_first {
+            assert_eq!(reopened.recover_wakes().unwrap(), 2);
+            let mut budget = reopened
+                .conversation_budget(limits(), human().verifying_key())
+                .unwrap();
+            assert!(matches!(
+                budget.may_run(turn.id, 11),
+                Err(BudgetError::Cause)
+            ));
+            budget.may_run(independent_turn.id, 11).unwrap();
+            assert_eq!(budget.recover_turns().unwrap(), 1);
+        } else {
+            let mut budget = reopened
+                .conversation_budget(limits(), human().verifying_key())
+                .unwrap();
+            assert_eq!(budget.recover_turns().unwrap(), 2);
+            assert!(matches!(
+                budget.may_run(turn.id, 11),
+                Err(BudgetError::Cause)
+            ));
+            assert_eq!(
+                reopened.wake_state(linked.execution).unwrap(),
+                Some(WakeState::Uncertain)
+            );
+            assert_eq!(
+                reopened.wake_state(standalone.execution).unwrap(),
+                Some(WakeState::Running)
+            );
+            assert_eq!(reopened.recover_wakes().unwrap(), 1);
+        }
+        assert_eq!(
+            reopened.wake_state(linked.execution).unwrap(),
+            Some(WakeState::Uncertain)
+        );
+        assert_eq!(
+            reopened.wake_state(standalone.execution).unwrap(),
+            Some(WakeState::Uncertain)
+        );
+        assert_eq!(reopened.recover_wakes().unwrap(), 0);
+    }
 }

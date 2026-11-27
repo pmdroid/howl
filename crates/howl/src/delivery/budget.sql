@@ -27,3 +27,7 @@ CREATE INDEX IF NOT EXISTS budget_turns_cause ON budget_turns(cause);
 CREATE INDEX IF NOT EXISTS budget_turns_started ON budget_turns(started);
 CREATE INDEX IF NOT EXISTS budget_turns_agent ON budget_turns(agent, started);
 CREATE INDEX IF NOT EXISTS budget_turns_active ON budget_turns(state) WHERE state = 1;
+CREATE TABLE IF NOT EXISTS budget_wakes (
+    execution BLOB PRIMARY KEY REFERENCES wake_queue(execution),
+    turn BLOB NOT NULL UNIQUE REFERENCES budget_turns(id)
+) STRICT;
