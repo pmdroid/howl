@@ -50,8 +50,12 @@ const cli = [
   "-c", 'forced_login_method="chatgpt"', "-c", "features.skip_host_skill_discovery=true",
   "-c", "mcp_servers.howl_repository.url=" + JSON.stringify(url.href),
 ];
-if (process.env.HOWL_EDITABLE_WORKSPACE === "1") {
-  const tools = ["read_file", "list_directory", "write_file", "delete_file", "run_tests"];
+const editable = process.env.HOWL_EDITABLE_WORKSPACE === "1";
+const work = process.env.HOWL_WORK_TOOLS === "1";
+if (editable || work) {
+  const tools = ["read_file", "list_directory"];
+  if (editable) tools.push("write_file", "delete_file", "run_tests");
+  if (work) tools.push("start_work", "send_peer");
   cli.push("-c", "mcp_servers.howl_repository.enabled_tools=" + JSON.stringify(tools),
     "-c", 'mcp_servers.howl_repository.default_tools_approval_mode="approve"',
     "-c", "mcp_servers.howl_repository.tool_timeout_sec=45");

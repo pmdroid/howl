@@ -1,3 +1,7 @@
+mod work;
+
+pub(crate) use work::WorkTools;
+
 use std::{
     collections::HashSet,
     io,
@@ -18,7 +22,7 @@ use tokio::{
 
 use crate::{
     channel::Channel,
-    delivery::{DeliveryStore, Id, OngoingInput, OngoingSchedule, OngoingThread},
+    delivery::{DeliveryStore, Id, OngoingInput, OngoingSchedule, OngoingSource, OngoingThread},
     enrollment::ChannelPermission,
     identity::{LocalIdentity, PeerTrust, StateDirectory},
     managed_acp::{Harness, ManagedSession},
@@ -48,7 +52,22 @@ struct Conversation {
     repository: PathBuf,
     revision: String,
     #[serde(default)]
+    work: bool,
+    #[serde(default)]
+    work_control_from: Vec<String>,
+    #[serde(default)]
+    peers: Vec<AgentPeer>,
+    #[serde(default)]
     schedules: Vec<Schedule>,
+}
+
+#[derive(Clone, Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct AgentPeer {
+    #[serde(deserialize_with = "decode_id")]
+    id: Id,
+    route: Option<String>,
+    name: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -62,7 +81,30 @@ struct Schedule {
 impl Conversation {
     fn validate(&mut self) -> io::Result<Option<Id>> {
         let origin = self.integration.as_deref().map(parse_id).transpose()?;
+        if self.work_control_from.len() > 4
+            || (!self.work_control_from.is_empty() && (!self.work || origin.is_some()))
+        {
+            return Err(invalid(
+                "work control delegates require a human conversation with work enabled",
+            ));
+        }
+        for delegate in &mut self.work_control_from {
+            *delegate = hex::encode_upper(parse_id(delegate)?);
+        }
         node::parse_route(self.route().as_bytes())?;
+        let mut peers = HashSet::new();
+        if self.peers.len() > 8
+            || self.peers.iter().any(|peer| {
+                peer.id == self.peer
+                    || !peers.insert(peer.id)
+                    || peer.name.as_ref().is_some_and(|name| name.len() > 64)
+            })
+        {
+            return Err(invalid("invalid conversation peers"));
+        }
+        for peer in &self.peers {
+            node::parse_route(peer.route.as_deref().unwrap_or("-").as_bytes())?;
+        }
         let mut names = HashSet::new();
         if !self.repository.is_absolute()
             || self.revision.trim().is_empty()
@@ -109,6 +151,7 @@ struct AgentContext<F> {
     observer: ObserverProvider,
     identity: LocalIdentity,
     profile: Id,
+    microvm: Option<crate::microvm::Profile>,
     harness: F,
 }
 
@@ -132,7 +175,22 @@ where
         }
         conversations.push((conversation, origin));
     }
+    if conversations.iter().any(|(conversation, _)| {
+        conversation.work_control_from.iter().any(|delegate| {
+            parse_id(delegate)
+                .is_ok_and(|id| keys.contains(&(conversation.channel, conversation.peer, Some(id))))
+        })
+    }) {
+        return Err(invalid(
+            "a work control delegate must use its owner's conversation",
+        ));
+    }
     let profile = harness()?.fingerprint();
+    let microvm = conversations
+        .iter()
+        .any(|(conversation, _)| conversation.work)
+        .then(|| crate::microvm::Profile::load(state))
+        .transpose()?;
     let identity = LocalIdentity::load_or_create(state)?;
     ManagedSession::reap_observers(&state.join("ongoing-acp"), &observer)
         .map_err(io::Error::other)?;
@@ -141,11 +199,21 @@ where
         observer,
         identity,
         profile,
+        microvm,
         harness,
     });
     let (stop, stopping) = watch::channel(false);
     let mut threads = JoinSet::new();
     for (conversation, origin) in conversations {
+        let conversation = Arc::new(conversation);
+        if conversation.work {
+            threads.spawn(work::serve(
+                context.clone(),
+                conversation.clone(),
+                origin,
+                stopping.clone(),
+            ));
+        }
         threads.spawn(run(context.clone(), conversation, origin, stopping.clone()));
     }
     let outcome = tokio::select! {
@@ -163,7 +231,7 @@ where
 
 async fn run<F>(
     context: Arc<AgentContext<F>>,
-    conversation: Conversation,
+    conversation: Arc<Conversation>,
     origin: Option<Id>,
     mut stopping: watch::Receiver<bool>,
 ) -> io::Result<()>
@@ -176,6 +244,8 @@ where
     let mut active = None;
     let mut session = None;
     let schedules = conversation.schedules();
+    let delegates =
+        serde_json::to_string(&conversation.work_control_from).map_err(io::Error::other)?;
     let mut tick = interval(TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -212,11 +282,20 @@ where
         }
         let now = i64::try_from(node::unix_time()?).map_err(io::Error::other)?;
         let Some(input) = delivery
-            .next_ongoing(thread, &schedules, now)
+            .next_ongoing(thread, &schedules, &delegates, now)
             .map_err(io::Error::other)?
         else {
             continue;
         };
+        if conversation.work
+            && input.source == OngoingSource::DirectMessage
+            && let Some(reply) = work::command(&delivery, thread.scope, &input.text)?
+        {
+            delivery
+                .finish_ongoing(input.id, &reply, false)
+                .map_err(io::Error::other)?;
+            continue;
+        }
         let result = match turn(
             &context,
             &conversation,
@@ -310,9 +389,15 @@ where
     } else {
         Vec::new()
     };
-    let directive = "Continue the Howl conversation. Earlier exchanges are context. Respond to the current input. Repository tools use the approved read-only snapshot.";
+    let directive = "Continue the Howl conversation. Earlier exchanges are context. Repository tools use the approved read-only snapshot. Use send_peer to ask an available peer and wait for a peer_reply in a later turn. Use start_work for isolated implementation and report its run ID. Share worker results with the requester.";
+    let peers = conversation
+        .peers
+        .iter()
+        .map(|peer| json!({ "id": hex::encode(peer.id), "name": peer.name }))
+        .collect::<Vec<_>>();
     let text = loop {
-        let data = json!({ "source": if input.scheduled { "schedule" } else { "direct_message" }, "input": input.text, "earlier_exchanges": history });
+        let data = json!({ "source": input.source, "input": input.text, "earlier_exchanges": history,
+            "available_peers": peers, "work_enabled": conversation.work });
         let text = format!("{directive}\n{data}");
         if text.len() <= 60 * 1024 {
             break text;
@@ -327,25 +412,30 @@ where
             let snapshot =
                 Snapshot::from_repository(&conversation.repository, &conversation.revision)
                     .map_err(io::Error::other)?;
+            let mut harness = (context.harness)()?;
+            if conversation.work || !conversation.peers.is_empty() {
+                harness = harness.with_work_tools(WorkTools::new(
+                    context.state.clone(),
+                    thread,
+                    conversation,
+                ));
+            }
             *session = Some(
                 ManagedSession::start(
                     &context.state.join("ongoing-acp"),
                     &context.observer,
                     snapshot,
-                    (context.harness)()?,
+                    harness,
                 )
                 .await
                 .map_err(io::Error::other)?,
             );
         }
-        prompt(
-            session
-                .as_ref()
-                .ok_or_else(|| io::Error::other("ACP session unavailable"))?,
-            text,
-            TURN_LIMIT,
-        )
-        .await
+        let session = session
+            .as_ref()
+            .ok_or_else(|| io::Error::other("ACP session unavailable"))?;
+        session.conversation_source(input.source);
+        prompt(session, text, TURN_LIMIT).await
     };
     tokio::pin!(run);
     let mut guard = interval(TICK);

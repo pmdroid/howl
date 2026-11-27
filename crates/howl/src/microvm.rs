@@ -25,6 +25,21 @@ use crate::{
 const BOOT: Duration = Duration::from_secs(60);
 const RUN_LIMIT: Duration = Duration::from_secs(900);
 const PATCH_LIMIT: usize = 4 * 1024 * 1024;
+const WATCH_OWNER: &str = r#"
+exec 3<&0
+"$@" </dev/null 3<&- &
+machine=$!
+(
+    IFS= read -r unused <&3 || :
+    kill -KILL "$machine" 2>/dev/null
+) &
+watcher=$!
+wait "$machine"
+status=$?
+kill "$watcher" 2>/dev/null || :
+wait "$watcher" 2>/dev/null || :
+exit "$status"
+"#;
 
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -79,6 +94,7 @@ impl Drop for Guest {
         if let Some(broker) = &self.broker {
             broker.abort();
         }
+        drop(self.process.stdin.take());
         let _ = self.process.start_kill();
     }
 }
@@ -123,11 +139,14 @@ impl Guest {
             .tempdir_in("/tmp")?;
         let archive = directory.path().join("repo.tar");
         snapshot.archive(&archive)?;
-        let mut command = Command::new(&profile.qemu);
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", WATCH_OWNER, "howl-microvm"])
+            .arg(&profile.qemu);
         command
             .env_clear()
             .current_dir(directory.path())
-            .stdin(Stdio::null())
+            .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .kill_on_drop(true)

@@ -126,6 +126,10 @@ howl worker run "$HOWL_STATE" /path/to/repo main < instruction.txt
 
 Worker patches are saved under `worker-patches` in the node's state directory.
 
+Set `"work": true` on a conversation to give its ongoing agent the `start_work` tool. It launches a separate ACP worker and returns a run ID. Send `/work RUN`, `/steer RUN MESSAGE`, or `/cancel RUN` in the same TUI DM or through MCP `dm` to check status, send feedback, or cancel. To give an integration permission to steer work from a human conversation, add its signed integration ID to that conversation's `work_control_from` list.
+
+To let the agent contact other agents in the signed channel, add a `peers` list to its conversation. Each entry takes an `id` and optional `name` and `route`. The `send_peer` tool sends a signed DM and brings a matching peer reply back into the initiating conversation.
+
 ## Deliver events to a webhook
 
 Give the webhook worker its own protected JSON configuration. Run it with the enrolled node state and pair each endpoint with the channels and event types the receiver has consent to process. Use metadata-only delivery when a receiver only needs to acknowledge or route an event. Set `include_content` to `true` when the receiver needs message content and the participants have authorized its disclosure.

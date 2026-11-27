@@ -8,6 +8,7 @@ const tools = ['search_tool', 'use_tool'];
 const mcpName = 'howl_repository';
 const names = ['read_file', 'list_directory'];
 if (process.env.HOWL_EDITABLE_WORKSPACE === '1') names.push('write_file', 'delete_file', 'run_tests');
+if (process.env.HOWL_WORK_TOOLS === '1') names.push('start_work', 'send_peer');
 const mcpTools = names.map(name => mcpName + '__' + name);
 const registeredTools = new Set([...tools, ...mcpTools]);
 const stopReasons = new Set(['end_turn', 'max_tokens', 'max_turn_requests', 'refusal', 'cancelled']);

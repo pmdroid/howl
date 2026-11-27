@@ -35,6 +35,29 @@ const tools = [
   },
 ];
 
+if (process.argv[2] === "work") {
+  tools.push({
+    name: "start_work",
+    description: "Queue a fresh ACP worker in an isolated microVM for this conversation's approved repository. Use the same request key and instruction to retry.",
+    inputSchema: {
+      type: "object",
+      properties: { request_key: { type: "string" }, instruction: { type: "string" } },
+      required: ["request_key", "instruction"],
+      additionalProperties: false,
+    },
+  });
+  tools.push({
+    name: "send_peer",
+    description: "Send one message to an approved peer. The peer's signed reply enters this conversation in a later turn.",
+    inputSchema: {
+      type: "object",
+      properties: { peer: { type: "string" }, text: { type: "string" } },
+      required: ["peer", "text"],
+      additionalProperties: false,
+    },
+  });
+}
+
 if (editable) {
   const string = { type: "string" };
   for (const [name, description, properties] of [
