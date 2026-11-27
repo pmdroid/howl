@@ -120,6 +120,8 @@ Install an ARM64 QEMU binary with HVF or KVM. Create a mode `600` file named `mi
 
 The guest init extracts the read-only tar disk at `/dev/vda` into its writable `/workspace`. Identify the serial ports by name in `/sys/class/virtio-ports`. The guest sends `HOWL_ACP_READY` followed by a newline on `howl.acp`, then runs its ACP adapter over that port. At teardown it returns an eight-byte big-endian patch length and the patch bytes on `howl.patch`. Set the length to zero for a worker that produced no patch. For inference, run `crates/howl/src/provider_bridge.cjs` in the guest over `howl.provider`, and configure the guest's agent to use its loopback endpoint.
 
+For an existing Howl ChatGPT plan connection, set the profile's provider to `chatgpt_plan` and choose a model available to that connection. Set `HOWL_CHATGPT_NODE` to the absolute Node executable path, `HOWL_CHATGPT_HELPER` to the path of `tools/chatgpt-auth/chatgpt-auth.mjs`, and `HOWL_CHATGPT_STORE` to the existing credential directory. The host broker uses the connection to make requests for the guest. The guest uses the local provider bridge.
+
 ```sh
 howl worker run "$HOWL_STATE" /path/to/repo main < instruction.txt
 ```
