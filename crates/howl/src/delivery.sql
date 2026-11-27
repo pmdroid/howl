@@ -82,6 +82,13 @@ CREATE TABLE IF NOT EXISTS wake_queue (
     CHECK (state = 4 OR ((state = 0) = (execution IS NULL)))
 ) STRICT;
 CREATE INDEX IF NOT EXISTS wakes_pending ON wake_queue(cursor) WHERE state = 0;
+CREATE TABLE IF NOT EXISTS peer_wake_cancellations (
+    channel BLOB NOT NULL,
+    sender BLOB NOT NULL,
+    wake BLOB NOT NULL,
+    valid_through BLOB NOT NULL,
+    PRIMARY KEY (channel, sender, wake)
+) STRICT;
 CREATE TABLE IF NOT EXISTS wake_authorizations (
     channel BLOB NOT NULL,
     target BLOB NOT NULL,

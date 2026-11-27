@@ -71,6 +71,11 @@ impl From<ChannelMessage> for Message {
                 message.target = Some(hex::encode(session));
                 text
             }
+            Body::CancelWake { wake } => {
+                message.role = Some("cancel");
+                message.in_reply_to = Some(hex::encode(wake));
+                String::new()
+            }
         };
         message
     }
@@ -284,6 +289,16 @@ impl<'a> LocalInteraction<'a> {
 
     pub fn cancel(&self, channel: Id, root: Id) -> io::Result<()> {
         workflow::pause(self.state, channel, root)
+    }
+
+    pub async fn cancel_remote(
+        &self,
+        channel: Id,
+        peer: Id,
+        route: &str,
+        wake: Id,
+    ) -> io::Result<Receipt> {
+        receipt(node::request_peer_cancel(self.state, channel, peer, route, wake).await?)
     }
 
     fn identity(&self) -> io::Result<LocalIdentity> {

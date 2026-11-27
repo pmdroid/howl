@@ -28,6 +28,86 @@ fn frame(sender: Device, message: u8, expires_at: u64) -> Frame {
 }
 
 #[test]
+fn signed_peer_cancellation_is_sender_scoped_and_survives_reordered_delivery() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("delivery.db");
+    let key = [9; 32];
+    let signer = SigningKey::from_bytes(&[10; 32]);
+    let mut store = DeliveryStore::open(&path, &key, LOCAL).unwrap();
+    let agent = AgentRole::Reviewer.agent_id(&LOCAL.device);
+    store.set_epoch(CHANNEL, 1).unwrap();
+    store.establish_wake_time(10).unwrap();
+    store
+        .enable_network_wake_target(CHANNEL, PEER, agent, 1)
+        .unwrap();
+    let early = frame(PEER, 20, 30);
+    let cancel = Frame {
+        sequence: 2,
+        ..frame(PEER, 21, 0)
+    };
+    let payload = Payload::CancelWake {
+        wake: early.message,
+    };
+    store
+        .accept_authenticated(cancel, b"cancel", payload, 10, &signer)
+        .unwrap();
+    drop(store);
+
+    let mut store = DeliveryStore::open(&path, &key, LOCAL).unwrap();
+    let wake = Payload::Wake {
+        target: agent,
+        text: "observe",
+    };
+    store
+        .accept_network_wake(early, b"early", wake, || Ok(11), &signer)
+        .unwrap();
+    assert!(store.claim_wake(CHANNEL, agent, 11).unwrap().is_none());
+    let active = Frame {
+        sequence: 3,
+        ..frame(PEER, 22, 30)
+    };
+    let other = Device {
+        device: [45; 32],
+        ..PEER
+    };
+    let payload = Payload::CancelWake {
+        wake: active.message,
+    };
+    store
+        .accept_authenticated(
+            frame(other, 23, 0),
+            b"other peer cancel",
+            payload,
+            11,
+            &signer,
+        )
+        .unwrap();
+    store
+        .accept_network_wake(active, b"active", wake, || Ok(11), &signer)
+        .unwrap();
+    let claim = store.claim_wake(CHANNEL, agent, 11).unwrap().unwrap();
+    assert_eq!(claim.message, active.message);
+
+    let cancel = Frame {
+        sequence: 4,
+        ..frame(PEER, 24, 0)
+    };
+    store
+        .accept_authenticated(cancel, b"owner cancel", payload, 11, &signer)
+        .unwrap();
+    assert_eq!(
+        store.wake_state(claim.execution).unwrap(),
+        Some(WakeState::Cancelled)
+    );
+    assert!(
+        !store
+            .accept_authenticated(cancel, b"owner cancel", payload, 12, &signer)
+            .unwrap()
+            .inserted
+    );
+}
+
+#[test]
 fn records_outbound_messages_only_after_a_successful_enqueue() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("delivery.db");

@@ -209,6 +209,17 @@ pub async fn send(
     request_message(state, channel, recipient, route, b'S', message.as_bytes()).await
 }
 
+pub(crate) async fn request_peer_cancel(
+    state: &Path,
+    channel: Id,
+    peer: Id,
+    route: &str,
+    wake: Id,
+) -> io::Result<String> {
+    StateDirectory::open(state)?;
+    request_message(state, channel, peer, route, b'K', &wake).await
+}
+
 pub(crate) async fn send_integration_chat(
     state: &Path,
     channel: Id,
@@ -385,6 +396,7 @@ pub fn read(state: &Path, id: Id) -> io::Result<()> {
                 hex::encode(item.message),
                 item.received_at,
             ),
+            Body::CancelWake { wake } => println!("wake-cancel {sender} {}", hex::encode(wake)),
         }
     }
     Ok(())
@@ -444,8 +456,10 @@ fn queue(
         return Err(invalid("integration operations require a signed route"));
     }
     let post = *command == b'P';
-    if post && *peer != [0; 32] {
-        return Err(invalid("channel posts do not specify a peer"));
+    if post && (*peer != [0; 32] || route.is_some()) {
+        return Err(invalid(
+            "channel posts use the current signed recipients and routes",
+        ));
     }
     if !post && route.is_none() && !has_relay {
         let peer = PeerTrust::open(state)?.pinned(peer)?;
@@ -545,6 +559,20 @@ fn queue(
                     text,
                 },
                 lifetime,
+                None,
+            )
+        }
+        b'K' => {
+            let wake = body
+                .try_into()
+                .map_err(|_| invalid("invalid wake cancellation"))?;
+            queue_frame(
+                state,
+                identity,
+                delivery,
+                address,
+                Body::CancelWake { wake },
+                0,
                 None,
             )
         }
@@ -650,7 +678,7 @@ fn queue_frame(
     let roster = Channel::load(state, identity, &channel)?;
     let local = identity.certificate();
     let permission = match &body {
-        Body::Wake { .. } => ChannelPermission::Wake,
+        Body::Wake { .. } | Body::CancelWake { .. } => ChannelPermission::Wake,
         Body::Chat(_) | Body::AgentReply(_) => ChannelPermission::Send,
     };
     if !roster.allows(local.device_id(), permission) {
@@ -765,7 +793,10 @@ fn queue_frame(
         Some(approved) => {
             delivery.enqueue_agent_reply(outbound, &sealed, target, &route, unix_time, approved)
         }
-        None => delivery.enqueue_routed_message(outbound, &sealed, target, &route, now, Some(body)),
+        None => {
+            let visible = (!matches!(&body, Body::CancelWake { .. })).then_some(body);
+            delivery.enqueue_routed_message(outbound, &sealed, target, &route, now, visible)
+        }
     }
     .map_err(io::Error::other)?;
     Ok(format!("queued {}", hex::encode(metadata.message_id)))
@@ -834,7 +865,7 @@ fn check_outbound(
 ) -> io::Result<()> {
     let metadata = howl_envelope::inspect_unverified(&attempt.frame).map_err(io::Error::other)?;
     let roster = Channel::load(state, identity, &metadata.routing.channel)?;
-    let permission = if metadata.intent.is_wake() {
+    let permission = if metadata.intent.requires_wake_permission() {
         ChannelPermission::Wake
     } else {
         ChannelPermission::Send
@@ -928,7 +959,7 @@ pub(crate) fn accept_envelope(
     let mailbox = matches!(source, EnvelopeSource::Mailbox);
     let roster = Channel::load(state, identity, &unverified.routing.channel)?;
     let wake = unverified.intent.is_wake();
-    let permission = if wake {
+    let permission = if unverified.intent.requires_wake_permission() {
         ChannelPermission::Wake
     } else {
         ChannelPermission::Send
@@ -974,7 +1005,7 @@ pub(crate) fn accept_envelope(
             address: address(device_with_account(peer, account)),
             signing_key: peer.signing_public(),
             chat: true,
-            wake,
+            wake: unverified.intent.requires_wake_permission(),
         },
         authorized_recipients: &allowed,
     };
@@ -994,6 +1025,7 @@ pub(crate) fn accept_envelope(
             target: *session,
             text,
         },
+        Body::CancelWake { wake } => Payload::CancelWake { wake: *wake },
         Body::AgentReply(reply) => Payload::AgentReply(AgentReply {
             agent: reply.agent,
             role: reply.role,

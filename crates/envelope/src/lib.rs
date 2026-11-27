@@ -47,6 +47,7 @@ pub enum Intent {
     AgentReply = 3,
     IntegrationChat = 4,
     IntegrationWake = 5,
+    CancelWake = 6,
 }
 
 impl Intent {
@@ -56,6 +57,10 @@ impl Intent {
 
     pub const fn is_integration(self) -> bool {
         matches!(self, Self::IntegrationChat | Self::IntegrationWake)
+    }
+
+    pub const fn requires_wake_permission(self) -> bool {
+        self.is_wake() || matches!(self, Self::CancelWake)
     }
 }
 
@@ -108,6 +113,7 @@ pub struct AgentReply<Text> {
 pub enum Body<Text> {
     Chat(Text),
     Wake { session: Id, text: Text },
+    CancelWake { wake: Id },
     AgentReply(AgentReply<Text>),
 }
 
@@ -116,6 +122,7 @@ impl<Text> Body<Text> {
         match self {
             Self::Chat(_) => Intent::Chat,
             Self::Wake { .. } => Intent::Wake,
+            Self::CancelWake { .. } => Intent::CancelWake,
             Self::AgentReply(_) => Intent::AgentReply,
         }
     }
@@ -367,9 +374,10 @@ fn open_envelope(
     }
     if routing.sender != policy.sender.address
         || metadata.signing_key_id != key_id(b"device-signing", &policy.sender.signing_key)
-        || !match metadata.intent {
-            Intent::Chat | Intent::AgentReply | Intent::IntegrationChat => policy.sender.chat,
-            Intent::Wake | Intent::IntegrationWake => policy.sender.wake,
+        || !if metadata.intent.requires_wake_permission() {
+            policy.sender.wake
+        } else {
+            policy.sender.chat
         }
     {
         return Err(Error::Unauthorized);
