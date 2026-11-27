@@ -45,6 +45,7 @@ pub fn run(args: &[OsString]) -> io::Result<()> {
             let exchange = StateDirectory::open(exchange)?;
             write_exact(&exchange, PEER, peer.as_bytes())?;
             println!("Fingerprint {}", hex::encode(peer.fingerprint()));
+            println!("Endpoint {}", peer.endpoint());
         }
         [command, state] if command == "authority" => {
             let state = Path::new(state);

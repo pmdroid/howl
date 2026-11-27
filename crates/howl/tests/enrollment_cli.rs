@@ -187,6 +187,10 @@ fn enrollment_transfers_separate_artifacts_and_checks_all_device_proofs() {
     let peer = LocalIdentity::load_or_create(&candidate)
         .unwrap()
         .certificate();
+    assert_eq!(
+        line(&identity, "Endpoint "),
+        peer.endpoint().to_string().as_str()
+    );
     let store = AuthorityStore::open(&candidate).unwrap();
     let signed = Designation::verify(
         &fs::read(candidate.join("enrollment-designation")).unwrap(),
