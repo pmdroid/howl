@@ -12,6 +12,9 @@ use howl::{
     node,
 };
 
+#[path = "mcp_interop/fixture.rs"]
+mod interop;
+
 struct Node(Child);
 
 impl Drop for Node {
@@ -481,6 +484,18 @@ async fn enrolled_peers_stop_new_delivery_after_signed_revocation() {
         .await
         .unwrap();
     check_gateway(&alice, &bob, channel, second_channel, a_device, architect).await;
+    if let Ok(image) = std::env::var("HOWL_MCP_INTEROP_IMAGE") {
+        interop::verify(
+            &bob,
+            &alice,
+            &bob_address,
+            &alice_address,
+            channel,
+            second_channel,
+            &image,
+        )
+        .await;
+    }
 
     let revocation = successful(cli(
         &["roster", "revoke"],
