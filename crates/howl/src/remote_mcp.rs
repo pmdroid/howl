@@ -1,5 +1,7 @@
 pub(crate) mod resources;
+pub(crate) mod subscriptions;
 pub(crate) mod tasks;
+
 use std::{
     collections::{HashMap, HashSet},
     io,
@@ -166,7 +168,8 @@ where
         .with_allowed_origins(config.allowed_origins)
         .enforce_origin_validation()
         .with_stateless_protocol_metadata_required(true)
-        .with_json_response(true)
+        .with_json_response(false)
+        .with_sse_keep_alive(Some(Duration::from_secs(15)))
         .with_max_request_body_bytes(65_536);
     let state = Arc::new(Gateway {
         configuration: Arc::new(configuration),
@@ -364,6 +367,16 @@ fn uncached(response: impl IntoResponse) -> Response {
     response
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    if response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .is_some_and(|value| value.as_bytes().starts_with(b"text/event-stream"))
+    {
+        response.headers_mut().insert(
+            HeaderName::from_static("x-accel-buffering"),
+            HeaderValue::from_static("no"),
+        );
+    }
     response
 }
 
