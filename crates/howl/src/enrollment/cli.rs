@@ -1,3 +1,5 @@
+mod recovery;
+
 use std::{
     ffi::{OsStr, OsString},
     io,
@@ -28,7 +30,7 @@ const RESPONSE: &str = "response";
 const INVITATION: &str = "invitation";
 const RECORD_LIMIT: u64 = 128 * 1024;
 
-pub const HELP: &str = "Usage: howl enrollment init STATE OFFLINE_KEYS\n       howl enrollment identity STATE EXCHANGE\n       howl enrollment authority STATE\n       howl enrollment offer STATE EXCHANGE VERIFIED_FINGERPRINT SEQUENCE SECRET_DIR\n       howl enrollment respond STATE EXCHANGE VERIFIED_ACCOUNT VERIFIED_HEAD VERIFIED_DESIGNATION SECRET_DIR\n       howl enrollment certify STATE EXCHANGE\n       howl enrollment certificate STATE EXCHANGE\n       howl enrollment accept STATE EXCHANGE VERIFIED_ACCOUNT VERIFIED_HEAD VERIFIED_DESIGNATION\n       howl enrollment peer STATE EXCHANGE";
+pub const HELP: &str = "Usage: howl enrollment init STATE OFFLINE_KEYS\n       howl enrollment identity STATE EXCHANGE\n       howl enrollment authority STATE\n       howl enrollment offer STATE EXCHANGE VERIFIED_FINGERPRINT SEQUENCE SECRET_DIR\n       howl enrollment respond STATE EXCHANGE VERIFIED_ACCOUNT VERIFIED_HEAD VERIFIED_DESIGNATION SECRET_DIR\n       howl enrollment certify STATE EXCHANGE\n       howl enrollment certificate STATE EXCHANGE\n       howl enrollment accept STATE EXCHANGE VERIFIED_ACCOUNT VERIFIED_HEAD VERIFIED_DESIGNATION\n       howl enrollment peer STATE EXCHANGE\n       howl enrollment recover-export STATE OFFLINE_KEYS PACKAGE_DIR UNLOCK_DIR\n       howl enrollment recover NEW_STATE PACKAGE_DIR UNLOCK_DIR NEW_OFFLINE_KEYS VERIFIED_ACCOUNT VERIFIED_HEAD";
 
 pub fn run(args: &[OsString]) -> io::Result<()> {
     match args {
@@ -92,6 +94,24 @@ pub fn run(args: &[OsString]) -> io::Result<()> {
         }
         [command, state, exchange] if command == "peer" => {
             import_peer(Path::new(state), Path::new(exchange))?;
+        }
+        [command, state, offline, package, unlock] if command == "recover-export" => {
+            recovery::export(
+                Path::new(state),
+                Path::new(offline),
+                Path::new(package),
+                Path::new(unlock),
+            )?;
+        }
+        [command, state, package, unlock, offline, account, head] if command == "recover" => {
+            recovery::recover(
+                Path::new(state),
+                Path::new(package),
+                Path::new(unlock),
+                Path::new(offline),
+                id(account)?,
+                id(head)?,
+            )?;
         }
         _ => {
             return Err(invalid(
