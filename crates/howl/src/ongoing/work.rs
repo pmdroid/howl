@@ -59,9 +59,7 @@ impl WorkTools {
             "start_work" if self.can_start => {
                 self.start(arguments).map(|id| format!("Work {id} queued."))
             }
-            "send_peer" if self.can_ask.swap(false, Ordering::AcqRel) => {
-                self.send_peer(arguments).await
-            }
+            "send_peer" if self.can_ask.load(Ordering::Acquire) => self.send_peer(arguments).await,
             _ => Err(io::ErrorKind::PermissionDenied.into()),
         }
     }
