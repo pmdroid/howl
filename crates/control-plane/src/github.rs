@@ -73,6 +73,13 @@ impl GitHub {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn fixture(mut self, url: String) -> Self {
+        self.login = format!("{url}/login");
+        self.api = url;
+        self
+    }
+
     pub(crate) async fn begin(&self) -> Result<DeviceCode> {
         let mut result: DeviceCode = json(
             self.http
