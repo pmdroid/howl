@@ -110,6 +110,16 @@ impl Harness {
         )
     }
 
+    pub fn opencode_go(image: String, model: &str) -> Self {
+        Self::new(
+            "opencode-go",
+            image,
+            "/usr/local/bin/node",
+            &["/usr/local/share/howl/opencode-provider.mjs", model],
+        )
+        .with_provider(Provider::OpenCodeGo, model)
+    }
+
     pub fn new(name: &str, image: String, executable: impl Into<PathBuf>, args: &[&str]) -> Self {
         Self {
             name: name.to_owned(),
@@ -364,7 +374,7 @@ impl ManagedSession {
         .map_err(|_| Error::Disconnected)??;
 
         let broker = if let Some(broker) = broker {
-            match broker.attach(&process).await {
+            match broker.attach(&process, &journal.state().id).await {
                 Ok(task) => Some(task),
                 Err(error) => {
                     journal.update(|state| state.phase = Phase::Interrupted)?;

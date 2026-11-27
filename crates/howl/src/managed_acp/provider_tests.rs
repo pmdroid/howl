@@ -11,6 +11,46 @@ use super::*;
 #[tokio::test]
 #[ignore = "requires both pinned harness images, Node, and a local Linux observer engine"]
 async fn both_brokered_harnesses_stream_from_a_host_fixture() {
+    exercise_brokers(&[
+        (
+            Provider::OpenAi,
+            "HOWL_CODEX_IMAGE",
+            "/usr/local/bin/node",
+            "/fixture/codex-wrapper.mjs",
+            "howl-fixture-model",
+        ),
+        (
+            Provider::ChatGptPlan,
+            "HOWL_CODEX_IMAGE",
+            "/usr/local/bin/node",
+            "/fixture/codex-wrapper.mjs",
+            "howl-fixture-model",
+        ),
+        (
+            Provider::XAi,
+            "HOWL_GROK_IMAGE",
+            "/bin/sh",
+            "/usr/local/share/howl/grok-provider.sh",
+            "grok-4.7",
+        ),
+    ])
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "requires a pinned OpenCode image, Node, and a local Linux observer engine"]
+async fn opencode_go_streams_from_the_host_broker() {
+    exercise_brokers(&[(
+        Provider::OpenCodeGo,
+        "HOWL_OPENCODE_GO_IMAGE",
+        "/usr/local/bin/node",
+        "/usr/local/share/howl/opencode-provider.mjs",
+        "howl-fixture-model",
+    )])
+    .await;
+}
+
+async fn exercise_brokers(cases: &[(Provider, &str, &str, &str, &str)]) {
     let socket = env_path("HOWL_OBSERVER_DOCKER_SOCKET");
     let provider = ObserverProvider::connect(&socket).unwrap();
     let repo = tempfile::tempdir().unwrap();
@@ -40,35 +80,25 @@ async fn both_brokered_harnesses_stream_from_a_host_fixture() {
         assert!(status.success());
     }
     let state = tempfile::tempdir().unwrap();
-    for (kind, image_variable, executable, wrapper, model) in [
-        (
-            Provider::OpenAi,
-            "HOWL_CODEX_IMAGE",
-            "/usr/local/bin/node",
-            "/fixture/codex-wrapper.mjs",
-            "howl-fixture-model",
-        ),
-        (
-            Provider::ChatGptPlan,
-            "HOWL_CODEX_IMAGE",
-            "/usr/local/bin/node",
-            "/fixture/codex-wrapper.mjs",
-            "howl-fixture-model",
-        ),
-        (
-            Provider::XAi,
-            "HOWL_GROK_IMAGE",
-            "/bin/sh",
-            "/usr/local/share/howl/grok-provider.sh",
-            "grok-4.7",
-        ),
-    ] {
+    for &(kind, image_variable, executable, wrapper, model) in cases {
+        let id = match kind {
+            Provider::OpenAi => "a",
+            Provider::XAi => "b",
+            Provider::ChatGptPlan => "c",
+            Provider::OpenCodeGo => "d",
+        }
+        .repeat(32);
+        let recorded_id = if kind == Provider::OpenCodeGo {
+            &id
+        } else {
+            ""
+        };
         let mut upstream = Command::new("node")
             .arg(format!(
                 "{}/tests/fixtures/codex-acp/responses-fixture.mjs",
                 env!("CARGO_MANIFEST_DIR")
             ))
-            .args(["fixture-host-key", "0", model])
+            .args(["fixture-host-key", "0", model, recorded_id])
             .stdout(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
@@ -90,12 +120,7 @@ async fn both_brokered_harnesses_stream_from_a_host_fixture() {
             &provider,
             snapshot,
             harness,
-            match kind {
-                Provider::OpenAi => "a",
-                Provider::XAi => "b",
-                Provider::ChatGptPlan => "c",
-            }
-            .repeat(32),
+            id,
             None,
             Some(Broker::fixture(kind, model, port)),
         )

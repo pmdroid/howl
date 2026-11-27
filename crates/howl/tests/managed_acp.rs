@@ -345,3 +345,11 @@ async fn live_brokered_grok() {
     )
     .await;
 }
+
+#[tokio::test]
+#[ignore = "requires a pinned OpenCode image and a host OpenCode Go subscription key"]
+async fn live_opencode_go() {
+    let model = std::env::var("HOWL_OPENCODE_GO_MODEL").unwrap_or_else(|_| "kimi-k3".to_owned());
+    let image = std::env::var("HOWL_OPENCODE_GO_IMAGE").expect("set the pinned OpenCode image ID");
+    provider_reply(Harness::opencode_go(image, &model)).await;
+}

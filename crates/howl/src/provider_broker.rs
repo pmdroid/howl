@@ -27,6 +27,7 @@ pub enum Provider {
     OpenAi,
     XAi,
     ChatGptPlan,
+    OpenCodeGo,
 }
 
 impl Provider {
@@ -34,15 +35,26 @@ impl Provider {
         match self {
             Self::OpenAi | Self::ChatGptPlan => "https://api.openai.com",
             Self::XAi => "https://api.x.ai",
+            Self::OpenCodeGo => "https://opencode.ai",
+        }
+    }
+
+    fn base_path(self) -> &'static str {
+        match self {
+            Self::OpenCodeGo => "/inference/go/openai",
+            _ => "",
         }
     }
 
     fn allows(self, method: &str, path: &str) -> bool {
         matches!(
             (self, method, path),
-            (_, "GET", "/v1/models")
-                | (Self::OpenAi | Self::ChatGptPlan, "POST", "/v1/responses")
-                | (Self::XAi, "POST", "/v1/chat/completions")
+            (
+                Self::OpenAi | Self::ChatGptPlan | Self::XAi,
+                "GET",
+                "/v1/models"
+            ) | (Self::OpenAi | Self::ChatGptPlan, "POST", "/v1/responses")
+                | (Self::XAi | Self::OpenCodeGo, "POST", "/v1/chat/completions")
         )
     }
 
@@ -51,6 +63,7 @@ impl Provider {
             Self::OpenAi => 1,
             Self::XAi => 2,
             Self::ChatGptPlan => 3,
+            Self::OpenCodeGo => 4,
         }
     }
 }
@@ -79,13 +92,15 @@ pub(crate) struct Broker {
     key: Zeroizing<String>,
     origin: String,
     model: String,
+    session: Option<String>,
 }
 
 impl Broker {
     pub(crate) fn from_environment(provider: Provider, model: &str) -> Result<Self, Error> {
-        let keys = match provider {
-            Provider::OpenAi => ["HOWL_OPENAI_API_KEY", "OPENAI_API_KEY"],
-            Provider::XAi => ["HOWL_XAI_API_KEY", "XAI_API_KEY"],
+        let keys: &[&str] = match provider {
+            Provider::OpenAi => &["HOWL_OPENAI_API_KEY", "OPENAI_API_KEY"],
+            Provider::XAi => &["HOWL_XAI_API_KEY", "XAI_API_KEY"],
+            Provider::OpenCodeGo => &["HOWL_OPENCODE_GO_API_KEY"],
             Provider::ChatGptPlan => return Err(Error::MissingPlan),
         };
         let key = keys
@@ -118,41 +133,50 @@ impl Broker {
         {
             return Err(Error::InvalidKey);
         }
-        let mut client = Client::builder()
-            .https_only(true)
-            .no_proxy()
-            .redirect(Policy::none())
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(120));
-        if provider == Provider::ChatGptPlan {
-            client = client.user_agent(concat!("Howl/", env!("CARGO_PKG_VERSION")));
-        }
-        let client = client.build().map_err(|_| Error::Client)?;
+        let client = Self::http_client(provider, true)?;
         Ok(Broker {
             provider,
             client,
             key,
             origin: provider.origin().to_owned(),
             model: model.to_owned(),
+            session: None,
         })
+    }
+
+    fn http_client(provider: Provider, https_only: bool) -> Result<Client, Error> {
+        let mut client = Client::builder()
+            .https_only(https_only)
+            .no_proxy()
+            .redirect(Policy::none())
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(120));
+        if matches!(provider, Provider::ChatGptPlan | Provider::OpenCodeGo) {
+            client = client.user_agent(concat!("Howl/", env!("CARGO_PKG_VERSION")));
+        }
+        client.build().map_err(|_| Error::Client)
     }
 
     #[cfg(test)]
     pub(crate) fn fixture(provider: Provider, model: &str, port: u16) -> Self {
         Self {
             provider,
-            client: Client::builder()
-                .no_proxy()
-                .redirect(Policy::none())
-                .build()
-                .unwrap(),
+            client: Self::http_client(provider, false).unwrap(),
             key: Zeroizing::new("fixture-host-key".to_owned()),
             origin: format!("http://127.0.0.1:{port}"),
             model: model.to_owned(),
+            session: None,
         }
     }
 
-    pub(crate) async fn attach(self, observer: &ObserverProcess) -> Result<BrokerTask, Error> {
+    pub(crate) async fn attach(
+        mut self,
+        observer: &ObserverProcess,
+        session: &str,
+    ) -> Result<BrokerTask, Error> {
+        if self.provider == Provider::OpenCodeGo {
+            self.session = Some(session.to_owned());
+        }
         timeout(Duration::from_secs(10), self.attach_when_running(observer))
             .await
             .map_err(|_| Error::Bridge)?
@@ -241,7 +265,12 @@ impl Broker {
         {
             return send_error(response, 403, "provider request denied").await;
         }
-        let url = format!("{}{}", self.origin, request.path);
+        let url = format!(
+            "{}{}{}",
+            self.origin,
+            self.provider.base_path(),
+            request.path
+        );
         let upstream = match request.method.as_str() {
             "GET" if request.body.is_empty() => self.client.request(Method::GET, url),
             "POST" => {
@@ -257,6 +286,10 @@ impl Broker {
             _ => return send_error(response, 403, "provider request denied").await,
         }
         .bearer_auth(&*self.key);
+        let upstream = match &self.session {
+            Some(session) => upstream.header("x-opencode-session", session),
+            None => upstream,
+        };
         let Ok(upstream) = upstream.send().await else {
             return send_error(response, 502, "provider unavailable").await;
         };
@@ -340,7 +373,7 @@ fn allowed_payload(body: &str, model: &str, provider: Provider) -> Option<String
             request.insert("store".to_owned(), false.into());
             "max_output_tokens"
         }
-        Provider::XAi => {
+        Provider::XAi | Provider::OpenCodeGo => {
             request.insert("n".to_owned(), 1.into());
             if let Some(value) = request.remove("max_completion_tokens") {
                 request.entry("max_tokens").or_insert(value);
@@ -385,7 +418,7 @@ fn allowed_field(provider: Provider, field: &str) -> bool {
                 | "truncation"
                 | "stream_options"
         ),
-        Provider::XAi => matches!(
+        Provider::XAi | Provider::OpenCodeGo => matches!(
             field,
             "messages"
                 | "n"
@@ -662,6 +695,36 @@ mod tests {
     use tokio::io::{AsyncBufReadExt, BufReader as AsyncBufReader, duplex, split};
 
     #[test]
+    fn opencode_go_only_allows_subscription_chat_for_the_selected_model() {
+        let provider = Provider::OpenCodeGo;
+        assert_eq!(provider.origin(), "https://opencode.ai");
+        assert_eq!(provider.base_path(), "/inference/go/openai");
+        assert!(provider.allows("POST", "/v1/chat/completions"));
+        assert!(!provider.allows("GET", "/v1/models"));
+        assert!(!provider.allows("POST", "/v1/responses"));
+        assert!(!provider.allows("POST", "/v1/chat/completions?extra=1"));
+        assert!(allowed_payload(r#"{"model":"other"}"#, "selected", provider).is_none());
+        assert!(
+            allowed_payload(
+                r#"{"model":"selected","tools":[{"type":"web_search"}]}"#,
+                "selected",
+                provider,
+            )
+            .is_none()
+        );
+        let allowed = allowed_payload(
+            r#"{"model":"selected","max_tokens":100000,"n":3}"#,
+            "selected",
+            provider,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&allowed).unwrap(),
+            serde_json::json!({"model":"selected","max_tokens":8192,"n":1})
+        );
+    }
+
+    #[test]
     fn denies_unconfigured_models_and_provider_tools() {
         let allowed_payload = |body, model| super::allowed_payload(body, model, Provider::OpenAi);
         assert!(Provider::OpenAi.allows("POST", "/v1/responses"));
@@ -829,6 +892,7 @@ mod tests {
             key: Zeroizing::new("fixture-host-key".to_owned()),
             origin,
             model: "selected".to_owned(),
+            session: None,
         };
         let (guest, host) = duplex(32 * 1024);
         let (host_read, host_write) = split(host);

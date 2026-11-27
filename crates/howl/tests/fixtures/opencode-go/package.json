@@ -1,0 +1,7 @@
+{
+  "name": "howl-opencode-go-fixture",
+  "private": true,
+  "dependencies": {
+    "opencode-ai": "1.19.6"
+  }
+}

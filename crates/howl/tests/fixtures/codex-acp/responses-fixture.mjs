@@ -1,6 +1,6 @@
 import { createServer } from "node:http";
 
-const [auth = "howl-local", port = "17861", model = "howl-fixture-model"] = process.argv.slice(2);
+const [auth = "howl-local", port = "17861", model = "howl-fixture-model", session = ""] = process.argv.slice(2);
 const label = "howl-responses-fixture-ok";
 
 const server = createServer(async (request, response) => {
@@ -15,7 +15,13 @@ const server = createServer(async (request, response) => {
     }));
     return;
   }
-  if (request.method === "POST" && request.url === "/v1/chat/completions") {
+  const chatPath = session ? "/inference/go/openai/v1/chat/completions" : "/v1/chat/completions";
+  if (request.method === "POST" && request.url === chatPath) {
+    const agent = request.headers["user-agent"];
+    if (session && (request.headers["x-opencode-session"] !== session || !agent?.startsWith("Howl/"))) {
+      response.writeHead(403).end();
+      return;
+    }
     const input = JSON.parse(await new Promise((resolve, reject) => {
       const chunks = [];
       request.on("data", chunk => chunks.push(chunk));
