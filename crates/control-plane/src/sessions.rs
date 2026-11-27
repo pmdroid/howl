@@ -57,17 +57,31 @@ impl ControlPlane {
         proof: &Proof,
         body: &[u8],
     ) -> Result<PendingSession> {
+        let mut connection = self.pool.get().await?;
+        let tx = connection.transaction().await?;
+        let session = self
+            .authorize_in(&tx, operation, credential, proof, body)
+            .await?;
+        tx.commit().await?;
+        Ok(session)
+    }
+
+    pub(crate) async fn authorize_in(
+        &self,
+        tx: &Transaction<'_>,
+        operation: &str,
+        credential: &str,
+        proof: &Proof,
+        body: &[u8],
+    ) -> Result<PendingSession> {
         proof::operation_name(operation)?;
         if matches!(operation, "poll" | "refresh" | "revoke") {
             return Err(Error::Invalid);
         }
         let digest = proof::credential_digest(credential)?;
-        let mut connection = self.pool.get().await?;
-        let tx = connection.transaction().await?;
-        let (session, _) = session(&tx, &digest, false).await?;
-        self.prove(&tx, proof, &session, operation, digest, body)
+        let (session, _) = session(tx, &digest, false).await?;
+        self.prove(tx, proof, &session, operation, digest, body)
             .await?;
-        tx.commit().await?;
         Ok(session.public())
     }
 

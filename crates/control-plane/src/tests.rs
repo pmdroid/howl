@@ -400,3 +400,301 @@ async fn device_login_rejects_replays_and_rotates_or_revokes_device_bound_creden
         StatusCode::UNAUTHORIZED
     );
 }
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL instance with owner and runtime fixture roles"]
+async fn hosted_enrollment_requires_a_current_independent_pin_and_pairing_certificate() {
+    use crate::{EnrollmentPin, pin_enrollment};
+    use howl::{
+        enrollment::{Authority, AuthorityRecord, Designation, Enroll, Floor, PairingTicket},
+        identity::LocalIdentity,
+    };
+    use std::{
+        fs,
+        io::Write,
+        os::unix::fs::{DirBuilderExt, OpenOptionsExt},
+    };
+
+    let owner = pool("HOWL_TEST_CONTROL_DATABASE_OWNER");
+    migrate(&owner).await.unwrap();
+    let runtime = pool("HOWL_TEST_CONTROL_DATABASE_RUNTIME");
+    let temp = tempfile::tempdir().unwrap();
+    let device_path = temp.path().join("device");
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&device_path)
+        .unwrap();
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(device_path.join("device-v1"))
+        .unwrap()
+        .write_all(&[&[1], &[20; 32][..], &[21; 32], &[22; 32], &[23; 32]].concat())
+        .unwrap();
+    let identity = LocalIdentity::load_or_create(&device_path).unwrap();
+    let device_key = SigningKey::from_bytes(&[21; 32]);
+    let peer = identity.certificate();
+    let root = SigningKey::from_bytes(&[24; 32]);
+    let recovery = SigningKey::from_bytes(&[25; 32]);
+    let membership = SigningKey::from_bytes(&[26; 32]);
+    let genesis = AuthorityRecord::genesis(&root, &recovery);
+    let account = genesis.digest();
+    let head = Authority::import([genesis.clone()], account, account)
+        .unwrap()
+        .head()
+        .unwrap();
+    let designation = Designation::issue(head, 1, &root, &membership, &[]).unwrap();
+    let (ticket, offer) =
+        PairingTicket::create(&designation, &membership, &peer, peer.fingerprint(), 1, 100)
+            .unwrap();
+    let response = offer
+        .respond(&designation, &identity, ticket.invitation_secret(), 110)
+        .unwrap();
+    let certificate = ticket
+        .enroll(Enroll {
+            state: &temp.path().join("owner"),
+            designation: &designation,
+            signer: &membership,
+            peer: &peer,
+            offer: &offer,
+            response: &response,
+            now: 110,
+        })
+        .unwrap();
+    let material = json!({"authority":[hex::encode(genesis.as_bytes())],
+        "designation":hex::encode(designation.as_bytes()), "certificate":hex::encode(certificate.as_bytes())});
+    let encoded = serde_json::to_vec(&material).unwrap();
+    let github_id = 7654321;
+    let mut connection = runtime.get().await.unwrap();
+    let tx = connection.transaction().await.unwrap();
+    let credentials = crate::sessions::begin(
+        &tx,
+        github_id,
+        *peer.device_id(),
+        device_key.verifying_key().to_bytes(),
+    )
+    .await
+    .unwrap();
+    let other_key = SigningKey::from_bytes(&[27; 32]);
+    let substitute = crate::sessions::begin(
+        &tx,
+        github_id,
+        [28; 32],
+        other_key.verifying_key().to_bytes(),
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    drop(connection);
+    let github = GitHub::new("fixtureapp".into(), Zeroizing::new("fixture_secret".into())).unwrap();
+    let control = Arc::new(
+        ControlPlane::new(runtime.clone(), github, AUDIENCE, Zeroizing::new([3; 32])).unwrap(),
+    );
+    let server = serve(control.clone().router()).await;
+    let http = Client::new();
+    let endpoint = format!("{}/v1/enrollment/device", server.url);
+    let pin = || EnrollmentPin {
+        github_id,
+        account_id: account,
+        authority_head: head.digest,
+        designation_digest: designation.digest(),
+    };
+    let send = |nonce: String, signature: String, credential: &str, bytes: Vec<u8>| {
+        http.post(&endpoint)
+            .bearer_auth(credential)
+            .header("howl-nonce", nonce)
+            .header("howl-signature", signature)
+            .body(bytes)
+            .send()
+    };
+    let proof = enrollment_proof(
+        &http,
+        &server.url,
+        &credentials,
+        &device_key,
+        "enrollment",
+        &encoded,
+    )
+    .await;
+    assert_eq!(
+        send(
+            proof.nonce,
+            proof.signature,
+            &credentials.access_token,
+            encoded.clone()
+        )
+        .await
+        .unwrap()
+        .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert!(pin_enrollment(&runtime, pin()).await.is_err());
+    pin_enrollment(&owner, pin()).await.unwrap();
+
+    let wrong = enrollment_proof(
+        &http,
+        &server.url,
+        &substitute,
+        &other_key,
+        "enrollment",
+        &encoded,
+    )
+    .await;
+    assert_eq!(
+        send(
+            wrong.nonce,
+            wrong.signature,
+            &substitute.access_token,
+            encoded.clone()
+        )
+        .await
+        .unwrap()
+        .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let proof = enrollment_proof(
+        &http,
+        &server.url,
+        &credentials,
+        &device_key,
+        "enrollment",
+        &encoded,
+    )
+    .await;
+    assert_eq!(
+        send(
+            proof.nonce.clone(),
+            proof.signature.clone(),
+            &credentials.access_token,
+            encoded.clone()
+        )
+        .await
+        .unwrap()
+        .status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        send(
+            proof.nonce,
+            proof.signature,
+            &credentials.access_token,
+            encoded.clone()
+        )
+        .await
+        .unwrap()
+        .status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    let read = enrollment_proof(
+        &http,
+        &server.url,
+        &credentials,
+        &device_key,
+        "enrollment-read",
+        peer.device_id(),
+    )
+    .await;
+    let public = http
+        .get(format!("{endpoint}/{}", credentials.session.device_id))
+        .bearer_auth(&credentials.access_token)
+        .header("howl-nonce", read.nonce)
+        .header("howl-signature", read.signature)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(success(public).await, material);
+    let trusted = enrollment_proof(
+        &http,
+        &server.url,
+        &credentials,
+        &device_key,
+        "mailbox",
+        b"",
+    )
+    .await;
+    assert_eq!(
+        control
+            .authorize_enrolled("mailbox", &credentials.access_token, &trusted, b"")
+            .await
+            .unwrap()
+            .account_id(),
+        account
+    );
+
+    let updated = Designation::issue(
+        head,
+        2,
+        &root,
+        &membership,
+        &[Floor {
+            device: *peer.device_id(),
+            sequence: 1,
+        }],
+    )
+    .unwrap();
+    pin_enrollment(
+        &owner,
+        EnrollmentPin {
+            designation_digest: updated.digest(),
+            ..pin()
+        },
+    )
+    .await
+    .unwrap();
+    let trusted = enrollment_proof(
+        &http,
+        &server.url,
+        &credentials,
+        &device_key,
+        "mailbox",
+        b"",
+    )
+    .await;
+    assert!(
+        control
+            .authorize_enrolled("mailbox", &credentials.access_token, &trusted, b"")
+            .await
+            .is_err()
+    );
+    let old = enrollment_proof(
+        &http,
+        &server.url,
+        &credentials,
+        &device_key,
+        "enrollment",
+        &encoded,
+    )
+    .await;
+    assert_eq!(
+        send(old.nonce, old.signature, &credentials.access_token, encoded)
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+async fn enrollment_proof(
+    http: &Client,
+    url: &str,
+    credentials: &crate::Credentials,
+    key: &SigningKey,
+    operation: &str,
+    body: &[u8],
+) -> crate::Proof {
+    let nonce = challenge(http, url, operation, &credentials.access_token).await;
+    let bytes = signing_bytes(
+        AUDIENCE,
+        proof::decode(&credentials.session.id).unwrap(),
+        operation,
+        proof::decode(&nonce).unwrap(),
+        credential_digest(&credentials.access_token).unwrap(),
+        body,
+    );
+    crate::Proof {
+        nonce,
+        signature: hex::encode(key.sign(&bytes).to_bytes()),
+    }
+}

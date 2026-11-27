@@ -6,7 +6,9 @@ use std::{
 };
 
 use deadpool_postgres::{Manager, Pool};
-use howl_control_plane::{ControlPlane, Error, GitHub, Id, Result, migrate};
+use howl_control_plane::{
+    ControlPlane, EnrollmentPin, Error, GitHub, Id, Result, migrate, pin_enrollment,
+};
 use tokio_postgres::{Config, NoTls, config::Host};
 use zeroize::Zeroizing;
 
@@ -23,11 +25,6 @@ async fn main() -> ExitCode {
 
 async fn run() -> Result<()> {
     let args = env::args_os().skip(1).collect::<Vec<_>>();
-    let migrate_only = match args.as_slice() {
-        [] => false,
-        [flag] if flag == "--migrate" => true,
-        _ => return Err(Error::Configuration),
-    };
     let url = Zeroizing::new(required("HOWL_CONTROL_DATABASE_URL")?);
     let config: Config = url.parse().map_err(|_| Error::Configuration)?;
     if config.get_hosts().is_empty()
@@ -44,8 +41,26 @@ async fn run() -> Result<()> {
         .max_size(12)
         .build()
         .map_err(|_| Error::Configuration)?;
-    if migrate_only {
-        return migrate(&pool).await;
+    match args.as_slice() {
+        [] => {}
+        [flag] if flag == "--migrate" => return migrate(&pool).await,
+        [flag, github_id, account, head, designation] if flag == "--pin-enrollment" => {
+            let github_id = github_id
+                .to_str()
+                .and_then(|value| value.parse().ok())
+                .ok_or(Error::Configuration)?;
+            return pin_enrollment(
+                &pool,
+                EnrollmentPin {
+                    github_id,
+                    account_id: public_id(account.to_str())?,
+                    authority_head: public_id(head.to_str())?,
+                    designation_digest: public_id(designation.to_str())?,
+                },
+            )
+            .await;
+        }
+        _ => return Err(Error::Configuration),
     }
     let bind: SocketAddr = env::var("HOWL_CONTROL_BIND")
         .unwrap_or_else(|_| "127.0.0.1:8080".into())
@@ -77,5 +92,12 @@ fn configured_id(name: &str) -> Result<Zeroizing<Id>> {
     let text = Zeroizing::new(required(name)?);
     let mut id = Zeroizing::new([0; 32]);
     hex::decode_to_slice(&*text, &mut *id).map_err(|_| Error::Configuration)?;
+    Ok(id)
+}
+
+fn public_id(value: Option<&str>) -> Result<Id> {
+    let mut id = [0; 32];
+    hex::decode_to_slice(value.ok_or(Error::Configuration)?, &mut id)
+        .map_err(|_| Error::Configuration)?;
     Ok(id)
 }
