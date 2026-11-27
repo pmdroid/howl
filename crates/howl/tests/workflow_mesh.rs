@@ -11,14 +11,14 @@ use std::{
 use howl::{
     delivery::{Id, WakeJob},
     identity::{LocalIdentity, PeerTrust},
-    managed_acp::Harness,
+    managed_acp::{Harness, HostClaude, HostCodex},
     node,
     observer::{ObserverProvider, Snapshot},
     workflow::{self, AgentRole, RunTurn},
 };
 
 const WAIT: Duration = Duration::from_secs(15);
-const TTL: u16 = 120;
+const TTL: u16 = 180;
 
 struct Node {
     process: Child,
@@ -118,16 +118,16 @@ async fn delivered(state: &Path, channel: Id, receipt: &str, recipient: Id) -> I
     id(message)
 }
 
-struct ExpectedReply {
+struct ExpectedReply<'a> {
     sender: Id,
     role: AgentRole,
     agent: Id,
     message: Id,
     wake: Id,
-    marker: &'static str,
+    markers: &'a [&'a str],
 }
 
-fn assert_received(state: &Path, channel: Id, reply: ExpectedReply) {
+fn assert_received(state: &Path, channel: Id, reply: ExpectedReply<'_>) {
     let inbox = stdout(mesh_cli(&["read"], state, &[&hex::encode(channel)]));
     let source = format!(
         "agent {} {} {} message={} reply-to={} context=",
@@ -138,11 +138,10 @@ fn assert_received(state: &Path, channel: Id, reply: ExpectedReply) {
         hex::encode(reply.wake)
     );
     assert!(
-        inbox
-            .lines()
-            .any(|line| line.starts_with(&source) && line.contains(reply.marker)),
-        "missing signed peer reply {}",
-        reply.marker
+        inbox.lines().any(|line| line.starts_with(&source)
+            && reply.markers.iter().all(|marker| line.contains(marker))),
+        "missing signed peer reply containing {:?}",
+        reply.markers
     );
 }
 
@@ -206,22 +205,107 @@ fn observer() -> ObserverProvider {
     ObserverProvider::connect(Path::new(&socket)).unwrap()
 }
 
-fn role_stage(repository: &Path, stage: &str) -> (Snapshot, Harness) {
-    let snapshot = Snapshot::from_commit(repository, "HEAD", &["selected.txt".into()]).unwrap();
+fn snapshot(repository: &Path) -> Snapshot {
+    Snapshot::from_commit(repository, "HEAD", &["selected.txt".into()]).unwrap()
+}
+
+fn fixture_harness(stage: &str) -> Harness {
     let image = std::env::var("HOWL_MANAGED_FIXTURE_IMAGE")
         .expect("set the pinned Docker image with Node.js");
-    let harness = Harness::new(
+    Harness::new(
         stage,
         image,
         "/usr/local/bin/node",
         &["-e", include_str!("fixtures/acp/workflow-agent.cjs"), stage],
-    );
-    (snapshot, harness)
+    )
 }
 
 #[tokio::test]
 #[ignore = "requires a local Linux Docker engine and a pinned image with Node.js"]
 async fn signed_two_node_wakes_drive_a_read_only_draft_review_and_final() {
+    exercise_workflow(
+        TestWorkflow {
+            architect_data: "Architect selected data\n",
+            reviewer_data: "Reviewer selected data\n",
+            draft: ("DRAFT_REQUEST", &["HOWL_ARCHITECT_DRAFT"]),
+            review: ("REVIEW_REQUEST", &["HOWL_REVIEWER_FEEDBACK"]),
+            final_reply: ("FINAL_REQUEST", &["HOWL_ARCHITECT_FINAL"]),
+        },
+        fixture_harness,
+    )
+    .await;
+}
+
+fn configured(name: &str) -> PathBuf {
+    std::env::var_os(name)
+        .unwrap_or_else(|| panic!("set {name}"))
+        .into()
+}
+
+fn native_harness(stage: &str) -> Harness {
+    let image = std::env::var("HOWL_HOST_REPOSITORY_IMAGE").expect("set the pinned Docker image");
+    let node = configured("HOWL_HOST_NODE");
+    let home = configured("HOME");
+    if stage == "reviewer" {
+        let host = HostClaude::new(
+            node,
+            configured("HOWL_HOST_CLAUDE_ADAPTER"),
+            configured("HOWL_HOST_CLAUDE"),
+            home,
+        )
+        .unwrap();
+        Harness::host_claude(image, host)
+    } else {
+        let mut host = HostCodex::new(node, configured("HOWL_HOST_CODEX"), home).unwrap();
+        if let Some(path) = std::env::var_os("CODEX_HOME") {
+            host = host.with_state_home(path.into()).unwrap();
+        }
+        Harness::host_codex(image, host)
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires installed, natively signed-in Codex and Claude CLIs and a Linux Docker observer"]
+async fn native_codex_and_claude_exchange_signed_workflow_context() {
+    let draft_proof = format!("draft-proof-{:016x}", getrandom::u64().unwrap());
+    let review_proof = format!("review-proof-{:016x}", getrandom::u64().unwrap());
+    let architect_data = format!(
+        "Design a read-only command that lists explicitly approved snapshot files. Draft proof: {draft_proof}\n"
+    );
+    let reviewer_data =
+        format!("Require a test covering denied unapproved paths. Review proof: {review_proof}\n");
+
+    exercise_workflow(
+        TestWorkflow {
+            architect_data: &architect_data,
+            reviewer_data: &reviewer_data,
+            draft: (
+                "Use the Docker repository tool to read selected.txt. Start your reply with HOWL_ARCHITECT_DRAFT, copy the draft proof from the file verbatim, then give a short plan for the requested command.",
+                &["HOWL_ARCHITECT_DRAFT", &draft_proof],
+            ),
+            review: (
+                "Review the selected signed architect draft. Use the Docker repository tool to read selected.txt for the review criterion. Start your reply with HOWL_REVIEWER_FEEDBACK. Copy the draft proof from the signed draft and the review proof from the file verbatim, then give one concrete recommendation.",
+                &["HOWL_REVIEWER_FEEDBACK", &draft_proof, &review_proof],
+            ),
+            final_reply: (
+                "Use the selected signed reviewer feedback. Start your reply with HOWL_ARCHITECT_FINAL, copy the review proof from the signed feedback verbatim, and update the plan to address the recommendation.",
+                &["HOWL_ARCHITECT_FINAL", &review_proof],
+            ),
+        },
+        native_harness,
+    )
+    .await;
+}
+
+struct TestWorkflow<'a> {
+    architect_data: &'a str,
+    reviewer_data: &'a str,
+    draft: (&'a str, &'a [&'a str]),
+    review: (&'a str, &'a [&'a str]),
+    final_reply: (&'a str, &'a [&'a str]),
+}
+
+async fn exercise_workflow(input: TestWorkflow<'_>, harness: impl Fn(&str) -> Harness) {
     let root = tempfile::tempdir().unwrap();
     let alice = root.path().join("alice");
     let bob = root.path().join("bob");
@@ -302,10 +386,9 @@ async fn signed_two_node_wakes_drive_a_read_only_draft_review_and_final() {
 
     let provider = observer();
     let (architect_repo, architect_head) =
-        repository(root.path(), "architect-repo", "Architect selected data\n");
+        repository(root.path(), "architect-repo", input.architect_data);
     let (reviewer_repo, reviewer_head) =
-        repository(root.path(), "reviewer-repo", "Reviewer selected data\n");
-    let (snapshot, harness) = role_stage(&architect_repo, "architect-draft");
+        repository(root.path(), "reviewer-repo", input.reviewer_data);
     let receipt = node::send_wake(
         &bob,
         channel,
@@ -313,7 +396,7 @@ async fn signed_two_node_wakes_drive_a_read_only_draft_review_and_final() {
         &alice_node.route,
         architect,
         TTL,
-        "DRAFT_REQUEST",
+        input.draft.0,
     )
     .await
     .unwrap();
@@ -338,8 +421,8 @@ async fn signed_two_node_wakes_drive_a_read_only_draft_review_and_final() {
             cause: None,
         },
         &provider,
-        snapshot,
-        harness,
+        snapshot(&architect_repo),
+        harness("architect-draft"),
     )
     .await
     .unwrap();
@@ -354,11 +437,10 @@ async fn signed_two_node_wakes_drive_a_read_only_draft_review_and_final() {
             agent: architect,
             message: draft_id,
             wake,
-            marker: "HOWL_ARCHITECT_DRAFT",
+            markers: input.draft.1,
         },
     );
 
-    let (snapshot, harness) = role_stage(&reviewer_repo, "reviewer");
     let receipt = node::send_wake(
         &alice,
         channel,
@@ -366,7 +448,7 @@ async fn signed_two_node_wakes_drive_a_read_only_draft_review_and_final() {
         &bob_node.route,
         reviewer,
         TTL,
-        "REVIEW_REQUEST",
+        input.review.0,
     )
     .await
     .unwrap();
@@ -390,13 +472,12 @@ async fn signed_two_node_wakes_drive_a_read_only_draft_review_and_final() {
             cause: None,
         },
         &provider,
-        snapshot,
-        harness,
+        snapshot(&reviewer_repo),
+        harness("reviewer"),
     )
     .await;
     assert!(matches!(invalid_context, Err(error) if error.kind() == std::io::ErrorKind::NotFound));
 
-    let (snapshot, harness) = role_stage(&reviewer_repo, "reviewer");
     let review = workflow::run_turn(
         RunTurn {
             state: &bob,
@@ -408,8 +489,8 @@ async fn signed_two_node_wakes_drive_a_read_only_draft_review_and_final() {
             cause: None,
         },
         &provider,
-        snapshot,
-        harness,
+        snapshot(&reviewer_repo),
+        harness("reviewer"),
     )
     .await
     .unwrap();
@@ -424,11 +505,10 @@ async fn signed_two_node_wakes_drive_a_read_only_draft_review_and_final() {
             agent: reviewer,
             message: review_id,
             wake,
-            marker: "HOWL_REVIEWER_FEEDBACK",
+            markers: input.review.1,
         },
     );
 
-    let (snapshot, harness) = role_stage(&architect_repo, "architect-final");
     let receipt = node::send_wake(
         &bob,
         channel,
@@ -436,7 +516,7 @@ async fn signed_two_node_wakes_drive_a_read_only_draft_review_and_final() {
         &alice_node.route,
         architect,
         TTL,
-        "FINAL_REQUEST",
+        input.final_reply.0,
     )
     .await
     .unwrap();
@@ -461,8 +541,8 @@ async fn signed_two_node_wakes_drive_a_read_only_draft_review_and_final() {
             cause: Some(draft.turn),
         },
         &provider,
-        snapshot,
-        harness,
+        snapshot(&architect_repo),
+        harness("architect-final"),
     )
     .await
     .unwrap();
@@ -480,7 +560,7 @@ async fn signed_two_node_wakes_drive_a_read_only_draft_review_and_final() {
             agent: architect,
             message: final_id,
             wake,
-            marker: "HOWL_ARCHITECT_FINAL",
+            markers: input.final_reply.1,
         },
     );
 
