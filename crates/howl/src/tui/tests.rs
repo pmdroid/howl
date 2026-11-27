@@ -102,6 +102,7 @@ fn cursor_deduplicates_reconnect_and_permission_loss_clears_the_view() {
             channels: Err(io::ErrorKind::PermissionDenied.into()),
         }),
         view: Some(ViewUpdate {
+            project: None,
             key,
             page: Ok(EventPage {
                 events: vec![event(10, "old grant")],
@@ -321,4 +322,48 @@ fn mouse_confirmation_requires_the_confirm_button() {
         click(&mut app, |hit| matches!(hit, Hit::Confirm)),
         InputOutcome::Action(Action::Cancel { .. })
     ));
+}
+
+#[test]
+fn completes_peer_and_channel_recipients_and_preserves_role_wakes() {
+    let mut app = App::new();
+    let channel = [2; 32];
+    let other_channel = [3; 32];
+    let peer = [4; 32];
+    app.channels = vec![
+        ChannelSummary {
+            id: channel,
+            peers: vec![peer],
+        },
+        ChannelSummary {
+            id: other_channel,
+            peers: vec![],
+        },
+    ];
+    app.channel = Some(channel);
+    app.peer_labels
+        .insert(hex::encode(peer), "Claude Code".into());
+    app.set_focus(Focus::Compose);
+    app.draft = "@cl".into();
+    assert!(app.complete());
+    assert_eq!(app.draft, "@claude-code ");
+    app.draft.push_str("Hello");
+    assert!(
+        matches!(app.submit().unwrap(), Some(Action::Direct { peer: actual, text, .. })
+        if actual == peer && text == "Hello")
+    );
+    app.draft = "@claude-code @rev".into();
+    assert!(app.complete());
+    app.draft.push_str("Review the test");
+    assert!(
+        matches!(app.submit().unwrap(), Some(Action::Wake { peer: actual, text, .. })
+        if actual == peer && text == "Review the test")
+    );
+    app.draft = "#03".into();
+    assert!(app.complete());
+    app.draft.push_str("Hello channel");
+    assert!(
+        matches!(app.submit().unwrap(), Some(Action::Post { channel: actual, text })
+        if actual == other_channel && text == "Hello channel")
+    );
 }

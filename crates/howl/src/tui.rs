@@ -38,6 +38,7 @@ use crate::{
         AgentAddress, ChannelSummary, Event, EventPage, LocalDevice, LocalInteraction, Wake,
     },
     node,
+    project::{self, Project},
 };
 
 const MAX_EVENTS: usize = 160;
@@ -126,6 +127,7 @@ struct ViewUpdate {
     page: io::Result<EventPage>,
     agents: Option<Vec<AgentAddress>>,
     workflows: Option<Vec<WorkflowView>>,
+    project: Option<Option<Project>>,
 }
 
 struct Update {
@@ -164,6 +166,7 @@ impl RefreshRequest {
                 page,
                 agents,
                 workflows,
+                project: self.catalog.then(|| Project::load(state, channel).ok()),
             }
         });
         let delivery = self.delivery.and_then(|key @ (channel, message)| {
@@ -189,6 +192,7 @@ struct App {
     views: HashMap<Conversation, ConversationView>,
     routes: HashMap<Id, String>,
     peer_labels: HashMap<String, String>,
+    projects: HashMap<Id, Project>,
     draft: String,
     notice: String,
     device_output: String,
@@ -214,6 +218,7 @@ impl App {
             views: HashMap::new(),
             routes: HashMap::new(),
             peer_labels: HashMap::new(),
+            projects: HashMap::new(),
             draft: String::new(),
             notice: String::new(),
             device_output: String::new(),
@@ -304,11 +309,19 @@ impl App {
             page,
             agents,
             workflows,
+            project,
         }) = update.view
             && self.channels.iter().any(|channel| {
                 channel.id == key.0 && key.1.is_none_or(|peer| channel.peers.contains(&peer))
             })
         {
+            if let Some(project) = project {
+                if let Some(project) = project {
+                    self.projects.insert(key.0, project);
+                } else {
+                    self.projects.remove(&key.0);
+                }
+            }
             match page {
                 Ok(page) => {
                     if self.views.len() >= MAX_VIEWS
@@ -450,6 +463,7 @@ enum Action {
         route: String,
         wake: Id,
     },
+    SelectProject(Id, Option<PathBuf>),
     Enroll(Vec<String>),
     Connect(Vec<String>),
     Disconnect,
@@ -458,40 +472,208 @@ enum Action {
 enum Outcome {
     Sent(Delivery),
     Notice(&'static str),
+    Project(Id, Option<Project>),
     Device(String),
     Connected(Child),
 }
 
 impl App {
+    fn recipient_shortcuts(&self) -> Vec<(String, Id, Option<Id>)> {
+        let channels = self.channels.iter().map(|channel| {
+            (
+                format!("#{}", short(&hex::encode(channel.id))),
+                channel.id,
+                None,
+            )
+        });
+        let peers = self.channel.into_iter().flat_map(|channel| {
+            self.peers().iter().map(move |peer| {
+                let name = self.peer_label(peer).to_ascii_lowercase().replace(' ', "-");
+                (format!("@{name}"), channel, Some(*peer))
+            })
+        });
+        channels.chain(peers).collect()
+    }
+
+    fn suggestions(&self) -> Vec<String> {
+        let input = self.draft.trim_start();
+        let prefix = if let Some((target, role)) = input.split_once(' ')
+            && target.starts_with('@')
+            && role.starts_with('@')
+            && !role.contains(char::is_whitespace)
+            && self
+                .recipient_shortcuts()
+                .iter()
+                .any(|(name, _, peer)| name == target && peer.is_some())
+        {
+            return ["@architect", "@reviewer"]
+                .into_iter()
+                .filter(|name| name.starts_with(role))
+                .map(str::to_owned)
+                .collect();
+        } else if input.starts_with(['@', '#']) && !input.contains(char::is_whitespace) {
+            input
+        } else {
+            return Vec::new();
+        };
+        let mut matches = self
+            .recipient_shortcuts()
+            .into_iter()
+            .map(|(name, _, _)| name)
+            .filter(|name| name.starts_with(prefix))
+            .collect::<Vec<_>>();
+        if self.peer.is_some() {
+            matches.extend(
+                ["@architect", "@reviewer"]
+                    .into_iter()
+                    .filter(|name| name.starts_with(prefix))
+                    .map(str::to_owned),
+            );
+        }
+        matches
+    }
+
+    fn complete(&mut self) -> bool {
+        if self.pending || self.focus != Focus::Compose {
+            return false;
+        }
+        if let Some(value) = self.suggestions().into_iter().next() {
+            if self.draft.trim_start().contains(char::is_whitespace)
+                && let Some((target, _)) = self.draft.split_once(' ')
+            {
+                self.draft = format!("{target} {value} ");
+            } else {
+                self.draft = format!("{value} ");
+            }
+            return true;
+        }
+        let Some(value) = self.draft.strip_prefix(":repo ") else {
+            return false;
+        };
+        let Ok(path) = repo_path(value) else {
+            return false;
+        };
+        let (directory, prefix) = if value.is_empty() || value.ends_with('/') {
+            (path.as_path(), "")
+        } else {
+            (
+                path.parent().unwrap_or(Path::new(".")),
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or(""),
+            )
+        };
+        let mut matches = std::fs::read_dir(directory)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|entry| {
+                entry.file_type().is_ok_and(|kind| kind.is_dir())
+                    && entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| name.starts_with(prefix))
+            })
+            .map(|entry| entry.path())
+            .take(128)
+            .collect::<Vec<_>>();
+        matches.sort();
+        if matches.len() == 1 {
+            self.draft = format!(":repo {}/", matches[0].display());
+        } else if !matches.is_empty() {
+            self.notice = matches
+                .iter()
+                .take(5)
+                .filter_map(|path| path.file_name())
+                .map(|name| name.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join(" · ");
+        }
+        true
+    }
+
+    fn choose_repo(&mut self) {
+        if self.draft.is_empty() {
+            self.set_focus(Focus::Compose);
+            self.draft = ":repo ".into();
+            self.notice = "Enter a Git repository path. Tab completes folders.".into();
+        }
+    }
+
     fn submit(&mut self) -> io::Result<Option<Action>> {
         let input = self.draft.trim();
         if input.is_empty() || self.pending {
             return Ok(None);
         }
+        if input == ":repo" {
+            return Err(invalid("Enter :repo followed by a Git repository path."));
+        }
+        if let Some(path) = input.strip_prefix(":repo ") {
+            let channel = self
+                .channel
+                .ok_or_else(|| invalid("Select a signed channel first."))?;
+            return Ok(Some(Action::SelectProject(
+                channel,
+                (path.trim() != "off")
+                    .then(|| repo_path(path.trim()))
+                    .transpose()?,
+            )));
+        }
         if let Some(command) = input.strip_prefix(':') {
             return self.command(command.to_owned().as_str());
         }
-        let (channel, peer) = self
+        let (mut channel, mut peer) = self
             .conversation()
             .ok_or_else(|| invalid("Select a signed channel first."))?;
+        let mut text = input;
+        if let Some((prefix, body)) = input.split_once(char::is_whitespace)
+            && !matches!(prefix, "@reviewer" | "@architect")
+        {
+            let shortcuts = self.recipient_shortcuts();
+            let mut matches = shortcuts.iter().filter(|(name, _, _)| name == prefix);
+            if let Some((_, destination, direct)) = matches.next() {
+                if matches.next().is_some() {
+                    return Err(invalid(
+                        "Choose the peer in the Direct peers list to resolve this name.",
+                    ));
+                }
+                (channel, peer, text) = (*destination, *direct, body.trim_start());
+                if text.is_empty() {
+                    return Err(invalid("Enter a message after its destination."));
+                }
+                self.channel = Some(channel);
+                self.peer = peer;
+            }
+        }
         let route = peer
             .and_then(|peer| self.routes.get(&peer).cloned())
             .unwrap_or_else(|| "-".into());
-        if let Some((role, text)) = mention(input)? {
+        if let Some((role, text)) = mention(text)? {
             let peer =
                 peer.ok_or_else(|| invalid("Select the agent’s peer before sending a wake."))?;
+            let text = self
+                .projects
+                .get(&channel)
+                .map_or_else(|| text.to_owned(), |project| project.instruction(text));
+            if text.len() > node::WAKE_LIMIT {
+                return Err(invalid("Enter a shorter wake message."));
+            }
             return Ok(Some(Action::Wake {
                 channel,
                 peer,
                 route,
                 target: role.agent_id(&peer),
-                text: text.to_owned(),
+                text,
             }));
         }
-        let text = self
-            .draft
+        let text = if text == input {
+            self.draft.as_str()
+        } else {
+            text
+        };
+        let text = text
             .strip_prefix("@@")
-            .map_or_else(|| self.draft.clone(), |text| format!("@{text}"));
+            .map_or_else(|| text.to_owned(), |text| format!("@{text}"));
         Ok(Some(match peer {
             Some(peer) => Action::Direct {
                 channel,
@@ -621,6 +803,19 @@ impl App {
                         self.notice = format!("Queued {}", short(&hex::encode(key.1)));
                     }
                     Outcome::Notice(notice) => self.notice = notice.into(),
+                    Outcome::Project(channel, project) => {
+                        if let Some(project) = project {
+                            self.notice = format!(
+                                "Selected {} at {}",
+                                project.root.display(),
+                                short(&project.commit)
+                            );
+                            self.projects.insert(channel, project);
+                        } else {
+                            self.projects.remove(&channel);
+                            self.notice = "Editable repository cleared".into();
+                        }
+                    }
                     Outcome::Device(output) => {
                         self.device_output = output;
                         self.set_focus(Focus::Device);
@@ -661,7 +856,11 @@ impl Action {
                         peer,
                         route: &route,
                         target,
-                        lifetime: WAKE_LIFETIME,
+                        lifetime: if project::wake(&text).is_some() {
+                            300
+                        } else {
+                            WAKE_LIFETIME
+                        },
                         text: &text,
                     })
                     .await?,
@@ -679,6 +878,15 @@ impl Action {
                 channel,
                 local.cancel_remote(channel, peer, &route, wake).await?,
             ),
+            Self::SelectProject(channel, root) => {
+                let project = tokio::task::spawn_blocking(move || match root {
+                    Some(path) => Project::select(&state, channel, &path).map(Some),
+                    None => Project::clear(&state, channel).map(|()| None),
+                })
+                .await
+                .map_err(io::Error::other)??;
+                return Ok(Outcome::Project(channel, project));
+            }
             Self::Enroll(args) => {
                 let (command, opts) = args
                     .split_first()
@@ -723,6 +931,18 @@ impl Action {
         };
         Ok(Outcome::Sent((channel, id(&receipt.message)?)))
     }
+}
+
+fn repo_path(path: &str) -> io::Result<PathBuf> {
+    if path.is_empty() {
+        return std::env::current_dir();
+    }
+    if let Some(path) = path.strip_prefix("~/") {
+        let home =
+            std::env::var_os("HOME").ok_or_else(|| invalid("Home directory is unavailable."))?;
+        return Ok(PathBuf::from(home).join(path));
+    }
+    Ok(PathBuf::from(path))
 }
 
 fn enrollment_args(args: &[&str]) -> io::Result<Vec<String>> {
@@ -915,6 +1135,7 @@ fn key(app: &mut App, event: KeyEvent) -> InputOutcome {
         return InputOutcome::Nothing;
     }
     match event.code {
+        KeyCode::Tab if app.complete() => {}
         KeyCode::Tab => app.set_focus(app.focus.step(false)),
         KeyCode::BackTab => app.set_focus(app.focus.step(true)),
         KeyCode::Char(ch @ '1'..='5')
@@ -975,6 +1196,7 @@ enum Hit {
     Row(Focus, usize),
     Tab(Focus),
     Send,
+    Repo,
     Confirm,
     Dismiss,
     Refresh,
@@ -1026,6 +1248,7 @@ fn mouse(app: &mut App, hits: &HitMap, event: MouseEvent) -> InputOutcome {
                     app.set_focus(Focus::Compose);
                     return submit(app);
                 }
+                Some(Hit::Repo) => app.choose_repo(),
                 Some(Hit::Refresh) => app.catalog_at = None,
                 Some(Hit::Quit) => return InputOutcome::Exit,
                 _ => {}
@@ -1066,8 +1289,27 @@ fn draw(frame: &mut Frame<'_>, app: &App) -> HitMap {
     } else {
         "Mesh offline"
     };
+    let repository = app
+        .channel
+        .and_then(|channel| app.projects.get(&channel))
+        .map_or_else(
+            || "Repo: none".into(),
+            |project| {
+                format!(
+                    "Repo: {} @ {}",
+                    visible(
+                        &project
+                            .root
+                            .file_name()
+                            .unwrap_or(project.root.as_os_str())
+                            .to_string_lossy()
+                    ),
+                    short(&project.commit)
+                )
+            },
+        );
     frame.render_widget(
-        Paragraph::new(format!("Howl   {}   {mesh}", short(&device))),
+        Paragraph::new(format!("Howl   {}   {mesh}   {repository}", short(&device))),
         header,
     );
 
@@ -1111,7 +1353,7 @@ fn draw(frame: &mut Frame<'_>, app: &App) -> HitMap {
     } else if app.pending {
         "Working…".into()
     } else if app.draft.is_empty() {
-        "Type a message, or @architect / @reviewer from a direct conversation".into()
+        "Type a message. Tab completes @peers, @roles and #channels.".into()
     } else {
         let shown = compose.width.saturating_sub(2) as usize;
         let tail = app.draft.chars().rev().take(shown).collect::<Vec<_>>();
@@ -1156,6 +1398,7 @@ fn draw(frame: &mut Frame<'_>, app: &App) -> HitMap {
         button(frame, &mut hits, &mut controls, "[Send]", Hit::Send, true);
     }
     let mut footer = footer;
+    button(frame, &mut hits, &mut footer, "[Repo]", Hit::Repo, false);
     for (label, focus) in [
         "1 Channels",
         "2 Direct",
@@ -1174,6 +1417,22 @@ fn draw(frame: &mut Frame<'_>, app: &App) -> HitMap {
             Hit::Tab(focus),
             app.focus == focus,
         );
+    }
+    let suggestions = app.suggestions();
+    if app.focus == Focus::Compose && !suggestions.is_empty() {
+        frame.render_widget(
+            Paragraph::new(format!(
+                "Tab  {}",
+                suggestions
+                    .iter()
+                    .take(5)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("  ")
+            )),
+            footer,
+        );
+        return hits;
     }
     button(
         frame,
