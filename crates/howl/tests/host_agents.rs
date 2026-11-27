@@ -91,6 +91,80 @@ async fn live_host_opencode_uses_docker_repository_tools() {
     check_repository_prompt(|image| Harness::host_opencode(image, host)).await;
 }
 
+#[tokio::test]
+#[ignore = "requires a Linux Docker engine, Node.js and a pinned repository image"]
+async fn host_acp_edits_runs_tests_and_exports_only_the_docker_copy() {
+    let node = configured("HOWL_HOST_NODE");
+    let temp = tempfile::tempdir().unwrap();
+    let adapter = temp.path().join("acp-fixture");
+    fs::write(
+        &adapter,
+        format!(
+            "#!{}\n{}",
+            node.display(),
+            include_str!("fixtures/host-agent/agent.cjs")
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&adapter, fs::Permissions::from_mode(0o700)).unwrap();
+    let host = HostClaude::new(node, adapter, "/bin/false".into(), temp.path().into()).unwrap();
+    let repo = temp.path().join("repository");
+    fs::create_dir(&repo).unwrap();
+    fs::write(repo.join("selected.txt"), "original").unwrap();
+    fs::write(repo.join("removed.txt"), "remove").unwrap();
+    fs::write(
+        repo.join("workspace.test.cjs"),
+        r#"
+        const { test } = require("node:test");
+        const assert = require("node:assert/strict");
+        const fs = require("node:fs");
+        test("edits are in Docker while the base stays read-only", () => {
+          assert.equal(fs.readFileSync("/workspace/selected.txt", "utf8"), "original");
+          assert.equal(fs.readFileSync("selected.txt", "utf8"), "edited");
+          assert.equal(fs.readFileSync("new.txt", "utf8"), "new");
+          assert.equal(fs.existsSync("removed.txt"), false);
+        });
+    "#,
+    )
+    .unwrap();
+    for args in [
+        &["init", "-q", "--template="][..],
+        &["add", "--all"],
+        &["commit", "-qm", "fixture"],
+    ] {
+        assert!(git(&repo).args(args).status().unwrap().success());
+    }
+    let snapshot = Snapshot::from_repository(&repo, "HEAD").unwrap();
+    let provider = ObserverProvider::connect(&configured("HOWL_OBSERVER_DOCKER_SOCKET")).unwrap();
+    let image = std::env::var("HOWL_HOST_REPOSITORY_IMAGE").unwrap();
+    let mut session = ManagedSession::start(
+        &temp.path().join("journal"),
+        &provider,
+        snapshot,
+        Harness::host_claude(image, host).with_editable_workspace(),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        session
+            .prompt("Edit and test".into(), Duration::from_secs(45))
+            .await
+            .unwrap(),
+        StopReason::EndTurn
+    ));
+    let changes = session.export_changes().await.unwrap();
+    assert_eq!(changes.as_array().unwrap().len(), 3);
+    assert_eq!(changes[0]["path"], "new.txt");
+    assert_eq!(changes[1]["after"], serde_json::Value::Null);
+    assert_eq!(changes[2]["after"]["content"], "edited");
+    assert_eq!(
+        fs::read_to_string(repo.join("selected.txt")).unwrap(),
+        "original"
+    );
+    assert!(!repo.join("new.txt").exists());
+    session.close().await.unwrap();
+}
+
 async fn check_repository_prompt(harness: impl FnOnce(String) -> Harness) {
     let socket = configured("HOWL_OBSERVER_DOCKER_SOCKET");
     let image = std::env::var("HOWL_HOST_REPOSITORY_IMAGE").unwrap();

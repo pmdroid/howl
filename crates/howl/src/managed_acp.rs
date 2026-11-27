@@ -16,6 +16,7 @@ use std::{
     io,
     os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
+    process::Stdio,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -106,6 +107,7 @@ pub struct Harness {
     chatgpt: Option<ChatGptPlanAuth>,
     host: Option<HostAgent>,
     prefer_v2: bool,
+    editable: bool,
 }
 
 impl Harness {
@@ -138,6 +140,7 @@ impl Harness {
             chatgpt: None,
             host: None,
             prefer_v2: false,
+            editable: false,
         }
     }
 
@@ -192,6 +195,15 @@ impl Harness {
         self
     }
 
+    pub fn with_editable_workspace(mut self) -> Self {
+        self.editable = true;
+        self
+    }
+
+    pub(crate) fn editable(&self) -> bool {
+        self.editable
+    }
+
     async fn broker(&self) -> Result<Option<Broker>> {
         let Some((provider, model)) = &self.provider else {
             return Ok(None);
@@ -229,6 +241,9 @@ impl Harness {
             hash.update(b"chatgpt-plan-store");
             hash.update((store.len() as u64).to_be_bytes());
             hash.update(store);
+        }
+        if self.editable {
+            hash.update(b"editable-workspace");
         }
         if self.prefer_v2 {
             hash.update(b"acp-v2");
@@ -311,6 +326,7 @@ pub struct ManagedSession {
     commands: mpsc::Sender<Command>,
     status: watch::Receiver<SessionState>,
     events: broadcast::Sender<Event>,
+    export: Option<std::process::Command>,
 }
 
 impl ManagedSession {
@@ -364,6 +380,9 @@ impl ManagedSession {
         id: String,
         restore: Option<Restore>,
     ) -> Result<Self> {
+        if harness.editable && harness.host.is_none() {
+            return Err(Error::HostAgent);
+        }
         if harness.host.is_some()
             && (harness.provider.is_some() || harness.prefer_v2 || restore.is_some())
         {
@@ -405,6 +424,7 @@ impl ManagedSession {
             phase: Phase::Starting,
         };
         let prefer_v2 = harness.prefer_v2;
+        let editable = harness.editable;
         let host = harness.host;
         let harness = Harness {
             host: None,
@@ -429,13 +449,18 @@ impl ManagedSession {
             } else {
                 Journal::new(&root, expected)?
             };
-            let args = harness.args.iter().map(String::as_str).collect::<Vec<_>>();
+            let args = if editable {
+                vec!["-e", include_str!("editable_workspace.cjs")]
+            } else {
+                harness.args.iter().map(String::as_str).collect()
+            };
             match provider.launch_managed(
                 &snapshot,
                 &harness.image,
                 &harness.executable,
                 &args,
                 &id,
+                editable,
             ) {
                 Ok(process) => {
                     journal.update(|state| {
@@ -453,7 +478,7 @@ impl ManagedSession {
         .map_err(|_| Error::Disconnected)??;
 
         let host = if let Some(host) = host {
-            match start_host_agent(&mut process, host).await {
+            match start_host_agent(&mut process, host, editable).await {
                 Ok(host) => Some(host),
                 Err(error) => {
                     journal.update(|state| state.phase = Phase::Interrupted)?;
@@ -486,12 +511,21 @@ impl ManagedSession {
             mode: ClientMode::V1,
             workspace: host.as_ref().map(|host| host.workspace.clone()),
         };
+        let export = editable
+            .then(|| {
+                process.broker_command(
+                    Path::new("/usr/local/bin/node"),
+                    &["-e", include_str!("editable_workspace.cjs"), "export"],
+                )
+            })
+            .transpose()?;
         tokio::spawn(supervise(process, broker, client, prefer_v2, host));
         initialized.await.map_err(|_| Error::Disconnected)??;
         Ok(Self {
             commands,
             status,
             events,
+            export,
         })
     }
 
@@ -513,6 +547,27 @@ impl ManagedSession {
         }
         self.request(|reply| Command::Prompt { text, limit, reply })
             .await
+    }
+
+    pub async fn export_changes(&mut self) -> Result<serde_json::Value> {
+        if self.status().phase != Phase::Ready {
+            return Err(Error::State);
+        }
+        let command = self.export.take().ok_or(Error::State)?;
+        let output = tokio::process::Command::from(command)
+            .stdin(Stdio::null())
+            .kill_on_drop(true)
+            .output()
+            .await?;
+        if !output.status.success() {
+            return Err(Error::State);
+        }
+        let changes: serde_json::Value =
+            serde_json::from_slice(&output.stdout).map_err(|_| Error::State)?;
+        if !changes.is_array() {
+            return Err(Error::State);
+        }
+        Ok(changes)
     }
 
     pub async fn cancel(&self) -> Result<()> {
@@ -585,11 +640,16 @@ struct HostSession {
 
 #[derive(Clone)]
 struct HostWorkspace {
+    editable: bool,
     cwd: PathBuf,
     server: McpServer,
 }
 
-async fn start_host_agent(process: &mut ObserverProcess, host: HostAgent) -> Result<HostSession> {
+async fn start_host_agent(
+    process: &mut ObserverProcess,
+    host: HostAgent,
+    editable: bool,
+) -> Result<HostSession> {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
     let stdout = ChildStdout::from_std(process.take_stdout().ok_or(Error::Disconnected)?)?;
@@ -603,9 +663,9 @@ async fn start_host_agent(process: &mut ObserverProcess, host: HostAgent) -> Res
     if ready != "ready\n" {
         return Err(Error::Disconnected);
     }
-    let repository = RepositoryEndpoint::start(process)?;
+    let repository = RepositoryEndpoint::start(process, editable)?;
     let http = if host.uses_http() {
-        Some(RepositoryHttp::start(host.node(), &repository.socket()).await?)
+        Some(RepositoryHttp::start(host.node(), &repository.socket(), editable).await?)
     } else {
         None
     };
@@ -613,8 +673,9 @@ async fn start_host_agent(process: &mut ObserverProcess, host: HostAgent) -> Res
         Some(http) => McpServer::Http(McpServerHttp::new("howl_repository", http.url())),
         None => repository.mcp_server(host.node())?,
     };
-    let process = host.start(http.as_ref())?;
+    let process = host.start(http.as_ref(), editable)?;
     let workspace = HostWorkspace {
+        editable,
         cwd: process.cwd.clone(),
         server,
     };
@@ -787,6 +848,7 @@ async fn drive_v1(
     let permission_state = journal.subscribe();
     let updates = events.clone();
     let host_workspace = workspace.is_some();
+    let editable = workspace.as_ref().is_some_and(|work| work.editable);
     Client
         .v1()
         .on_receive_notification(
@@ -815,7 +877,16 @@ async fn drive_v1(
                                 | "mcp__howl_repository__list_directory"
                         )
                     );
-                let (kind, selected) = if repository_read {
+                let repository_edit = editable
+                    && matches!(
+                        request.tool_call.fields.name.as_deref(),
+                        Some(
+                            "mcp__howl_repository__write_file"
+                                | "mcp__howl_repository__delete_file"
+                                | "mcp__howl_repository__run_tests"
+                        )
+                    );
+                let (kind, selected) = if repository_read || repository_edit {
                     (
                         PermissionOptionKind::AllowOnce,
                         PermissionDecision::AllowOnce,

@@ -1,5 +1,6 @@
 use std::{
     borrow::Cow,
+    collections::BTreeMap,
     io,
     path::{Path, PathBuf},
     sync::Arc,
@@ -34,6 +35,7 @@ use crate::{
         NewIntegrationRun,
     },
     enrollment::ChannelPermission,
+    identity::StateDirectory,
     interaction::{AgentAddress, LocalInteraction, Receipt},
     node,
     remote_mcp::{
@@ -117,6 +119,8 @@ struct Channels {
 #[derive(Serialize, JsonSchema)]
 struct Agents {
     agents: Vec<AgentAddress>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    peer_names: BTreeMap<String, String>,
 }
 
 #[tool_router(router = routes)]
@@ -158,10 +162,16 @@ impl GatewayTools {
         Parameters(args): Parameters<ChannelArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let channel = permitted(&context, &args.channel, IntegrationPermission::Read)?;
+        let state = self.state.clone();
         self.read_local(move |local| {
-            Ok(Agents {
-                agents: local.agents(channel)?,
-            })
+            let agents = local.agents(channel)?;
+            let mut peer_names: BTreeMap<String, String> = StateDirectory::open(&state)
+                .and_then(|directory| directory.read_bounded("peer-labels.json", 16 * 1024))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                .unwrap_or_default();
+            peer_names.retain(|device, _| agents.iter().any(|agent| &agent.device == device));
+            Ok(Agents { agents, peer_names })
         })
         .await
     }
@@ -313,6 +323,12 @@ impl GatewayTools {
         {
             return Err(ErrorData::invalid_params(
                 "agent address does not match peer",
+                None,
+            ));
+        }
+        if args.text.trim_start().starts_with(crate::project::PREFIX) {
+            return Err(ErrorData::invalid_params(
+                "Select an editable repository in the operator's terminal",
                 None,
             ));
         }

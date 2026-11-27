@@ -50,6 +50,12 @@ const cli = [
   "-c", 'forced_login_method="chatgpt"', "-c", "features.skip_host_skill_discovery=true",
   "-c", "mcp_servers.howl_repository.url=" + JSON.stringify(url.href),
 ];
+if (process.env.HOWL_EDITABLE_WORKSPACE === "1") {
+  const tools = ["read_file", "list_directory", "write_file", "delete_file", "run_tests"];
+  cli.push("-c", "mcp_servers.howl_repository.enabled_tools=" + JSON.stringify(tools),
+    "-c", 'mcp_servers.howl_repository.default_tools_approval_mode="approve"',
+    "-c", "mcp_servers.howl_repository.tool_timeout_sec=45");
+}
 if (token) {
   cli.push("-c", 'mcp_servers.howl_repository.bearer_token_env_var="HOWL_REPOSITORY_MCP_TOKEN"');
 }

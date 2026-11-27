@@ -31,12 +31,16 @@ pub(super) struct RepositoryEndpoint {
 }
 
 impl RepositoryEndpoint {
-    pub(super) fn start(observer: &ObserverProcess) -> Result<Self> {
+    pub(super) fn start(observer: &ObserverProcess, editable: bool) -> Result<Self> {
         let directory = tempfile::Builder::new().prefix("howl-r-").tempdir()?;
         let listener = UnixListener::bind(directory.path().join("tools.sock"))?;
         let command = observer.broker_command(
             Path::new("/usr/local/bin/node"),
-            &["-e", include_str!("../repository_tools.cjs")],
+            &[
+                "-e",
+                include_str!("../repository_tools.cjs"),
+                if editable { "edit" } else { "read" },
+            ],
         )?;
         let mut command = Command::from(command);
         command.stderr(Stdio::null()).kill_on_drop(true);

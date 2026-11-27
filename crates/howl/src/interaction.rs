@@ -81,7 +81,10 @@ impl From<ChannelMessage> for Message {
             Body::Wake { session, text } => {
                 message.role = Some("wake");
                 message.target = Some(hex::encode(session));
-                text
+                match crate::project::wake(&text) {
+                    Some((_, prompt)) => prompt.to_owned(),
+                    None => text,
+                }
             }
             Body::CancelWake { wake } => {
                 message.role = Some("cancel");

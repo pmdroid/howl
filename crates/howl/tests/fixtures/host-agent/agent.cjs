@@ -28,6 +28,19 @@ async function runTools() {
     const handshake = await request("initialize", { protocolVersion: "2025-06-18" });
     assert.equal(handshake.serverInfo.name, "howl-repository");
     const list = await request("tools/list");
+    if (process.env.HOWL_EDITABLE_WORKSPACE === "1") {
+      assert.deepEqual(list.tools.map(tool => tool.name),
+        ["read_file", "list_directory", "write_file", "delete_file", "run_tests"]);
+      const tool = (name, args) => request("tools/call", { name, arguments: args });
+      assert.equal((await tool("write_file", { path: "../outside", content: "blocked" })).isError, true);
+      assert.equal((await tool("write_file", { path: "selected.txt", content: "edited" })).isError, false);
+      assert.equal((await tool("write_file", { path: "new.txt", content: "new" })).isError, false);
+      assert.equal((await tool("delete_file", { path: "removed.txt" })).isError, false);
+      const test = await tool("run_tests", { argv: ["node", "--test", "workspace.test.cjs"] });
+      assert.equal(test.isError, false);
+      assert.match(test.content[0].text, /Exit 0/);
+      return "Docker edit and tests completed";
+    }
     assert.deepEqual(list.tools.map(tool => tool.name), ["read_file", "list_directory"]);
     const call = (name, path) => request("tools/call", { name, arguments: { path } });
     const result = await call("read_file", "selected.txt");

@@ -16,6 +16,7 @@ use tempfile::TempDir;
 use super::{Error, Result, digest, process_error};
 
 const MAX_PATHS: usize = 256;
+const MAX_REPOSITORY_PATHS: usize = 1024;
 const MAX_FILE: usize = 2 * 1024 * 1024;
 const MAX_SNAPSHOT: usize = 16 * 1024 * 1024;
 
@@ -27,14 +28,23 @@ pub struct Snapshot {
 
 impl Snapshot {
     pub fn from_commit(repository: &Path, revision: &str, paths: &[PathBuf]) -> Result<Self> {
-        if paths.is_empty() || paths.len() > MAX_PATHS || revision.len() > 1024 {
+        Self::build(repository, revision, paths, false)
+    }
+
+    fn build(repository: &Path, revision: &str, paths: &[PathBuf], editable: bool) -> Result<Self> {
+        let max_paths = if editable {
+            MAX_REPOSITORY_PATHS
+        } else {
+            MAX_PATHS
+        };
+        if paths.is_empty() || paths.len() > max_paths || revision.len() > 1024 {
             return Err(Error::InvalidSnapshot);
         }
 
         let mut entries = BTreeMap::new();
         for path in paths {
             let path = selected_path(path)?;
-            if entries.insert(path, String::new()).is_some() {
+            if entries.insert(path, (String::new(), false)).is_some() {
                 return Err(Error::InvalidSnapshot);
             }
         }
@@ -63,43 +73,77 @@ impl Snapshot {
             let record = str::from_utf8(entry).map_err(|_| Error::InvalidSnapshot)?;
             let (object, path) = record.split_once('\t').ok_or(Error::InvalidSnapshot)?;
             let mut fields = object.split(' ');
-            let (Some("100644" | "100755"), Some("blob"), Some(hash), None) =
+            let (Some(mode @ ("100644" | "100755")), Some("blob"), Some(hash), None) =
                 (fields.next(), fields.next(), fields.next(), fields.next())
             else {
                 return Err(Error::UnsafePath(PathBuf::from(path)));
             };
             let slot = entries.get_mut(path).ok_or(Error::InvalidSnapshot)?;
-            if !digest(hash, &[commit.len()]) || !slot.is_empty() {
+            if !digest(hash, &[commit.len()]) || !slot.0.is_empty() {
                 return Err(Error::InvalidSnapshot);
             }
-            *slot = hash.to_owned();
+            *slot = (hash.to_owned(), mode == "100755");
         }
-        if entries.values().any(String::is_empty) {
+        if entries.values().any(|(hash, _)| hash.is_empty()) {
             return Err(Error::InvalidSnapshot);
         }
 
-        let mut selection = Sha256::new();
-        selection.update(b"howl/snapshot/v1\0");
-        selection.update([commit.len() as u8]);
-        selection.update(commit.as_bytes());
-        for (path, hash) in &entries {
-            selection.update((path.len() as u16).to_be_bytes());
-            selection.update(path.as_bytes());
-            selection.update(hash.as_bytes());
-        }
-        let selection = selection.finalize().into();
         let directory = tempfile::Builder::new()
             .prefix("howl-snapshot-")
             .tempdir()?;
         let tree = directory.path().join("tree");
         fs::create_dir(&tree)?;
         fs::set_permissions(&tree, fs::Permissions::from_mode(0o755))?;
-        materialize(&repository, &tree, entries)?;
+        let mut selection = Sha256::new();
+        selection.update(b"howl/snapshot/v1\0");
+        selection.update([commit.len() as u8]);
+        selection.update(commit.as_bytes());
+        if materialize(&repository, &tree, entries, editable, &mut selection)? == 0 {
+            return Err(Error::InvalidSnapshot);
+        }
+        let selection = selection.finalize().into();
         Ok(Self {
             directory,
             commit,
             selection,
         })
+    }
+
+    pub fn from_repository(repository: &Path, revision: &str) -> Result<Self> {
+        let repository = repository_root(repository)?;
+        let mut resolve = git(&repository);
+        let revision = format!("{revision}^{{commit}}");
+        resolve.args(["rev-parse", "--verify", "--end-of-options", &revision]);
+        let commit = run_git(resolve)?;
+        let commit = str::from_utf8(&commit)
+            .map_err(|_| Error::InvalidSnapshot)?
+            .trim();
+        let mut list = git(&repository);
+        list.args(["ls-tree", "-r", "-l", "-z", "--full-tree", commit]);
+        let output = run_git(list)?;
+        let mut paths = Vec::new();
+        for entry in output
+            .split(|byte| *byte == 0)
+            .filter(|entry| !entry.is_empty())
+        {
+            let Ok(record) = str::from_utf8(entry) else {
+                continue;
+            };
+            let Some((object, path)) = record.split_once('\t') else {
+                return Err(Error::InvalidSnapshot);
+            };
+            if (object.starts_with("100644 blob ") || object.starts_with("100755 blob "))
+                && object
+                    .split_whitespace()
+                    .last()
+                    .and_then(|size| size.parse::<usize>().ok())
+                    .is_some_and(|size| size <= MAX_FILE)
+                && selected_path(Path::new(path)).is_ok()
+            {
+                paths.push(PathBuf::from(path));
+            }
+        }
+        Self::build(&repository, commit, &paths, true)
     }
 
     pub fn selection(&self) -> [u8; 32] {
@@ -176,7 +220,13 @@ fn selected_path(path: &Path) -> Result<&str> {
     Ok(text)
 }
 
-fn materialize(repository: &Path, target: &Path, entries: BTreeMap<&str, String>) -> Result<()> {
+fn materialize(
+    repository: &Path,
+    target: &Path,
+    entries: BTreeMap<&str, (String, bool)>,
+    editable: bool,
+    selection: &mut Sha256,
+) -> Result<usize> {
     let mut child = git(repository)
         .args(["cat-file", "--batch"])
         .stdin(Stdio::piped())
@@ -185,10 +235,11 @@ fn materialize(repository: &Path, target: &Path, entries: BTreeMap<&str, String>
         .spawn()?;
     let mut input = child.stdin.take().ok_or(Error::InvalidSnapshot)?;
     let mut output = BufReader::new(child.stdout.take().ok_or(Error::InvalidSnapshot)?);
-    let result = (|| -> Result<()> {
+    let result = (|| -> Result<usize> {
         let mut total = 0;
+        let mut count = 0;
         let mut header = String::new();
-        for (path, hash) in entries {
+        for (path, (hash, executable)) in entries {
             writeln!(input, "{hash}")?;
             input.flush()?;
             header.clear();
@@ -200,10 +251,9 @@ fn materialize(repository: &Path, target: &Path, entries: BTreeMap<&str, String>
                 return Err(Error::InvalidSnapshot);
             };
             let size = size.parse::<usize>().map_err(|_| Error::InvalidSnapshot)?;
-            if returned != hash || size > MAX_FILE || total + size > MAX_SNAPSHOT {
+            if returned != hash || size > MAX_FILE {
                 return Err(Error::InvalidSnapshot);
             }
-            total += size;
 
             let mut body = vec![0; size];
             output.read_exact(&mut body)?;
@@ -212,28 +262,39 @@ fn materialize(repository: &Path, target: &Path, entries: BTreeMap<&str, String>
             if delimiter != *b"\n" {
                 return Err(Error::InvalidSnapshot);
             }
-            let text =
-                str::from_utf8(&body).map_err(|_| Error::UnsafeContent(PathBuf::from(path)))?;
-            if text.contains('\0') || contains_secret(text) {
+            let approved = str::from_utf8(&body)
+                .is_ok_and(|text| !text.contains('\0') && !contains_secret(text));
+            if !approved {
+                if editable {
+                    continue;
+                }
                 return Err(Error::UnsafeContent(PathBuf::from(path)));
             }
-            write_file(target, path, &body)?;
+            total += size;
+            if total > MAX_SNAPSHOT {
+                return Err(Error::InvalidSnapshot);
+            }
+            write_file(target, path, &body, executable)?;
+            selection.update((path.len() as u16).to_be_bytes());
+            selection.update(path.as_bytes());
+            selection.update(hash.as_bytes());
+            count += 1;
         }
-        Ok(())
+        Ok(count)
     })();
     drop(input);
     if result.is_err() {
         let _ = child.kill();
     }
     let status = child.wait()?;
-    result?;
+    let count = result?;
     if !status.success() {
         return Err(process_error("read snapshot blobs", status));
     }
-    Ok(())
+    Ok(count)
 }
 
-fn write_file(target: &Path, path: &str, body: &[u8]) -> Result<()> {
+fn write_file(target: &Path, path: &str, body: &[u8], executable: bool) -> Result<()> {
     let mut parts = path.split('/').peekable();
     let mut parent = target.to_path_buf();
     while let Some(part) = parts.next() {
@@ -245,7 +306,11 @@ fn write_file(target: &Path, path: &str, body: &[u8]) -> Result<()> {
                 .mode(0o644)
                 .open(&child)?;
             file.write_all(body)?;
-            file.set_permissions(fs::Permissions::from_mode(0o444))?;
+            file.set_permissions(fs::Permissions::from_mode(if executable {
+                0o555
+            } else {
+                0o444
+            }))?;
             return Ok(());
         }
         match fs::create_dir(&child) {

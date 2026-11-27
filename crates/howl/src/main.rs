@@ -416,12 +416,17 @@ async fn run_workflow(args: &[OsString]) -> io::Result<()> {
         .ok_or_else(|| invalid_input("select at least one snapshot path after --"))?;
     let (flags, paths) = options.split_at(separator);
     let paths = paths[1..].iter().map(PathBuf::from).collect::<Vec<_>>();
-    if paths.is_empty() {
-        return Err(invalid_input("select at least one snapshot path after --"));
-    }
+    let mut editable = false;
     let mut context = Vec::new();
     let mut cause = None;
-    for option in flags.chunks(2) {
+    let mut paired = flags;
+    if let Some((flag, rest)) = paired.split_first()
+        && flag == "--edit"
+    {
+        editable = true;
+        paired = rest;
+    }
+    for option in paired.chunks(2) {
         match option {
             [flag, message] if flag == "--context" => context.push(parse_id(message)?),
             [flag, turn] if flag == "--cause" && cause.is_none() => cause = Some(parse_id(turn)?),
@@ -438,9 +443,18 @@ async fn run_workflow(args: &[OsString]) -> io::Result<()> {
         cause,
     };
     let driver = required_text(driver)?;
-    let harness = host_harness(driver, required_text(image)?.to_owned())?;
-    let snapshot = Snapshot::from_commit(Path::new(repo), required_text(commit)?, &paths)
-        .map_err(io::Error::other)?;
+    let mut harness = host_harness(driver, required_text(image)?.to_owned())?;
+    let snapshot = if editable && paths.is_empty() {
+        harness = harness.with_editable_workspace();
+        Snapshot::from_repository(Path::new(repo), required_text(commit)?)
+    } else if !editable && !paths.is_empty() {
+        Snapshot::from_commit(Path::new(repo), required_text(commit)?, &paths)
+    } else {
+        return Err(invalid_input(
+            "use --edit -- for a repository or list approved paths after --",
+        ));
+    }
+    .map_err(io::Error::other)?;
     let observer = ObserverProvider::connect(&configured_path("HOWL_OBSERVER_DOCKER_SOCKET")?)
         .map_err(io::Error::other)?;
     eprintln!(
@@ -450,6 +464,9 @@ async fn run_workflow(args: &[OsString]) -> io::Result<()> {
     println!("Execution {}", hex::encode(reply.execution));
     println!("Turn {}", hex::encode(reply.turn));
     println!("Message {}", serde_json::to_string(&reply.message)?);
+    if let Some(path) = reply.changes {
+        println!("Changes {}", path.display());
+    }
     Ok(())
 }
 

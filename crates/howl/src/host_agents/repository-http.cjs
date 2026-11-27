@@ -4,6 +4,7 @@ const { timingSafeEqual } = require("node:crypto");
 const { createInterface } = require("node:readline");
 
 const repository = process.argv[1];
+const editable = process.argv[2] === "edit";
 const token = process.env.HOWL_REPOSITORY_MCP_TOKEN;
 if (!/^[0-9a-f]{64}$/.test(token ?? "")) process.exit(64);
 const authorization = Buffer.from("Bearer " + token);
@@ -23,7 +24,7 @@ async function readRequest(request) {
   let size = 0;
   for await (const chunk of request) {
     size += chunk.length;
-    if (size > 16384) throw new Error("Request exceeds limit");
+    if (size > (editable ? 128 * 1024 : 16384)) throw new Error("Request exceeds limit");
     chunks.push(chunk);
   }
   return JSON.parse(Buffer.concat(chunks, size));
@@ -38,7 +39,7 @@ let pending = 0;
 function exchange(request) {
   const exchange = queue.then(async () => {
     if (bridge.destroyed) throw new Error("Repository disconnected");
-    const timer = setTimeout(() => bridge.destroy(), 8000);
+    const timer = setTimeout(() => bridge.destroy(), editable ? 40000 : 8000);
     try {
       bridge.write(JSON.stringify(request) + "\n");
       const { value, done } = await replies.next();
