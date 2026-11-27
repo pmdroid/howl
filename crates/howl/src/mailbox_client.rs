@@ -11,7 +11,7 @@ use crate::{
 
 mod hosted;
 
-pub use hosted::{PullReport, pull};
+pub use hosted::{DepositReport, PullReport, deposit, pull};
 
 pub struct MailboxEnvelope<'a> {
     pub channel: Id,

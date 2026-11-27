@@ -468,3 +468,235 @@ async fn reply_http(mut link: tokio::net::TcpStream, status: &str, body: &str) {
     link.write_all(response.as_bytes()).await.unwrap();
     link.shutdown().await.unwrap();
 }
+
+fn enrolled_pair(root: &Path) -> Pair {
+    use crate::enrollment::{AuthorityRecord, AuthorityStore, Designation, Enroll, PairingTicket};
+
+    let Pair {
+        mut channel,
+        alice,
+        bob,
+        state,
+    } = Pair::new(root);
+    let alice_state = root.join("alice");
+    let operator = ed25519_dalek::SigningKey::from_bytes(&[24; 32]);
+    let offline = ed25519_dalek::SigningKey::from_bytes(&[25; 32]);
+    let signer = ed25519_dalek::SigningKey::from_bytes(&[26; 32]);
+    let genesis = AuthorityRecord::genesis(&operator, &offline);
+    let account = genesis.digest();
+    let authority = AuthorityStore::open(&alice_state).unwrap();
+    authority
+        .initialize(std::slice::from_ref(&genesis), account, account)
+        .unwrap();
+    AuthorityStore::open(&state)
+        .unwrap()
+        .initialize(std::slice::from_ref(&genesis), account, account)
+        .unwrap();
+    let designation =
+        Designation::issue(authority.current().unwrap(), 1, &operator, &signer, &[]).unwrap();
+    for (path, other, identity) in [(&alice_state, &state, &alice), (&state, &alice_state, &bob)] {
+        let peer = identity.certificate();
+        let (ticket, offer) =
+            PairingTicket::create(&designation, &signer, &peer, peer.fingerprint(), 1, 100)
+                .unwrap();
+        let response = offer
+            .respond(&designation, identity, ticket.invitation_secret(), 110)
+            .unwrap();
+        let certificate = ticket
+            .enroll(Enroll {
+                state: &alice_state,
+                designation: &designation,
+                signer: &signer,
+                peer: &peer,
+                offer: &offer,
+                response: &response,
+                now: 120,
+            })
+            .unwrap();
+        let directory = StateDirectory::open(path).unwrap();
+        directory
+            .replace("enrollment-designation", designation.as_bytes())
+            .unwrap();
+        directory
+            .replace("enrollment-certificate", certificate.as_bytes())
+            .unwrap();
+        StateDirectory::open(other)
+            .unwrap()
+            .replace(
+                &format!("enrollment-peer-{}", hex::encode(peer.device_id())),
+                certificate.as_bytes(),
+            )
+            .unwrap();
+    }
+    StateDirectory::open(&alice_state)
+        .unwrap()
+        .replace("enrollment-signer-key", &signer.to_bytes())
+        .unwrap();
+    let signed = Channel::create(&alice_state, &alice, &[*bob.certificate().device_id()]).unwrap();
+    channel.copy_from_slice(signed.id());
+    Channel::join(&state, &bob, signed.manifest()).unwrap();
+    Pair {
+        channel,
+        alice,
+        bob,
+        state,
+    }
+}
+
+#[tokio::test]
+async fn signed_deposit_preserves_direct_retry_and_rechecks_roster() {
+    use ed25519_dalek::Signature;
+    use serde_json::{Value, json};
+    use tokio::net::TcpListener;
+
+    use crate::{
+        delivery::{Frame, Stream},
+        enrollment::{RosterStore, profile::Profile},
+    };
+
+    let root = tempfile::tempdir().unwrap();
+    let pair = enrolled_pair(root.path());
+    let state = root.path().join("alice");
+    let now = node::unix_time().unwrap();
+    let alice = pair.alice.certificate();
+    let bob = pair.bob.certificate();
+    let sender = node::device_for(&state, &alice).unwrap();
+    let receiver = node::device_for(&state, &bob).unwrap();
+    let signing = Zeroizing::new(pair.alice.signing_key().to_bytes());
+    let bytes = seal(
+        Routing {
+            channel: pair.channel,
+            sender: DeviceAddress {
+                account: sender.account,
+                device: sender.device,
+            },
+            epoch: 1,
+            sequence: 1,
+            created_at: now,
+            expires_at: 0,
+        },
+        Body::Chat("retained while Bob is offline"),
+        &SigningKey::from_bytes(&signing),
+        &[Recipient {
+            address: DeviceAddress {
+                account: receiver.account,
+                device: receiver.device,
+            },
+            encryption_key: bob.encryption_public(),
+        }],
+    )
+    .unwrap();
+    let metadata = howl_envelope::inspect_unverified(&bytes).unwrap();
+    let stream = Stream {
+        channel: pair.channel,
+        sender,
+        signing_key: metadata.signing_key_id,
+    };
+    let directory = StateDirectory::open(&state).unwrap();
+    let mut delivery = node::open_delivery(&state, &directory, &alice).unwrap();
+    delivery.set_epoch(pair.channel, 1).unwrap();
+    assert_eq!(delivery.reserve_sequence(stream).unwrap(), 1);
+    delivery
+        .enqueue(
+            Frame {
+                stream,
+                message: metadata.message_id,
+                sequence: 1,
+                epoch: 1,
+                created_at: now,
+                expires_at: 0,
+            },
+            &bytes,
+            &[receiver],
+            now,
+        )
+        .unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}/", listener.local_addr().unwrap());
+    let audience = [32; 32];
+    let subject = [33; 32];
+    let token = [34; 32];
+    let public_key = pair.alice.signing_key().verifying_key();
+    let secret = json!({
+        "origin": origin,
+        "audience": hex::encode(audience),
+        "access_expires": now + 60,
+        "credentials": {
+            "access_token": hex::encode(token),
+            "refresh_token": hex::encode([35; 32]),
+            "expires_in": 60,
+            "session": {
+                "id": hex::encode(subject),
+                "github_id": 1234,
+                "device_id": hex::encode(sender.device),
+                "signing_key": hex::encode(public_key.as_bytes()),
+            },
+        },
+    });
+    directory
+        .replace("credentials", &serde_json::to_vec(&secret).unwrap())
+        .unwrap();
+    let expected_ciphertext = hex::encode(&bytes);
+    let server = tokio::spawn(async move {
+        let nonce = [36; 32];
+        let (path, _, challenge, link) = next_http_request(&listener).await;
+        assert_eq!(path, "/v1/auth/challenge");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&challenge).unwrap(),
+            json!({ "operation": "mailbox-deposit" })
+        );
+        reply_http(
+            link,
+            "200 OK",
+            &json!({ "nonce": hex::encode(nonce) }).to_string(),
+        )
+        .await;
+        let (path, headers, body, link) = next_http_request(&listener).await;
+        assert_eq!(path, "/v1/mailbox/deposit");
+        assert_eq!(headers["howl-nonce"], hex::encode(nonce));
+        let signature = hex::decode(&headers["howl-signature"])
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let signed = crate::control_proof::signing_bytes(
+            audience,
+            subject,
+            "mailbox-deposit",
+            nonce,
+            Sha256::digest(token).into(),
+            &body,
+        );
+        public_key
+            .verify_strict(&signed, &Signature::from_bytes(&signature))
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap(),
+            json!({
+                "recipient": hex::encode(receiver.device), "ciphertext": expected_ciphertext,
+            })
+        );
+        reply_http(link, "201 Created", "").await;
+    });
+    let report = deposit(&state, receiver.device, 0).await.unwrap();
+    server.await.unwrap();
+    assert_eq!(report.stored, 1);
+    assert_eq!(report.skipped, 0);
+    let direct = delivery.claim_due(None, now, 2).unwrap();
+    assert_eq!(direct.len(), 1);
+    assert_eq!(direct[0].recipient, receiver);
+    assert_eq!(direct[0].frame, bytes);
+
+    let profile = Profile::load(&state, &alice).unwrap().unwrap();
+    profile
+        .issue(
+            &RosterStore::open(&state, pair.channel).unwrap(),
+            pair.channel,
+            false,
+            vec![profile.member(sender.device, 7).unwrap()],
+        )
+        .unwrap();
+    let report = deposit(&state, receiver.device, 0).await.unwrap();
+    assert_eq!(report.stored, 0);
+    assert_eq!(report.skipped, 1);
+}
