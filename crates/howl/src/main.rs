@@ -11,6 +11,7 @@ use howl::{
     channel::{Channel, MAX_MANIFEST_LEN},
     control_client, discovery_client,
     identity::{LocalIdentity, PeerCertificate, PeerTrust},
+    mailbox_client,
     managed_acp::{Harness, HostClaude, HostCodex, HostGrok},
     node,
     observer::{ObserverProvider, Snapshot},
@@ -77,6 +78,26 @@ async fn main() -> ExitCode {
                 None => None,
             };
             node::run(Path::new(state), listen, relay).await
+        }
+        [group, command, action, state]
+            if group == "mesh" && command == "mailbox" && action == "fetch" =>
+        {
+            mailbox_client::pull(Path::new(state))
+                .await
+                .and_then(|report| {
+                    println!(
+                        "Mailbox stored {} and acknowledged {} message(s).",
+                        report.stored, report.acknowledged,
+                    );
+                    if report.unacknowledged == 0 {
+                        Ok(())
+                    } else {
+                        Err(io::Error::other(format!(
+                            "{} mailbox message(s) could not be admitted locally",
+                            report.unacknowledged,
+                        )))
+                    }
+                })
         }
         [group, command, action, state, address]
             if group == "mesh" && command == "hint" && action == "export" =>
