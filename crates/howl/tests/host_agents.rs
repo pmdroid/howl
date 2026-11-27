@@ -8,7 +8,7 @@ use std::{
 
 use agent_client_protocol::v1::schema::{ContentBlock, SessionUpdate, StopReason};
 use howl::{
-    managed_acp::{Event, Harness, HostClaude, HostGrok, ManagedSession},
+    managed_acp::{Event, Harness, HostClaude, HostCodex, HostGrok, ManagedSession},
     observer::{ObserverProvider, Snapshot},
 };
 
@@ -61,6 +61,21 @@ async fn live_host_grok_uses_docker_repository_tools() {
     )
     .unwrap();
     check_repository_prompt(|image| Harness::host_grok(image, host)).await;
+}
+
+#[tokio::test]
+#[ignore = "requires an installed, natively signed-in Codex CLI and a Linux Docker observer"]
+async fn live_host_codex_uses_docker_repository_tools() {
+    let mut host = HostCodex::new(
+        configured("HOWL_HOST_NODE"),
+        configured("HOWL_HOST_CODEX"),
+        configured("HOME"),
+    )
+    .unwrap();
+    if let Some(path) = std::env::var_os("CODEX_HOME") {
+        host = host.with_state_home(path.into()).unwrap();
+    }
+    check_repository_prompt(|image| Harness::host_codex(image, host)).await;
 }
 
 async fn check_repository_prompt(harness: impl FnOnce(String) -> Harness) {

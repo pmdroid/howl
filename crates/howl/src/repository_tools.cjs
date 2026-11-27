@@ -11,6 +11,7 @@ const protocols = new Set(["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25
 const tools = [
   {
     name: "read_file",
+    annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
     description: "Read a UTF-8 file from the approved repository snapshot.",
     inputSchema: {
       type: "object",
@@ -21,6 +22,7 @@ const tools = [
   },
   {
     name: "list_directory",
+    annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
     description: "List a directory in the approved repository snapshot. Use an empty path for its root.",
     inputSchema: {
       type: "object",

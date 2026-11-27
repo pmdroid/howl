@@ -71,7 +71,7 @@ impl RepositoryEndpoint {
         Ok(Self { directory, task })
     }
 
-    fn socket(&self) -> PathBuf {
+    pub(super) fn socket(&self) -> PathBuf {
         self.directory.path().join("tools.sock")
     }
 

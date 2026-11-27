@@ -8,7 +8,7 @@ use std::{
 use rustix::process::{Pid, Signal, kill_process_group};
 use sha2::{Digest, Sha256};
 
-use super::{Error, Result};
+use super::{Error, RepositoryHttp, Result};
 
 pub struct HostClaude {
     node: PathBuf,
@@ -117,9 +117,76 @@ impl HostGrok {
     }
 }
 
+pub struct HostCodex {
+    node: PathBuf,
+    codex: PathBuf,
+    home: PathBuf,
+    state_home: Option<PathBuf>,
+}
+
+impl HostCodex {
+    pub fn new(node: PathBuf, codex: PathBuf, home: PathBuf) -> Result<Self> {
+        if ![&node, &codex, &home]
+            .into_iter()
+            .all(|path| path.is_absolute())
+        {
+            return Err(Error::HostAgent);
+        }
+        Ok(Self {
+            node,
+            codex,
+            home,
+            state_home: None,
+        })
+    }
+
+    pub fn with_state_home(mut self, state_home: PathBuf) -> Result<Self> {
+        if !state_home.is_absolute() {
+            return Err(Error::HostAgent);
+        }
+        self.state_home = Some(state_home);
+        Ok(self)
+    }
+
+    fn fingerprint(&self, hash: &mut Sha256) {
+        hash.update(b"howl/host-codex/v1\0");
+        for path in [&self.node, &self.codex, &self.home]
+            .into_iter()
+            .chain(self.state_home.iter())
+        {
+            let value = path.as_os_str().as_encoded_bytes();
+            hash.update((value.len() as u64).to_be_bytes());
+            hash.update(value);
+        }
+    }
+
+    fn start(&self, repository: &RepositoryHttp) -> Result<HostProcess> {
+        let scratch = tempfile::Builder::new().prefix("howl-host-").tempdir()?;
+        let scratch_path = fs::canonicalize(scratch.path())?;
+        let cwd = scratch_path.join("workspace");
+        let home = scratch_path.join("home");
+        fs::create_dir(&cwd)?;
+        fs::create_dir(&home)?;
+        let wrapper = scratch_path.join("codex-wrapper.mjs");
+        fs::write(&wrapper, include_str!("../host_agents/codex-wrapper.mjs"))?;
+        launch(&self.node, &self.node, scratch, cwd, &home, |command| {
+            command
+                .arg(wrapper)
+                .env("HOWL_CODEX_EXECUTABLE", &self.codex)
+                .env("HOWL_CODEX_HOME", &self.home)
+                .env("HOWL_REPOSITORY_MCP_URL", repository.url())
+                .env("HOWL_REPOSITORY_MCP_TOKEN", repository.token());
+            if let Some(state_home) = &self.state_home {
+                command.env("HOWL_CODEX_STATE_HOME", state_home);
+            }
+        })
+    }
+}
+
 pub(super) enum HostAgent {
     Claude(HostClaude),
     Grok(HostGrok),
+    Codex(HostCodex),
 }
 
 impl HostAgent {
@@ -127,6 +194,7 @@ impl HostAgent {
         match self {
             Self::Claude(agent) => agent.node(),
             Self::Grok(agent) => &agent.node,
+            Self::Codex(agent) => &agent.node,
         }
     }
 
@@ -134,13 +202,19 @@ impl HostAgent {
         match self {
             Self::Claude(agent) => agent.fingerprint(hash),
             Self::Grok(agent) => agent.fingerprint(hash),
+            Self::Codex(agent) => agent.fingerprint(hash),
         }
     }
 
-    pub(super) fn start(self) -> Result<HostProcess> {
+    pub(super) fn uses_http(&self) -> bool {
+        matches!(self, Self::Codex(_))
+    }
+
+    pub(super) fn start(self, repository: Option<&RepositoryHttp>) -> Result<HostProcess> {
         match self {
             Self::Claude(agent) => agent.start(),
             Self::Grok(agent) => agent.start(),
+            Self::Codex(agent) => agent.start(repository.ok_or(Error::HostAgent)?),
         }
     }
 }
