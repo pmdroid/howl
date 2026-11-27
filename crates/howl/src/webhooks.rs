@@ -97,7 +97,7 @@ impl Endpoint {
                         .bytes()
                         .all(|byte| byte.is_ascii_alphanumeric() || b"-._~+/=".contains(&byte)) =>
             {
-                let bearer = Zeroizing::new(format!("Bearer {}", &*key));
+                let bearer = Zeroizing::new(format!("Bearer {}", key.as_str()));
                 let mut value =
                     header::HeaderValue::from_str(&bearer).map_err(|_| config_error())?;
                 value.set_sensitive(true);
