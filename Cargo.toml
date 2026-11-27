@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/envelope", "crates/howl"]
+members = ["crates/envelope", "crates/howl", "crates/local-mcp"]
 resolver = "3"
 
 [workspace.package]
