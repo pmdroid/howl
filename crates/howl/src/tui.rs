@@ -9,8 +9,9 @@ use std::{
 
 use crossterm::{
     event::{
-        DisableBracketedPaste, EnableBracketedPaste, Event as Input, EventStream, KeyCode,
-        KeyEvent, KeyEventKind, KeyModifiers,
+        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event as Input, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton,
+        MouseEvent, MouseEventKind,
     },
     execute,
 };
@@ -18,7 +19,7 @@ use futures_util::StreamExt;
 use howl_envelope::{AgentRole, Id};
 use ratatui::{
     DefaultTerminal, Frame,
-    layout::{Constraint, Layout, Rect},
+    layout::{Constraint, Layout, Position, Rect},
     style::{Modifier, Style},
     widgets::{Block, List, ListItem, ListState, Paragraph, Wrap},
 };
@@ -57,14 +58,16 @@ enum Focus {
 }
 
 impl Focus {
+    const PANES: [Self; 5] = [
+        Self::Channels,
+        Self::Peers,
+        Self::Messages,
+        Self::Device,
+        Self::Compose,
+    ];
+
     fn step(self, backwards: bool) -> Self {
-        let panes = [
-            Self::Channels,
-            Self::Peers,
-            Self::Messages,
-            Self::Device,
-            Self::Compose,
-        ];
+        let panes = Self::PANES;
         let index = panes.iter().position(|pane| *pane == self).unwrap();
         panes[(index + if backwards { panes.len() - 1 } else { 1 }) % panes.len()]
     }
@@ -340,13 +343,10 @@ impl App {
                     .iter()
                     .position(|entry| Some(entry.id) == self.channel)
                     .unwrap_or(0);
-                self.channel = self
-                    .channels
-                    .get(shift(selected, self.channels.len(), offset))
-                    .map(|entry| entry.id);
-                self.peer = None;
-                self.detail = false;
-                self.catalog_at = None;
+                self.select(
+                    Focus::Channels,
+                    shift(selected, self.channels.len(), offset),
+                );
             }
             Focus::Peers => {
                 let peers = self.peers();
@@ -354,13 +354,7 @@ impl App {
                     .iter()
                     .position(|peer| Some(*peer) == self.peer)
                     .map_or(0, |index| index + 1);
-                let next = shift(selected, peers.len() + 1, offset);
-                self.peer = next
-                    .checked_sub(1)
-                    .and_then(|next| peers.get(next))
-                    .copied();
-                self.detail = false;
-                self.catalog_at = None;
+                self.select(Focus::Peers, shift(selected, peers.len() + 1, offset));
             }
             Focus::Messages if !self.detail => {
                 if let Some(view) = self.conversation().and_then(|key| self.views.get_mut(&key)) {
@@ -372,6 +366,26 @@ impl App {
             }
             Focus::Compose => {}
         }
+    }
+
+    fn select(&mut self, pane: Focus, index: usize) {
+        match pane {
+            Focus::Channels => {
+                if let Some(entry) = self.channels.get(index) {
+                    self.channel = Some(entry.id);
+                    self.peer = None;
+                }
+            }
+            Focus::Peers => {
+                self.peer = index
+                    .checked_sub(1)
+                    .and_then(|index| self.peers().get(index))
+                    .copied();
+            }
+            _ => return,
+        }
+        self.detail = false;
+        self.catalog_at = None;
     }
 
     fn set_focus(&mut self, focus: Focus) {
@@ -533,7 +547,7 @@ impl App {
                 self.confirm = Some(self.remote_cancel(args.first().copied())?);
             }
             ["enroll", args @ ..] => return Ok(Some(Action::Enroll(enrollment_args(args)?))),
-            _ => return Err(invalid("Commands available in Device (F4).")),
+            _ => return Err(invalid("Commands available in Device (4).")),
         }
         self.draft.clear();
         Ok(None)
@@ -705,7 +719,7 @@ fn enrollment_args(args: &[&str]) -> io::Result<Vec<String>> {
         | ["authority"]
         | ["respond", _, _, _, _, _]
         | ["accept", _, _, _, _] => Ok(args.iter().map(|arg| (*arg).to_owned()).collect()),
-        _ => Err(invalid("Choose an enrollment action shown in Device (F4).")),
+        _ => Err(invalid("Choose an enrollment action shown in Device (4).")),
     }
 }
 
@@ -770,7 +784,7 @@ struct TerminalCleanup;
 
 impl Drop for TerminalCleanup {
     fn drop(&mut self) {
-        let _ = execute!(io::stdout(), DisableBracketedPaste);
+        let _ = execute!(io::stdout(), DisableBracketedPaste, DisableMouseCapture);
         let _ = ratatui::try_restore();
     }
 }
@@ -783,7 +797,7 @@ pub async fn run(state: &Path) -> io::Result<()> {
     }
     let cleanup = TerminalCleanup;
     let mut terminal = ratatui::try_init()?;
-    execute!(io::stdout(), EnableBracketedPaste)?;
+    execute!(io::stdout(), EnableBracketedPaste, EnableMouseCapture)?;
     let mut app = App::new();
     let result = drive(state, &mut terminal, &mut app).await;
     drop(terminal);
@@ -808,7 +822,8 @@ async fn drive(state: &Path, terminal: &mut DefaultTerminal, app: &mut App) -> i
     let (action_tx, mut action_rx) = mpsc::channel(1);
     let mut refreshing = false;
     loop {
-        terminal.draw(|frame| draw(frame, app))?;
+        let mut hits = HitMap::default();
+        terminal.draw(|frame| hits = draw(frame, app))?;
         tokio::select! {
             _ = terminate.recv() => break,
             _ = hangup.recv() => break,
@@ -836,23 +851,28 @@ async fn drive(state: &Path, terminal: &mut DefaultTerminal, app: &mut App) -> i
                 app.update(update);
             },
             Some(result) = action_rx.recv() => app.completed(result),
-            input = inputs.next() => match input {
-                None => break,
-                Some(Err(error)) => return Err(error),
-                Some(Ok(Input::Paste(text))) => app.insert(&text),
-                Some(Ok(Input::Key(event))) if event.kind != KeyEventKind::Release => {
-                    match key(app, event) {
-                        InputOutcome::Exit => break,
-                        InputOutcome::Nothing => {}
-                        InputOutcome::Action(action) => {
-                            app.pending = true;
-                            let state = state.to_owned();
-                            let actions = action_tx.clone();
-                            tokio::spawn(async move { let _ = actions.send(action.execute(state).await).await; });
-                        }
+            input = inputs.next() => {
+                let outcome = match input {
+                    None => break,
+                    Some(Err(error)) => return Err(error),
+                    Some(Ok(Input::Paste(text))) => {
+                        app.insert(&text);
+                        InputOutcome::Nothing
+                    }
+                    Some(Ok(Input::Key(event))) if event.kind != KeyEventKind::Release => key(app, event),
+                    Some(Ok(Input::Mouse(event))) => mouse(app, &hits, event),
+                    Some(Ok(_)) => InputOutcome::Nothing,
+                };
+                match outcome {
+                    InputOutcome::Exit => break,
+                    InputOutcome::Nothing => {}
+                    InputOutcome::Action(action) => {
+                        app.pending = true;
+                        let state = state.to_owned();
+                        let actions = action_tx.clone();
+                        tokio::spawn(async move { let _ = actions.send(action.execute(state).await).await; });
                     }
                 }
-                Some(Ok(_)) => {}
             },
         }
     }
@@ -880,11 +900,12 @@ fn key(app: &mut App, event: KeyEvent) -> InputOutcome {
     match event.code {
         KeyCode::Tab => app.set_focus(app.focus.step(false)),
         KeyCode::BackTab => app.set_focus(app.focus.step(true)),
-        KeyCode::F(1) => app.set_focus(Focus::Channels),
-        KeyCode::F(2) => app.set_focus(Focus::Peers),
-        KeyCode::F(3) => app.set_focus(Focus::Messages),
-        KeyCode::F(4) => app.set_focus(Focus::Device),
-        KeyCode::F(5) => app.set_focus(Focus::Compose),
+        KeyCode::Char(ch @ '1'..='5')
+            if app.focus != Focus::Compose && event.modifiers.is_empty() =>
+        {
+            app.set_focus(Focus::PANES[ch as usize - '1' as usize]);
+        }
+        KeyCode::Esc if app.focus == Focus::Compose => app.set_focus(Focus::Messages),
         KeyCode::Up => app.move_selection(true),
         KeyCode::Down => app.move_selection(false),
         KeyCode::Enter if app.focus == Focus::Messages => {
@@ -892,11 +913,7 @@ fn key(app: &mut App, event: KeyEvent) -> InputOutcome {
             app.scroll = 0;
         }
         KeyCode::Enter if app.focus == Focus::Compose && event.kind == KeyEventKind::Press => {
-            match app.submit() {
-                Ok(Some(action)) => return InputOutcome::Action(action),
-                Ok(None) => {}
-                Err(error) => app.notice = error.to_string(),
-            }
+            return submit(app);
         }
         KeyCode::Backspace if app.focus == Focus::Compose && !app.pending => {
             app.draft.pop();
@@ -924,7 +941,97 @@ fn key(app: &mut App, event: KeyEvent) -> InputOutcome {
     InputOutcome::Nothing
 }
 
-fn draw(frame: &mut Frame<'_>, app: &App) {
+fn submit(app: &mut App) -> InputOutcome {
+    match app.submit() {
+        Ok(Some(action)) => InputOutcome::Action(action),
+        Ok(None) => InputOutcome::Nothing,
+        Err(error) => {
+            app.notice = error.to_string();
+            InputOutcome::Nothing
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Hit {
+    Pane(Focus),
+    Row(Focus, usize),
+    Tab(Focus),
+    Send,
+    Confirm,
+    Dismiss,
+    Refresh,
+    Quit,
+}
+
+#[derive(Default)]
+struct HitMap(Vec<(Rect, Hit)>);
+
+fn mouse(app: &mut App, hits: &HitMap, event: MouseEvent) -> InputOutcome {
+    let position = Position::new(event.column, event.row);
+    match event.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            let hit = hits
+                .0
+                .iter()
+                .rev()
+                .find(|(area, _)| area.contains(position));
+            if app.confirm.is_some() {
+                return match hit {
+                    Some((_, Hit::Confirm)) if !app.pending => app
+                        .confirm
+                        .take()
+                        .map_or(InputOutcome::Nothing, InputOutcome::Action),
+                    Some((_, Hit::Dismiss)) => {
+                        app.confirm = None;
+                        InputOutcome::Nothing
+                    }
+                    _ => InputOutcome::Nothing,
+                };
+            }
+            match hit.map(|(_, hit)| *hit) {
+                Some(Hit::Pane(focus)) if app.focus != focus => app.set_focus(focus),
+                Some(Hit::Tab(focus)) => app.set_focus(focus),
+                Some(Hit::Row(Focus::Messages, index)) => {
+                    app.set_focus(Focus::Messages);
+                    if let Some(view) = app.conversation().and_then(|key| app.views.get_mut(&key))
+                        && index < view.events.len()
+                    {
+                        view.selected = index;
+                        app.detail = true;
+                    }
+                }
+                Some(Hit::Row(focus, index)) => {
+                    app.set_focus(focus);
+                    app.select(focus, index);
+                }
+                Some(Hit::Send) => {
+                    app.set_focus(Focus::Compose);
+                    return submit(app);
+                }
+                Some(Hit::Refresh) => app.catalog_at = None,
+                Some(Hit::Quit) => return InputOutcome::Exit,
+                _ => {}
+            }
+        }
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown if app.confirm.is_none() => {
+            if let Some(focus) = hits.0.iter().find_map(|(area, hit)| match hit {
+                Hit::Pane(focus) if area.contains(position) => Some(*focus),
+                _ => None,
+            }) {
+                if app.focus != focus {
+                    app.set_focus(focus);
+                }
+                app.move_selection(event.kind == MouseEventKind::ScrollUp);
+            }
+        }
+        _ => {}
+    }
+    InputOutcome::Nothing
+}
+
+fn draw(frame: &mut Frame<'_>, app: &App) -> HitMap {
+    let mut hits = HitMap::default();
     let [header, body, status, compose, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(3),
@@ -948,6 +1055,7 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
     );
 
     if app.focus == Focus::Device {
+        hits.0.push((body, Hit::Pane(Focus::Device)));
         draw_device(frame, body, app);
     } else {
         let [channels, peers, messages] = Layout::horizontal([
@@ -956,8 +1064,8 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
             Constraint::Percentage(60),
         ])
         .areas(body);
-        draw_navigation(frame, app, channels, peers);
-        draw_messages(frame, messages, app);
+        draw_navigation(frame, app, &mut hits, channels, peers);
+        draw_messages(frame, app, &mut hits, messages);
     }
     frame.render_widget(
         Paragraph::new(status_text(app))
@@ -965,11 +1073,19 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
             .wrap(Wrap { trim: false }),
         status,
     );
+    let [compose, controls] = Layout::horizontal([
+        Constraint::Min(1),
+        Constraint::Length(if app.confirm.is_some() { 20 } else { 8 }),
+    ])
+    .areas(compose);
     let composer = if let Some(action) = &app.confirm {
         match action {
-            Action::Cancel { root, .. } => format!("Pause run {}? y confirms.", hex::encode(root)),
+            Action::Cancel { root, .. } => format!(
+                "Pause run {}? Press y to confirm.",
+                short(&hex::encode(root))
+            ),
             Action::CancelWake { peer, wake, .. } => format!(
-                "Cancel wake {} to peer {}? y confirms.",
+                "Cancel wake {} to peer {}? Press y to confirm.",
                 short(&hex::encode(wake)),
                 short(&hex::encode(peer)),
             ),
@@ -984,16 +1100,106 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
         let tail = app.draft.chars().rev().take(shown).collect::<Vec<_>>();
         tail.into_iter().rev().map(display_char).collect()
     };
+    hits.0.push((compose, Hit::Pane(Focus::Compose)));
     frame.render_widget(
-        Paragraph::new(composer).block(panel("Compose", app.focus == Focus::Compose)),
+        Paragraph::new(composer).block(panel(
+            if app.focus == Focus::Compose {
+                "Compose · Esc to leave"
+            } else {
+                "Compose"
+            },
+            app.focus == Focus::Compose,
+        )),
         compose,
     );
-    frame.render_widget(
-        Paragraph::new(
-            "F1 Channels  F2 Direct  F3 Messages  F4 Device  F5 Compose  r Refresh  Ctrl+Q Quit",
-        ),
-        footer,
+    let mut controls = Rect::new(
+        controls.x,
+        controls.y.saturating_add(1),
+        controls.width,
+        controls.height.min(2).saturating_sub(1),
     );
+    if app.confirm.is_some() {
+        button(
+            frame,
+            &mut hits,
+            &mut controls,
+            "[Confirm]",
+            Hit::Confirm,
+            true,
+        );
+        button(
+            frame,
+            &mut hits,
+            &mut controls,
+            "[Back]",
+            Hit::Dismiss,
+            false,
+        );
+    } else if !app.pending && !app.draft.trim().is_empty() {
+        button(frame, &mut hits, &mut controls, "[Send]", Hit::Send, true);
+    }
+    let mut footer = footer;
+    for (label, focus) in [
+        "1 Channels",
+        "2 Direct",
+        "3 Messages",
+        "4 Device",
+        "5 Compose",
+    ]
+    .into_iter()
+    .zip(Focus::PANES)
+    {
+        button(
+            frame,
+            &mut hits,
+            &mut footer,
+            label,
+            Hit::Tab(focus),
+            app.focus == focus,
+        );
+    }
+    button(
+        frame,
+        &mut hits,
+        &mut footer,
+        "r Refresh",
+        Hit::Refresh,
+        false,
+    );
+    button(
+        frame,
+        &mut hits,
+        &mut footer,
+        "Ctrl+Q Quit",
+        Hit::Quit,
+        false,
+    );
+    hits
+}
+
+fn button(
+    frame: &mut Frame<'_>,
+    hits: &mut HitMap,
+    row: &mut Rect,
+    label: &str,
+    hit: Hit,
+    active: bool,
+) {
+    let width = label.len() as u16;
+    if width > row.width || row.height == 0 {
+        return;
+    }
+    let area = Rect::new(row.x, row.y, width, 1);
+    let style = Style::default().add_modifier(if active {
+        Modifier::REVERSED
+    } else {
+        Modifier::UNDERLINED
+    });
+    frame.render_widget(Paragraph::new(label).style(style), area);
+    hits.0.push((area, hit));
+    let used = (width + 2).min(row.width);
+    row.x = row.x.saturating_add(used);
+    row.width -= used;
 }
 
 fn panel(title: &str, focused: bool) -> Block<'_> {
@@ -1005,7 +1211,13 @@ fn panel(title: &str, focused: bool) -> Block<'_> {
     Block::bordered().title(title).border_style(style)
 }
 
-fn draw_navigation(frame: &mut Frame<'_>, app: &App, channels: Rect, peers: Rect) {
+fn draw_navigation(
+    frame: &mut Frame<'_>,
+    app: &App,
+    hits: &mut HitMap,
+    channels: Rect,
+    peers: Rect,
+) {
     let channel_selection = app
         .channels
         .iter()
@@ -1016,6 +1228,8 @@ fn draw_navigation(frame: &mut Frame<'_>, app: &App, channels: Rect, peers: Rect
         .map(|entry| ListItem::new(short(&hex::encode(entry.id)).to_owned()));
     draw_list(
         frame,
+        hits,
+        Focus::Channels,
         channels,
         panel("Channels", app.focus == Focus::Channels),
         channel_list,
@@ -1033,6 +1247,8 @@ fn draw_navigation(frame: &mut Frame<'_>, app: &App, channels: Rect, peers: Rect
     );
     draw_list(
         frame,
+        hits,
+        Focus::Peers,
         peers,
         panel("Direct peers", app.focus == Focus::Peers),
         peers_list,
@@ -1042,24 +1258,33 @@ fn draw_navigation(frame: &mut Frame<'_>, app: &App, channels: Rect, peers: Rect
 
 fn draw_list<'a>(
     frame: &mut Frame<'_>,
+    hits: &mut HitMap,
+    focus: Focus,
     area: Rect,
     block: Block<'a>,
     items: impl IntoIterator<Item = ListItem<'a>>,
     selected: Option<usize>,
 ) {
+    hits.0.push((area, Hit::Pane(focus)));
+    let inner = block.inner(area);
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    let len = list.len();
     let mut state = ListState::default().with_selected(selected);
-    frame.render_stateful_widget(
-        List::new(items)
-            .block(block)
-            .highlight_style(Style::default().add_modifier(Modifier::REVERSED)),
-        area,
-        &mut state,
-    );
+    frame.render_stateful_widget(list, area, &mut state);
+    for (row, index) in (state.offset()..len).take(inner.height.into()).enumerate() {
+        hits.0.push((
+            Rect::new(inner.x, inner.y + row as u16, inner.width, 1),
+            Hit::Row(focus, index),
+        ));
+    }
 }
 
-fn draw_messages(frame: &mut Frame<'_>, area: Rect, app: &App) {
+fn draw_messages(frame: &mut Frame<'_>, app: &App, hits: &mut HitMap, area: Rect) {
     let block = panel("Messages", app.focus == Focus::Messages);
     let Some(view) = app.conversation().and_then(|key| app.views.get(&key)) else {
+        hits.0.push((area, Hit::Pane(Focus::Messages)));
         frame.render_widget(
             Paragraph::new("Select an enrolled channel to view messages.").block(block),
             area,
@@ -1069,6 +1294,7 @@ fn draw_messages(frame: &mut Frame<'_>, area: Rect, app: &App) {
     if app.detail
         && let Some(event) = view.events.get(view.selected)
     {
+        hits.0.push((area, Hit::Pane(Focus::Messages)));
         let message = &event.message;
         let mut text = format!("Message {}\nFrom {}", message.message, message.sender);
         if let Some(reply) = &message.in_reply_to {
@@ -1088,6 +1314,7 @@ fn draw_messages(frame: &mut Frame<'_>, area: Rect, app: &App) {
         return;
     }
     if view.events.is_empty() {
+        hits.0.push((area, Hit::Pane(Focus::Messages)));
         frame.render_widget(Paragraph::new("No messages yet.").block(block), area);
         return;
     }
@@ -1106,7 +1333,15 @@ fn draw_messages(frame: &mut Frame<'_>, area: Rect, app: &App) {
         let text: String = message.text.chars().take(320).map(display_char).collect();
         ListItem::new(format!("{role} {}{thread}  {text}", short(sender)))
     });
-    draw_list(frame, area, block, items, Some(view.selected));
+    draw_list(
+        frame,
+        hits,
+        Focus::Messages,
+        area,
+        block,
+        items,
+        Some(view.selected),
+    );
 }
 
 fn status_text(app: &App) -> String {
@@ -1181,7 +1416,7 @@ fn draw_device(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
     lines.extend([
         String::new(),
-        "Enter commands in Compose (F5)".into(),
+        "Enter commands in Compose (5)".into(),
         ":connect LISTEN [RELAY]   :disconnect   :refresh   :device".into(),
         ":route ADDRESS  (with a direct peer selected)".into(),
         ":cancel [ROOT]  (pause a signed local workflow)".into(),

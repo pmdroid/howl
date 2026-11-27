@@ -203,7 +203,11 @@ fn display_cannot_execute_terminal_controls_from_a_signed_message() {
             more: false,
         });
     let mut terminal = Terminal::new(TestBackend::new(110, 23)).unwrap();
-    terminal.draw(|frame| draw(frame, &app)).unwrap();
+    terminal
+        .draw(|frame| {
+            draw(frame, &app);
+        })
+        .unwrap();
     let rendered: String = terminal
         .backend()
         .buffer()
@@ -215,4 +219,106 @@ fn display_cannot_execute_terminal_controls_from_a_signed_message() {
     assert!(!rendered.contains('\x1b'));
     assert!(!rendered.contains('\u{202e}'));
     assert!(rendered.contains("↳0606060606"));
+}
+
+fn render_hits(app: &App) -> HitMap {
+    let mut terminal = Terminal::new(TestBackend::new(80, 16)).unwrap();
+    let mut hits = HitMap::default();
+    terminal.draw(|frame| hits = draw(frame, app)).unwrap();
+    hits
+}
+
+fn click(app: &mut App, target: impl Fn(Hit) -> bool) -> InputOutcome {
+    let hits = render_hits(app);
+    let area = hits.0.iter().find(|(_, hit)| target(*hit)).unwrap().0;
+    mouse(
+        app,
+        &hits,
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: area.x,
+            row: area.y,
+            modifiers: KeyModifiers::NONE,
+        },
+    )
+}
+
+#[test]
+fn numbers_switch_panes_and_remain_text_in_the_composer() {
+    let mut app = app();
+    for (digit, focus) in ('1'..='5').zip(Focus::PANES) {
+        key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char(digit), KeyModifiers::NONE),
+        );
+        assert!(app.focus == focus);
+    }
+    key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE),
+    );
+    assert_eq!(app.draft, "2");
+    key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(app.focus == Focus::Messages);
+    key(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    assert!(app.focus == Focus::Device);
+}
+
+#[test]
+fn mouse_opens_visible_rows_and_sends_to_the_selected_peer() {
+    let mut app = app();
+    app.channels.push(ChannelSummary {
+        id: [8; 32],
+        peers: vec![PEER],
+    });
+    click(&mut app, |hit| matches!(hit, Hit::Row(Focus::Channels, 1)));
+    assert_eq!(app.channel, Some([8; 32]));
+    click(&mut app, |hit| matches!(hit, Hit::Row(Focus::Peers, 1)));
+    assert_eq!(app.peer, Some(PEER));
+    let view = app.views.entry(([8; 32], Some(PEER))).or_default();
+    view.events
+        .extend((1..=20).map(|cursor| event(cursor, "message")));
+    view.selected = 19;
+    let hits = render_hits(&app);
+    let first_visible = hits
+        .0
+        .iter()
+        .find_map(|(_, hit)| match hit {
+            Hit::Row(Focus::Messages, index) => Some(*index),
+            _ => None,
+        })
+        .unwrap();
+    assert!(first_visible > 0);
+    click(
+        &mut app,
+        |hit| matches!(hit, Hit::Row(Focus::Messages, index) if index == first_visible),
+    );
+    assert!(app.detail);
+    assert_eq!(app.views[&([8; 32], Some(PEER))].selected, first_visible);
+    click(&mut app, |hit| matches!(hit, Hit::Tab(Focus::Device)));
+    assert!(app.focus == Focus::Device);
+    click(&mut app, |hit| matches!(hit, Hit::Pane(Focus::Compose)));
+    app.insert("hello");
+    assert!(matches!(click(&mut app, |hit| matches!(hit, Hit::Send)),
+        InputOutcome::Action(Action::Direct { peer: PEER, text, .. }) if text == "hello"));
+}
+
+#[test]
+fn mouse_confirmation_requires_the_confirm_button() {
+    let mut app = app();
+    app.draft = format!(":cancel {}", hex::encode([9; 32]));
+    app.submit().unwrap();
+    assert!(matches!(
+        click(&mut app, |hit| matches!(hit, Hit::Tab(Focus::Peers))),
+        InputOutcome::Nothing
+    ));
+    assert!(app.confirm.is_some());
+    click(&mut app, |hit| matches!(hit, Hit::Dismiss));
+    assert!(app.confirm.is_none());
+    app.draft = format!(":cancel {}", hex::encode([9; 32]));
+    app.submit().unwrap();
+    assert!(matches!(
+        click(&mut app, |hit| matches!(hit, Hit::Confirm)),
+        InputOutcome::Action(Action::Cancel { .. })
+    ));
 }
