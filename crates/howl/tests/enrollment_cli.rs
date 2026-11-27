@@ -316,3 +316,205 @@ fn offline_export_recovers_authority_after_loss_of_the_online_root() {
     assert_ne!(successor.recovery, prior.recovery);
     assert_eq!(success(recover(&downloaded_package, &unlock, head)), result);
 }
+
+#[test]
+fn existing_devices_adopt_recovery_and_a_higher_certificate_sequence() {
+    let fixture = tempfile::tempdir().unwrap();
+    let path = |name: &str| fixture.path().join(name);
+    let operator = path("operator");
+    let offline = path("offline");
+    let candidate = path("candidate");
+    let observer = path("observer");
+    let first_exchange = path("first-exchange");
+    let first = success(command(&[
+        "init".as_ref(),
+        operator.as_os_str(),
+        offline.as_os_str(),
+    ]));
+    pairing_exchange(
+        &operator,
+        &candidate,
+        &first_exchange,
+        &path("first-secret"),
+        &first,
+        "1",
+    );
+    success(accept_enrollment(&candidate, &first_exchange, &first));
+    let observer_exchange = path("observer-exchange");
+    pairing_exchange(
+        &operator,
+        &observer,
+        &observer_exchange,
+        &path("observer-secret"),
+        &first,
+        "1",
+    );
+    success(accept_enrollment(&observer, &observer_exchange, &first));
+    success(command(&[
+        "peer".as_ref(),
+        observer.as_os_str(),
+        first_exchange.as_os_str(),
+    ]));
+    let first_pin = fs::read(candidate.join("authority-pin")).unwrap();
+    let first_cert = fs::read(candidate.join("enrollment-certificate")).unwrap();
+    let device = LocalIdentity::load_or_create(&candidate)
+        .unwrap()
+        .certificate();
+    let package = path("package");
+    let unlock = path("unlock");
+    success(command(&[
+        "recover-export".as_ref(),
+        operator.as_os_str(),
+        offline.as_os_str(),
+        package.as_os_str(),
+        unlock.as_os_str(),
+    ]));
+    let recovered = path("recovered");
+    let recovered_offline = path("recovered-offline");
+    let second = success(command(&[
+        "recover".as_ref(),
+        recovered.as_os_str(),
+        package.as_os_str(),
+        unlock.as_os_str(),
+        recovered_offline.as_os_str(),
+        line(&first, "Account "),
+        line(&first, "Authority "),
+    ]));
+    let old_sequence_exchange = path("old-sequence-exchange");
+    pairing_exchange(
+        &recovered,
+        &candidate,
+        &old_sequence_exchange,
+        &path("old-sequence-secret"),
+        &second,
+        "1",
+    );
+    failed(accept_enrollment(
+        &candidate,
+        &old_sequence_exchange,
+        &second,
+    ));
+    assert_eq!(
+        success(command(&["authority".as_ref(), candidate.as_os_str()])),
+        first
+    );
+    let renewal = path("renewal-exchange");
+    pairing_exchange(
+        &recovered,
+        &candidate,
+        &renewal,
+        &path("renewal-secret"),
+        &second,
+        "2",
+    );
+    failed(accept_enrollment(&observer, &renewal, &second));
+    success(accept_enrollment(&candidate, &renewal, &second));
+    success(accept_enrollment(&candidate, &renewal, &second));
+    failed(accept_enrollment(&candidate, &first_exchange, &first));
+    assert_eq!(
+        success(command(&["authority".as_ref(), candidate.as_os_str()])),
+        second
+    );
+    assert_eq!(
+        fs::read(candidate.join("authority-pin")).unwrap(),
+        first_pin
+    );
+    assert_eq!(
+        fs::read(candidate.join("enrollment-certificate")).unwrap(),
+        first_cert
+    );
+    let unrelated = path("unrelated-operator");
+    let unrelated_offline = path("unrelated-offline");
+    let unrelated_ids = success(command(&[
+        "init".as_ref(),
+        unrelated.as_os_str(),
+        unrelated_offline.as_os_str(),
+    ]));
+    let unrelated_exchange = path("unrelated-exchange");
+    pairing_exchange(
+        &unrelated,
+        &candidate,
+        &unrelated_exchange,
+        &path("unrelated-secret"),
+        &unrelated_ids,
+        "3",
+    );
+    failed(accept_enrollment(
+        &candidate,
+        &unrelated_exchange,
+        &unrelated_ids,
+    ));
+    assert_eq!(
+        success(command(&["authority".as_ref(), candidate.as_os_str()])),
+        second
+    );
+
+    let observer_renewal = path("observer-renewal");
+    pairing_exchange(
+        &recovered,
+        &observer,
+        &observer_renewal,
+        &path("observer-renewal-secret"),
+        &second,
+        "2",
+    );
+    success(accept_enrollment(&observer, &observer_renewal, &second));
+    let peer =
+        |exchange: &Path| command(&["peer".as_ref(), observer.as_os_str(), exchange.as_os_str()]);
+    failed(peer(&first_exchange));
+    success(peer(&renewal));
+    success(peer(&renewal));
+    let pinned = PeerTrust::open(&observer)
+        .unwrap()
+        .pinned(device.device_id())
+        .unwrap();
+    assert_eq!(pinned.as_bytes(), device.as_bytes());
+}
+
+fn accept_enrollment(state: &Path, exchange: &Path, authority: &str) -> Output {
+    command(&[
+        "accept".as_ref(),
+        state.as_os_str(),
+        exchange.as_os_str(),
+        line(authority, "Account "),
+        line(authority, "Authority "),
+        line(authority, "Designation "),
+    ])
+}
+
+fn pairing_exchange(
+    issuer: &Path,
+    state: &Path,
+    exchange: &Path,
+    secret: &Path,
+    authority: &str,
+    sequence: &str,
+) {
+    let identity = success(command(&[
+        "identity".as_ref(),
+        state.as_os_str(),
+        exchange.as_os_str(),
+    ]));
+    success(command(&[
+        "offer".as_ref(),
+        issuer.as_os_str(),
+        exchange.as_os_str(),
+        line(&identity, "Fingerprint "),
+        sequence.as_ref(),
+        secret.as_os_str(),
+    ]));
+    success(command(&[
+        "respond".as_ref(),
+        state.as_os_str(),
+        exchange.as_os_str(),
+        line(authority, "Account "),
+        line(authority, "Authority "),
+        line(authority, "Designation "),
+        secret.as_os_str(),
+    ]));
+    success(command(&[
+        "certify".as_ref(),
+        issuer.as_os_str(),
+        exchange.as_os_str(),
+    ]));
+}

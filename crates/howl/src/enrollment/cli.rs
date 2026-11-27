@@ -1,4 +1,7 @@
 mod recovery;
+mod renewal;
+
+pub(crate) use renewal::{peer_records, profile_records};
 
 use std::{
     ffi::{OsStr, OsString},
@@ -10,7 +13,7 @@ use ed25519_dalek::SigningKey;
 use zeroize::Zeroizing;
 
 use crate::{
-    identity::{CERTIFICATE_LEN, LocalIdentity, PeerCertificate, PeerTrust, StateDirectory},
+    identity::{CERTIFICATE_LEN, LocalIdentity, PeerCertificate, StateDirectory},
     node,
 };
 
@@ -269,16 +272,7 @@ fn accept(
     let identity = LocalIdentity::load_or_create(state)?;
     let local = identity.certificate();
     let certificate = certificate(&exchange, &designation, &local)?;
-    let pinned = AuthorityStore::open(state)?;
-    pinned.initialize(authority.records(), head.account, head.digest)?;
-    if pinned.current()? != head {
-        return Err(invalid(
-            "local authority head differs from the approved head",
-        ));
-    }
-    let directory = StateDirectory::open(state)?;
-    write_exact(&directory, DESIGNATION, designation.as_bytes())?;
-    write_exact(&directory, CERTIFICATE, certificate.as_bytes())?;
+    renewal::accept(state, &authority, &designation, &certificate, &local)?;
     println!("Device enrolled.");
     Ok(())
 }
@@ -286,14 +280,19 @@ fn accept(
 fn import_peer(state: &Path, exchange: &Path) -> io::Result<()> {
     separate(&[state, exchange])?;
     let directory = StateDirectory::open(state)?;
-    let head = AuthorityStore::open(state)?.current()?;
-    let designation = designation(&directory, head)?;
+    let authority = AuthorityStore::open(state)?.load()?;
+    let designation = designation(&directory, authority.head()?)?;
     let exchange = StateDirectory::open(exchange)?;
     let peer = peer(&exchange)?;
     let certificate = certificate(&exchange, &designation, &peer)?;
-    let filename = format!("enrollment-peer-{}", hex::encode(peer.device_id()));
-    write_exact(&directory, &filename, certificate.as_bytes())?;
-    PeerTrust::open(state)?.pin(&peer, &peer.fingerprint())?;
+    renewal::import_peer(
+        state,
+        &directory,
+        &authority,
+        &designation,
+        &certificate,
+        &peer,
+    )?;
     println!("Enrolled peer trusted.");
     Ok(())
 }
@@ -314,7 +313,11 @@ fn checked_authority(
 }
 
 fn designation(directory: &StateDirectory, head: AuthorityHead) -> io::Result<Designation> {
-    Designation::verify(&directory.read_bounded(DESIGNATION, RECORD_LIMIT)?, head)
+    let bytes = match profile_records(directory)? {
+        Some((designation, _)) => designation,
+        None => directory.read_bounded(DESIGNATION, 165_000)?,
+    };
+    Designation::verify(&bytes, head)
 }
 
 fn checked_designation(
