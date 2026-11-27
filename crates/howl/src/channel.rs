@@ -104,7 +104,11 @@ impl Channel {
         Self::load_manual(state, local, id)
     }
 
-    fn load_manual(state: &Path, local: &LocalIdentity, id: &[u8; 32]) -> io::Result<Self> {
+    pub(crate) fn load_manual(
+        state: &Path,
+        local: &LocalIdentity,
+        id: &[u8; 32],
+    ) -> io::Result<Self> {
         let manifest =
             StateDirectory::open(state)?.read_bounded(&filename(id), MAX_MANIFEST_LEN as u64)?;
         let channel = Self::verify(local, &PeerTrust::open(state)?, &manifest)?;
