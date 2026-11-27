@@ -13,6 +13,7 @@ const ROSTER: &[u8] = b"howl/identity/v1/roster\0";
 const HEADER: usize = 139;
 const MEMBER: usize = 97;
 const ZERO: Id = [0; 32];
+pub(crate) const MAX_ROSTER_LEN: usize = ROSTER.len() + HEADER + MAX_RECIPIENTS * MEMBER + 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ChannelPermission {
@@ -154,6 +155,10 @@ impl Roster {
         self.digest
     }
 
+    pub fn channel(&self) -> Id {
+        self.channel
+    }
+
     pub fn epoch(&self) -> u64 {
         self.epoch
     }
@@ -242,6 +247,22 @@ impl RosterChain {
         }
     }
 
+    pub(crate) fn merge_revocations(&mut self, source: &Self) {
+        for (address, &sequence) in &source.floors {
+            self.raise_floor(
+                address.account,
+                Floor {
+                    device: address.device,
+                    sequence,
+                },
+            );
+        }
+    }
+
+    pub(crate) fn revoked_through(&self, address: DeviceAddress) -> u64 {
+        self.floors.get(&address).copied().unwrap_or_default()
+    }
+
     fn raise_floor(&mut self, account: Id, floor: Floor) {
         self.floors
             .entry(DeviceAddress {
@@ -252,12 +273,15 @@ impl RosterChain {
             .or_insert(floor.sequence);
     }
 
-    pub fn active(&self, current: &Designation) -> io::Result<&Roster> {
+    pub fn latest(&self) -> io::Result<Option<&Roster>> {
         if !self.conflicts.is_empty() {
             return Err(invalid("roster has a verified fork"));
         }
-        self.head
-            .and_then(|head| self.accepted.get(&head))
+        Ok(self.head.and_then(|head| self.accepted.get(&head)))
+    }
+
+    pub fn active(&self, current: &Designation) -> io::Result<&Roster> {
+        self.latest()?
             .filter(|roster| roster.designation == current.digest() && !roster.paused)
             .ok_or_else(|| invalid("no active roster matches the current designation"))
     }
