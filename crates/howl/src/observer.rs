@@ -221,7 +221,7 @@ impl ObserverProvider {
         Ok(ObserverProcess {
             child,
             container: Some(container),
-            _volume: volume,
+            volume,
         })
     }
 
@@ -377,7 +377,7 @@ impl ObserverProvider {
 pub struct ObserverProcess {
     child: Child,
     container: Option<Container>,
-    _volume: Volume,
+    volume: Volume,
 }
 
 impl ObserverProcess {
@@ -438,7 +438,7 @@ impl ObserverProcess {
         }
         let _ = self.child.kill();
         let _ = self.child.wait();
-        Ok(())
+        self.volume.remove()
     }
 }
 
@@ -484,12 +484,22 @@ struct Volume {
     name: String,
 }
 
+impl Volume {
+    fn remove(&mut self) -> Result<()> {
+        if !self.name.is_empty() {
+            self.provider.run(
+                self.provider.command().args(["volume", "rm", &self.name]),
+                "remove disposable snapshot volume",
+            )?;
+            self.name.clear();
+        }
+        Ok(())
+    }
+}
+
 impl Drop for Volume {
     fn drop(&mut self) {
-        let _ = self.provider.run(
-            self.provider.command().args(["volume", "rm", &self.name]),
-            "remove disposable snapshot volume",
-        );
+        let _ = self.remove();
     }
 }
 

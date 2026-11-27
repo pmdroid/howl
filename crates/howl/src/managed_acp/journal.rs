@@ -16,9 +16,15 @@ use super::{Error, Result, SessionState};
 pub(super) struct Journal {
     root_path: PathBuf,
     directory: File,
-    _lock: File,
+    lock: File,
     file_name: String,
     status: watch::Sender<SessionState>,
+}
+
+impl Drop for Journal {
+    fn drop(&mut self) {
+        let _ = self.lock.unlock();
+    }
 }
 
 impl Journal {
@@ -30,21 +36,7 @@ impl Journal {
 
     pub(super) fn existing(root: &Path, expected: SessionState) -> Result<Self> {
         let mut journal = Self::open(root, expected.clone())?;
-        let file = openat(
-            &journal.directory,
-            journal.file_name.as_str(),
-            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .map_err(io::Error::from)?;
-        let file = File::from(file);
-        check_private(&file, false)?;
-        let mut data = Vec::new();
-        file.take(16_385).read_to_end(&mut data)?;
-        if data.len() > 16_384 {
-            return Err(Error::State);
-        }
-        let old: SessionState = serde_json::from_slice(&data).map_err(|_| Error::State)?;
+        let old = read_state(&journal.directory, &journal.file_name)?;
         if old.id != expected.id
             || old.engine != expected.engine
             || old.commit != expected.commit
@@ -56,6 +48,46 @@ impl Journal {
         }
         journal.status = watch::channel(old).0;
         Ok(journal)
+    }
+
+    pub(super) fn reap_observers(
+        root: &Path,
+        provider: &crate::observer::ObserverProvider,
+    ) -> Result<()> {
+        let directory = match open_private_directory(root) {
+            Ok(directory) => directory,
+            Err(Error::Io(error)) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        for entry in std::fs::read_dir(root)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(id) = name.to_str().and_then(|name| name.strip_suffix(".json")) else {
+                continue;
+            };
+            if !valid_id(id) {
+                continue;
+            }
+            let state = read_state(&directory, &format!("{id}.json"))?;
+            if state.id != id {
+                return Err(Error::ScopeChanged);
+            }
+            if state.phase == super::Phase::Closed && state.container.is_none() {
+                continue;
+            }
+            if state.engine != provider.engine_id() {
+                return Err(Error::ScopeChanged);
+            }
+            let journal = Self::existing(root, state)?;
+            provider.reap_managed(id)?;
+            journal.update(|state| {
+                state.container = None;
+                if state.phase != super::Phase::Closed {
+                    state.phase = super::Phase::Interrupted;
+                }
+            })?;
+        }
+        Ok(())
     }
 
     fn open(root: &Path, state: SessionState) -> Result<Self> {
@@ -70,15 +102,7 @@ impl Journal {
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error.into()),
         }
-        let directory = File::from(
-            open(
-                root,
-                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-                Mode::empty(),
-            )
-            .map_err(io::Error::from)?,
-        );
-        check_private(&directory, true)?;
+        let directory = open_private_directory(root)?;
         let lock = File::from(
             openat(
                 &directory,
@@ -102,7 +126,7 @@ impl Journal {
         Ok(Self {
             root_path: root.to_owned(),
             directory,
-            _lock: lock,
+            lock,
             file_name,
             status,
         })
@@ -140,6 +164,45 @@ impl Journal {
         self.directory.sync_all()?;
         Ok(())
     }
+}
+
+fn valid_id(id: &str) -> bool {
+    id.len() == 32
+        && id
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+fn open_private_directory(root: &Path) -> Result<File> {
+    let directory = File::from(
+        open(
+            root,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(io::Error::from)?,
+    );
+    check_private(&directory, true)?;
+    Ok(directory)
+}
+
+fn read_state(directory: &File, name: &str) -> Result<SessionState> {
+    let file = File::from(
+        openat(
+            directory,
+            name,
+            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(io::Error::from)?,
+    );
+    check_private(&file, false)?;
+    let mut data = Vec::new();
+    file.take(16_385).read_to_end(&mut data)?;
+    if data.len() > 16_384 {
+        return Err(Error::State);
+    }
+    serde_json::from_slice(&data).map_err(|_| Error::State)
 }
 
 fn check_private(file: &File, directory: bool) -> Result<()> {

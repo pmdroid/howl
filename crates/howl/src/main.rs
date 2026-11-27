@@ -1,7 +1,8 @@
 use std::{
     env,
+    ffi::{OsStr, OsString},
     io::{self, Read},
-    path::Path,
+    path::{Path, PathBuf},
     process::ExitCode,
 };
 
@@ -9,8 +10,12 @@ use howl::{
     HELP,
     channel::{Channel, MAX_MANIFEST_LEN},
     identity::{LocalIdentity, PeerCertificate, PeerTrust},
+    managed_acp::{Harness, HostClaude, HostCodex, HostGrok},
     node,
+    observer::{ObserverProvider, Snapshot},
+    workflow::{self, RunTurn},
 };
+use howl_envelope::AgentRole;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
@@ -74,6 +79,7 @@ async fn main() -> ExitCode {
         [group, action, state] if group == "mesh" && action == "stop" => {
             node::stop(Path::new(state)).await
         }
+        [group, command @ ..] if group == "workflow" => workflow_command(command).await,
         [command, state, channel, peer, route] if command == "send" => {
             let (Ok(channel), Ok(peer), Some(route)) =
                 (parse_id(channel), parse_id(peer), route.to_str())
@@ -112,6 +118,205 @@ async fn main() -> ExitCode {
     }
 }
 
+async fn workflow_command(args: &[OsString]) -> io::Result<()> {
+    match args {
+        [command, state, role] if command == "id" => {
+            let id = workflow::agent_id(Path::new(state), parse_role(role)?)?;
+            println!("{}", hex::encode(id));
+        }
+        [command, state, channel, sender, role, generation] if command == "grant" => {
+            let state = Path::new(state);
+            let channel = parse_id(channel)?;
+            let sender = parse_id(sender)?;
+            let target = workflow::agent_id(state, parse_role(role)?)?;
+            let generation = required_text(generation)?
+                .parse::<u64>()
+                .ok()
+                .filter(|generation| *generation > 0)
+                .ok_or_else(|| invalid_input("grant generation must be a positive integer"))?;
+            node::grant_wake(state, channel, sender, target, generation).await?;
+            println!("Wake grant installed for {}.", hex::encode(target));
+        }
+        [command, state, channel, peer, route, target, lifetime] if command == "wake" => {
+            let channel = parse_id(channel)?;
+            let peer = parse_id(peer)?;
+            let route = required_text(route)?;
+            let target = parse_id(target)?;
+            let lifetime = required_text(lifetime)?
+                .parse::<u16>()
+                .ok()
+                .filter(|lifetime| *lifetime > 0)
+                .ok_or_else(|| {
+                    invalid_input("wake lifetime must be a positive number of seconds")
+                })?;
+            let mut text = String::new();
+            io::stdin()
+                .take((node::WAKE_LIMIT + 1) as u64)
+                .read_to_string(&mut text)?;
+            if text.len() > node::WAKE_LIMIT {
+                return Err(invalid_input("wake text is too large"));
+            }
+            let receipt = node::send_wake(
+                Path::new(state),
+                channel,
+                peer,
+                route,
+                target,
+                lifetime,
+                &text,
+            )
+            .await?;
+            println!("{receipt}");
+        }
+        [command, state, channel, role] if command == "next" => {
+            let job = workflow::claim(Path::new(state), parse_id(channel)?, parse_role(role)?)?;
+            if let Some(job) = job {
+                println!("Execution {}", hex::encode(job.claim.execution));
+                println!("Sender {}", hex::encode(job.claim.stream.sender.device));
+                println!("Source {}", hex::encode(job.claim.message));
+                println!("Expires {}", job.claim.expires_at);
+                println!("Preview {}", serde_json::to_string(&job.text)?);
+            } else {
+                println!("No pending wakes.");
+            }
+        }
+        [command, state] if command == "recover" => {
+            let count = workflow::recover(Path::new(state))?;
+            println!("Recovered {count} interrupted workflow jobs.");
+        }
+        [command, options @ ..] if command == "run" => run_workflow(options).await?,
+        _ => return Err(invalid_input("invalid workflow arguments; run howl --help")),
+    }
+    Ok(())
+}
+
+async fn run_workflow(args: &[OsString]) -> io::Result<()> {
+    let [
+        state,
+        channel,
+        role,
+        execution,
+        route,
+        driver,
+        repo,
+        commit,
+        image,
+        options @ ..,
+    ] = args
+    else {
+        return Err(invalid_input(
+            "invalid workflow run arguments; run howl --help",
+        ));
+    };
+    let separator = options
+        .iter()
+        .position(|arg| arg == "--")
+        .ok_or_else(|| invalid_input("select at least one snapshot path after --"))?;
+    let (flags, paths) = options.split_at(separator);
+    let paths = paths[1..].iter().map(PathBuf::from).collect::<Vec<_>>();
+    if paths.is_empty() {
+        return Err(invalid_input("select at least one snapshot path after --"));
+    }
+    let mut context = Vec::new();
+    let mut cause = None;
+    for option in flags.chunks(2) {
+        match option {
+            [flag, message] if flag == "--context" => context.push(parse_id(message)?),
+            [flag, turn] if flag == "--cause" && cause.is_none() => cause = Some(parse_id(turn)?),
+            _ => return Err(invalid_input("invalid workflow context or cause")),
+        }
+    }
+    let request = RunTurn {
+        state: Path::new(state),
+        channel: parse_id(channel)?,
+        role: parse_role(role)?,
+        execution: parse_id(execution)?,
+        route: required_text(route)?,
+        context: &context,
+        cause,
+    };
+    let driver = required_text(driver)?;
+    let harness = host_harness(driver, required_text(image)?.to_owned())?;
+    let snapshot = Snapshot::from_commit(Path::new(repo), required_text(commit)?, &paths)
+        .map_err(io::Error::other)?;
+    let observer = ObserverProvider::connect(&configured_path("HOWL_OBSERVER_DOCKER_SOCKET")?)
+        .map_err(io::Error::other)?;
+    eprintln!(
+        "The signed-in {driver} agent may send selected repository files, the wake text, and supplied context to its model provider. Its reply will be shared in the channel."
+    );
+    let reply = workflow::run_turn(request, &observer, snapshot, harness).await?;
+    println!("Execution {}", hex::encode(reply.execution));
+    println!("Turn {}", hex::encode(reply.turn));
+    println!("Message {}", serde_json::to_string(&reply.message)?);
+    Ok(())
+}
+
+fn host_harness(driver: &str, image: String) -> io::Result<Harness> {
+    let node = configured_path("HOWL_HOST_NODE")?;
+    let harness = match driver {
+        "claude" => Harness::host_claude(
+            image,
+            HostClaude::new(
+                node,
+                configured_path("HOWL_HOST_CLAUDE_ADAPTER")?,
+                configured_path("HOWL_HOST_CLAUDE")?,
+                configured_path("HOME")?,
+            )
+            .map_err(io::Error::other)?,
+        ),
+        "grok" => Harness::host_grok(
+            image,
+            HostGrok::new(
+                node,
+                configured_path("HOWL_HOST_GROK")?,
+                configured_path("HOWL_HOST_GROK_AUTH_PATH")?,
+            )
+            .map_err(io::Error::other)?,
+        ),
+        "codex" => {
+            let mut codex = HostCodex::new(
+                node,
+                configured_path("HOWL_HOST_CODEX")?,
+                configured_path("HOME")?,
+            )
+            .map_err(io::Error::other)?;
+            if let Some(path) = env::var_os("CODEX_HOME") {
+                codex = codex
+                    .with_state_home(path.into())
+                    .map_err(io::Error::other)?;
+            }
+            Harness::host_codex(image, codex)
+        }
+        _ => return Err(invalid_input("driver must be claude, grok, or codex")),
+    };
+    Ok(harness)
+}
+
+fn parse_role(value: &OsStr) -> io::Result<AgentRole> {
+    match value.to_str() {
+        Some("architect") => Ok(AgentRole::Architect),
+        Some("reviewer") => Ok(AgentRole::Reviewer),
+        _ => Err(invalid_input("role must be architect or reviewer")),
+    }
+}
+
+fn configured_path(name: &str) -> io::Result<PathBuf> {
+    env::var_os(name)
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .ok_or_else(|| invalid_input(format!("set {name} to an absolute path")))
+}
+
+fn required_text(value: &OsStr) -> io::Result<&str> {
+    value
+        .to_str()
+        .ok_or_else(|| invalid_input("expected UTF-8 argument"))
+}
+
+fn invalid_input(message: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, message)
+}
+
 fn show_identity(state: &Path) -> io::Result<()> {
     let certificate = LocalIdentity::load_or_create(state)?.certificate();
     println!("Certificate {}", hex::encode(certificate.as_bytes()));
@@ -133,7 +338,7 @@ fn pin_peer(state: &Path, certificate: &str, fingerprint: &str) -> io::Result<()
     Ok(())
 }
 
-fn create_channel(state: &Path, peers: &[std::ffi::OsString]) -> io::Result<()> {
+fn create_channel(state: &Path, peers: &[OsString]) -> io::Result<()> {
     let peers = peers
         .iter()
         .map(|peer| {
@@ -166,7 +371,7 @@ fn join_channel(state: &Path, manifest: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn parse_id(value: &std::ffi::OsStr) -> io::Result<[u8; 32]> {
+fn parse_id(value: &OsStr) -> io::Result<[u8; 32]> {
     let mut id = [0; 32];
     hex::decode_to_slice(value.as_encoded_bytes(), &mut id)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid hex ID"))?;
