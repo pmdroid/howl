@@ -137,6 +137,72 @@ fn requires_a_local_engine_socket() {
 
 #[test]
 #[ignore = "requires local Linux Docker socket and pinned OpenCode fixture image"]
+fn observers_cannot_share_a_mock_provider() {
+    let socket = std::env::var_os("HOWL_OBSERVER_DOCKER_SOCKET").unwrap();
+    let image = std::env::var("HOWL_OBSERVER_IMAGE").unwrap();
+    let provider = ObserverProvider::connect(Path::new(&socket)).unwrap();
+    let repo = repository();
+    let snapshot =
+        Snapshot::from_commit(repo.path(), "HEAD", &[PathBuf::from("tracked.txt")]).unwrap();
+    let node = Path::new("/usr/local/bin/node");
+    let mut owner = provider
+        .launch(
+            &snapshot,
+            &image,
+            node,
+            &[
+                "-e",
+                "const server = require('node:http').createServer((_, res) => res.end('mock-provider'));
+                 server.listen(0, '127.0.0.1', () => console.log(server.address().port));",
+            ],
+        )
+        .unwrap();
+    let mut stdout = BufReader::new(owner.take_stdout().unwrap());
+    let (send, receive) = mpsc::channel();
+    thread::spawn(move || {
+        let mut port = String::new();
+        stdout.read_line(&mut port).unwrap();
+        send.send(port.trim().parse::<u16>()).ok();
+    });
+    let port = receive
+        .recv_timeout(Duration::from_secs(15))
+        .unwrap()
+        .unwrap();
+    let endpoint = format!("http://127.0.0.1:{port}/v1/models");
+    let request = r#"const assert = require('node:assert/strict');
+        const request = () => fetch(process.argv[1], {signal: AbortSignal.timeout(3000)});
+        async function check() {
+            if (process.argv[2] === 'owner') {
+                assert.equal(await (await request()).text(), 'mock-provider');
+            } else {
+                await assert.rejects(request, error => error.cause?.code === 'ECONNREFUSED');
+            }
+        }
+        check().catch(error => { console.error(error); process.exitCode = 1; });"#;
+    let peer = provider
+        .launch(
+            &snapshot,
+            &image,
+            node,
+            &["-e", "setInterval(() => {}, 1000)"],
+        )
+        .unwrap();
+    for (observer, role) in [(&owner, "owner"), (&peer, "peer")] {
+        let output = observer
+            .start_broker(node, &["-e", request, &endpoint, role])
+            .unwrap()
+            .wait_with_output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{role}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires local Linux Docker socket and pinned OpenCode fixture image"]
 fn real_harness_is_read_only_and_replies_over_stdio() {
     let socket = std::env::var_os("HOWL_OBSERVER_DOCKER_SOCKET").unwrap();
     let image = std::env::var("HOWL_OBSERVER_IMAGE").unwrap();
