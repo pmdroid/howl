@@ -34,9 +34,13 @@ use crate::{
         NewIntegrationRun,
     },
     enrollment::ChannelPermission,
-    interaction::{AgentAddress, EventPage, LocalInteraction, Receipt},
+    interaction::{AgentAddress, LocalInteraction, Receipt},
     node,
-    remote_mcp::{self, IntegrationPermission, authenticated, resources, tasks},
+    remote_mcp::{
+        self, IntegrationPermission, authenticated,
+        cursors::{CursorInput, CursorKey, RemoteEventPage},
+        resources, tasks,
+    },
 };
 
 #[derive(Clone)]
@@ -44,6 +48,7 @@ struct GatewayTools {
     state: Arc<PathBuf>,
     tools: ToolRouter<Self>,
     subscriptions: Subscriptions,
+    cursor_key: Arc<CursorKey>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -57,7 +62,7 @@ struct ChannelArgs {
 struct ReadArgs {
     channel: String,
     peer: Option<String>,
-    after: Option<u64>,
+    after: Option<CursorInput>,
     limit: Option<usize>,
 }
 
@@ -66,7 +71,7 @@ struct ReadArgs {
 struct WaitArgs {
     channel: String,
     peer: Option<String>,
-    after: Option<u64>,
+    after: Option<CursorInput>,
     limit: Option<usize>,
     wait_ms: Option<u64>,
 }
@@ -163,7 +168,7 @@ impl GatewayTools {
 
     #[tool(
         description = "Read durable channel events after a cursor, optionally for one direct peer",
-        output_schema = rmcp::handler::server::tool::schema_for_type::<EventPage>(),
+        output_schema = rmcp::handler::server::tool::schema_for_type::<RemoteEventPage>(),
         annotations(read_only_hint = true, idempotent_hint = true, destructive_hint = false, open_world_hint = false)
     )]
     async fn read(
@@ -171,17 +176,12 @@ impl GatewayTools {
         context: RequestContext<RoleServer>,
         Parameters(args): Parameters<ReadArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let channel = permitted(&context, &args.channel, IntegrationPermission::Read)?;
-        let peer = args.peer.as_deref().map(parse_id).transpose()?;
-        let limit = args.limit.unwrap_or(20).clamp(1, 32);
-        let after = args.after.unwrap_or_default();
-        self.read_local(move |local| local.event_page(channel, peer, after, limit))
-            .await
+        self.replay(&context, args, 0).await
     }
 
     #[tool(
         description = "Read a bounded page of durable conversation events with replay and gap detection",
-        output_schema = rmcp::handler::server::tool::schema_for_type::<EventPage>(),
+        output_schema = rmcp::handler::server::tool::schema_for_type::<RemoteEventPage>(),
         annotations(read_only_hint = true, idempotent_hint = true, destructive_hint = false, open_world_hint = false)
     )]
     async fn read_events(
@@ -194,7 +194,7 @@ impl GatewayTools {
 
     #[tool(
         description = "Wait for a durable conversation event after the supplied cursor",
-        output_schema = rmcp::handler::server::tool::schema_for_type::<EventPage>(),
+        output_schema = rmcp::handler::server::tool::schema_for_type::<RemoteEventPage>(),
         annotations(read_only_hint = true, idempotent_hint = true, destructive_hint = false, open_world_hint = false)
     )]
     async fn wait_for_events(
@@ -223,11 +223,12 @@ impl GatewayTools {
     ) -> Result<CallToolResult, ErrorData> {
         subscriptions::events(
             Arc::clone(&self.state),
+            &self.cursor_key,
             context,
             EventQuery {
                 channel: permitted(context, &args.channel, IntegrationPermission::Read)?,
                 peer: args.peer.as_deref().map(parse_id).transpose()?,
-                after: args.after.unwrap_or_default(),
+                after: args.after,
                 limit: args.limit.unwrap_or(20),
                 wait: Duration::from_millis(wait_ms),
             },
@@ -659,6 +660,7 @@ pub async fn serve_gateway(
             state: Arc::new(state.to_owned()),
             tools: GatewayTools::routes(),
             subscriptions: Subscriptions::default(),
+            cursor_key: Arc::new(CursorKey::load(state)?),
         },
     )
     .await
