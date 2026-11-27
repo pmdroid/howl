@@ -15,23 +15,7 @@ pub struct Proof {
     pub signature: String,
 }
 
-pub fn signing_bytes(
-    audience: Id,
-    subject: Id,
-    operation: &str,
-    nonce: Id,
-    token_digest: Id,
-    body: &[u8],
-) -> Vec<u8> {
-    let mut bytes = b"howl/control-proof/v1\0".to_vec();
-    bytes.extend(audience);
-    bytes.extend(subject);
-    bytes.extend(hash(operation.as_bytes()));
-    bytes.extend(nonce);
-    bytes.extend(token_digest);
-    bytes.extend(hash(body));
-    bytes
-}
+pub use howl::control_proof::signing_bytes;
 
 pub fn credential_digest(credential: &str) -> Result<Id> {
     Ok(hash(&decode::<32>(credential)?))
