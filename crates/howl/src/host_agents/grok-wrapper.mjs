@@ -16,6 +16,7 @@ const grok = process.env.HOWL_GROK_EXECUTABLE;
 const auth = process.env.HOWL_GROK_AUTH_PATH;
 let session;
 let active;
+let saved = false;
 
 function ensure(condition) {
   if (!condition) throw new Error('Grok adapter policy rejected the operation');
@@ -128,8 +129,10 @@ async function readReply(turn, id, sessionId) {
   const code = await exit;
   if (turn.timer) clearTimeout(turn.timer);
   if (turn.cancelled) send({ id, result: { stopReason: 'cancelled' } });
-  else if (code === 0 && reason) send({ id, result: { stopReason: reason } });
-  else reject(id, -32603, 'Grok headless turn failed');
+  else if (code === 0 && reason) {
+    saved = true;
+    send({ id, result: { stopReason: reason } });
+  } else reject(id, -32603, 'Grok headless turn failed');
 }
 
 async function serve() {
@@ -199,7 +202,7 @@ async function serve() {
             '--no-auto-update', '--no-memory', '--no-subagents', '--disable-web-search',
             '--permission-mode', 'dontAsk', '--tools', tools.join(','),
             ...mcpTools.flatMap(tool => ['--allow', 'MCPTool(' + tool + ')']),
-            '--session-id', session, '--verbatim', '--output-format', 'streaming-json',
+            saved ? '--resume' : '--session-id', session, '--verbatim', '--output-format', 'streaming-json',
             '--prompt-file', path,
           ], {
             cwd: work, env: { ...env, GROK_AUTH_PATH: auth }, detached: true, stdio: ['ignore', 'pipe', 'ignore'],
