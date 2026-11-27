@@ -3,6 +3,7 @@ use std::{
     io,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use howl_envelope::{AgentRole, Id};
@@ -15,16 +16,18 @@ use rmcp::{
         InitializeRequestParams, InitializeResult, ListPromptsResult, ListResourceTemplatesResult,
         ListResourcesResult, ListToolsResult, PaginatedRequestParams, ProtocolVersion,
         ReadResourceRequestParams, ReadResourceResponse, ServerCapabilities, ServerConfig,
-        TASKS_EXTENSION_ID, UpdateTaskParams,
+        SubscribeRequestParams, SubscriptionFilter, TASKS_EXTENSION_ID, UnsubscribeRequestParams,
+        UpdateTaskParams,
     },
     schemars::{self, JsonSchema},
-    service::RequestContext,
+    service::{RequestContext, SubscriptionContext},
     tool, tool_handler, tool_router,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
+use crate::remote_mcp::subscriptions::{self, EventQuery, Subscriptions};
 use crate::{
     delivery::{IntegrationRun, IntegrationRunState, NewIntegrationRun},
     enrollment::ChannelPermission,
@@ -37,6 +40,7 @@ use crate::{
 struct GatewayTools {
     state: Arc<PathBuf>,
     tools: ToolRouter<Self>,
+    subscriptions: Subscriptions,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -52,6 +56,16 @@ struct ReadArgs {
     peer: Option<String>,
     after: Option<u64>,
     limit: Option<usize>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct WaitArgs {
+    channel: String,
+    peer: Option<String>,
+    after: Option<u64>,
+    limit: Option<usize>,
+    wait_ms: Option<u64>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -160,6 +174,62 @@ impl GatewayTools {
         let after = args.after.unwrap_or_default();
         self.read_local(move |local| local.event_page(channel, peer, after, limit))
             .await
+    }
+
+    #[tool(
+        description = "Read a bounded page of durable conversation events with replay and gap detection",
+        output_schema = rmcp::handler::server::tool::schema_for_type::<EventPage>(),
+        annotations(read_only_hint = true, idempotent_hint = true, destructive_hint = false, open_world_hint = false)
+    )]
+    async fn read_events(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(args): Parameters<ReadArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.replay(&context, args, 0).await
+    }
+
+    #[tool(
+        description = "Wait for a durable conversation event after the supplied cursor",
+        output_schema = rmcp::handler::server::tool::schema_for_type::<EventPage>(),
+        annotations(read_only_hint = true, idempotent_hint = true, destructive_hint = false, open_world_hint = false)
+    )]
+    async fn wait_for_events(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(args): Parameters<WaitArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.replay(
+            &context,
+            ReadArgs {
+                channel: args.channel,
+                peer: args.peer,
+                after: args.after,
+                limit: args.limit,
+            },
+            args.wait_ms.unwrap_or(15_000),
+        )
+        .await
+    }
+
+    async fn replay(
+        &self,
+        context: &RequestContext<RoleServer>,
+        args: ReadArgs,
+        wait_ms: u64,
+    ) -> Result<CallToolResult, ErrorData> {
+        subscriptions::events(
+            Arc::clone(&self.state),
+            context,
+            EventQuery {
+                channel: permitted(context, &args.channel, IntegrationPermission::Read)?,
+                peer: args.peer.as_deref().map(parse_id).transpose()?,
+                after: args.after.unwrap_or_default(),
+                limit: args.limit.unwrap_or(20),
+                wait: Duration::from_millis(wait_ms),
+            },
+        )
+        .await
     }
 
     #[tool(
@@ -392,6 +462,7 @@ impl ServerHandler for GatewayTools {
                 .enable_tools()
                 .enable_tasks()
                 .enable_resources()
+                .enable_resources_subscribe()
                 .enable_prompts()
                 .build(),
         )
@@ -441,6 +512,39 @@ impl ServerHandler for GatewayTools {
         context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResponse, ErrorData> {
         resources::read_resource(&self.state, &context, request).await
+    }
+
+    fn accepted_subscription_filter(
+        &self,
+        requested: &SubscriptionFilter,
+    ) -> Option<SubscriptionFilter> {
+        Subscriptions::accepted_filter(requested)
+    }
+
+    async fn listen(&self, context: SubscriptionContext) -> Result<(), ErrorData> {
+        self.subscriptions
+            .listen(Arc::clone(&self.state), context)
+            .await
+    }
+
+    async fn subscribe(
+        &self,
+        request: SubscribeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<(), ErrorData> {
+        self.subscriptions
+            .subscribe(Arc::clone(&self.state), request.uri, context)
+            .await
+    }
+
+    async fn unsubscribe(
+        &self,
+        request: UnsubscribeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<(), ErrorData> {
+        self.subscriptions
+            .unsubscribe(Arc::clone(&self.state), request.uri, context)
+            .await
     }
 
     async fn list_prompts(
@@ -548,6 +652,7 @@ pub async fn serve_gateway(
         GatewayTools {
             state: Arc::new(state.to_owned()),
             tools: GatewayTools::routes(),
+            subscriptions: Subscriptions::default(),
         },
     )
     .await
@@ -570,7 +675,8 @@ fn permitted(
 
 fn tool_allowed(principal: &remote_mcp::IntegrationPrincipal, name: &str) -> bool {
     let permission = match name {
-        "list_channels" | "list_agents" | "read" | "get_run" => IntegrationPermission::Read,
+        "list_channels" | "list_agents" | "read" | "get_run" | "read_events"
+        | "wait_for_events" => IntegrationPermission::Read,
         "post" | "dm" => IntegrationPermission::Send,
         "wake" => IntegrationPermission::Wake,
         "cancel_run" => IntegrationPermission::Cancel,
