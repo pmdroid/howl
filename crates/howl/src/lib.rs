@@ -14,6 +14,7 @@ pub mod transport;
 pub mod channel;
 
 mod local_control;
+pub mod mailbox_client;
 pub mod node;
 
 pub mod delivery;

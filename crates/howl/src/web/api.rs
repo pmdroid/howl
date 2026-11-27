@@ -217,19 +217,19 @@ fn execute_local(state: &Path, input: Command) -> io::Result<Value> {
                 .map_err(io::Error::other)?
                 .into_iter()
                 .rev()
-                .filter_map(|item| {
+                .map(|item| {
                     let (text, role) = match item.body {
                         Body::Chat(text) => (text, None),
                         Body::AgentReply(reply) => (reply.text, Some(reply.role.name())),
-                        Body::Wake { .. } => return None,
+                        Body::Wake { text, .. } => (text, Some("wake")),
                     };
-                    Some(json!({
+                    json!({
                         "message": hex::encode(item.message),
                         "sender": hex::encode(item.sender.device),
                         "time": item.received_at,
                         "text": text,
                         "role": role,
-                    }))
+                    })
                 })
                 .collect::<Vec<_>>();
             let work = delivery

@@ -21,7 +21,7 @@ use crate::{
     channel::Channel,
     delivery::{
         ACK_LENGTH, ACK_TAG, Acknowledgment, ApprovedAgentReply, DeliveryStore, Device, Frame,
-        Payload, Stream,
+        Payload, Receipt, Stream,
     },
     discovery::{self, HINT_LEN, RouteHint},
     enrollment::{ChannelPermission, profile::Profile},
@@ -270,7 +270,12 @@ pub fn read(state: &Path, id: Id) -> io::Result<()> {
                 item.received_at,
                 reply.text,
             ),
-            Body::Wake { .. } => return Err(invalid("unexpected wake in channel history")),
+            Body::Wake { session, text } => println!(
+                "wake-history {sender} target={} message={} {} {text:?}",
+                hex::encode(session),
+                hex::encode(item.message),
+                item.received_at,
+            ),
         }
     }
     Ok(())
@@ -651,6 +656,43 @@ fn accept(
     }
 
     let unverified = howl_envelope::inspect_unverified(bytes).map_err(io::Error::other)?;
+    let receipt = accept_envelope(
+        state,
+        identity,
+        delivery,
+        bytes,
+        unverified,
+        EnvelopeSource::Peer(peer),
+    )?;
+    Ok(Some(receipt.acknowledgment))
+}
+
+pub(crate) enum EnvelopeSource<'a> {
+    Peer(&'a PeerCertificate),
+    Mailbox,
+}
+
+pub(crate) fn accept_envelope(
+    state: &Path,
+    identity: &LocalIdentity,
+    delivery: &mut DeliveryStore,
+    bytes: &[u8],
+    unverified: Metadata,
+    source: EnvelopeSource<'_>,
+) -> io::Result<Receipt> {
+    let local = identity.certificate();
+    let peer_pin;
+    let peer = match source {
+        EnvelopeSource::Peer(peer) => peer,
+        EnvelopeSource::Mailbox => {
+            if unverified.routing.sender.device == *local.device_id() {
+                return Err(invalid("mailbox envelope claims the local sender"));
+            }
+            peer_pin = PeerTrust::open(state)?.pinned(&unverified.routing.sender.device)?;
+            &peer_pin
+        }
+    };
+    let mailbox = matches!(source, EnvelopeSource::Mailbox);
     let roster = Channel::load(state, identity, &unverified.routing.channel)?;
     let wake = unverified.intent == Intent::Wake;
     let permission = if wake {
@@ -663,7 +705,6 @@ fn accept(
             "sender lacks the required signed channel permission",
         ));
     }
-    let local = identity.certificate();
     if !roster.allows(local.device_id(), ChannelPermission::Receive) {
         return Err(forbidden(
             "local device lacks the signed channel receive permission",
@@ -680,7 +721,7 @@ fn accept(
     let secret = RecipientSecret::from_bytes(address(device_with_account(&local, account)), &key)
         .map_err(io::Error::other)?;
     let now = unix_time()?;
-    if wake {
+    if wake && !mailbox {
         delivery.observe_wake_time(now).map_err(io::Error::other)?;
         if !delivery
             .wake_sender_authorized(*roster.id(), device_with_account(peer, account))
@@ -704,45 +745,38 @@ fn accept(
         },
         authorized_recipients: &allowed,
     };
-    let message = howl_envelope::open(bytes, &policy, &secret).map_err(io::Error::other)?;
+    let opened = if mailbox {
+        howl_envelope::open_history(bytes, &policy, &secret)
+    } else {
+        howl_envelope::open(bytes, &policy, &secret)
+    }
+    .map_err(io::Error::other)?;
     delivery
         .set_epoch(*roster.id(), roster.epoch())
         .map_err(io::Error::other)?;
-    let metadata = frame(message.metadata);
-    let accepted = match &message.body {
-        Body::Chat(text) => delivery.accept_authenticated(
-            metadata,
-            bytes,
-            Payload::Chat(text),
-            now,
-            identity.signing_key(),
-        ),
-        Body::Wake { session, text } => delivery.accept_network_wake(
-            metadata,
-            bytes,
-            Payload::Wake {
-                target: *session,
-                text,
-            },
-            unix_time,
-            identity.signing_key(),
-        ),
-        Body::AgentReply(reply) => delivery.accept_authenticated(
-            metadata,
-            bytes,
-            Payload::AgentReply(AgentReply {
-                agent: reply.agent,
-                role: reply.role,
-                in_reply_to: reply.in_reply_to,
-                context_digest: reply.context_digest,
-                text: &reply.text,
-            }),
-            now,
-            identity.signing_key(),
-        ),
+    let metadata = frame(opened.metadata);
+    let payload = match &opened.body {
+        Body::Chat(text) => Payload::Chat(text),
+        Body::Wake { session, text } => Payload::Wake {
+            target: *session,
+            text,
+        },
+        Body::AgentReply(reply) => Payload::AgentReply(AgentReply {
+            agent: reply.agent,
+            role: reply.role,
+            in_reply_to: reply.in_reply_to,
+            context_digest: reply.context_digest,
+            text: &reply.text,
+        }),
+    };
+    if mailbox {
+        delivery.accept_mailbox_history(metadata, bytes, payload, now, identity.signing_key())
+    } else if wake {
+        delivery.accept_network_wake(metadata, bytes, payload, unix_time, identity.signing_key())
+    } else {
+        delivery.accept_authenticated(metadata, bytes, payload, now, identity.signing_key())
     }
-    .map_err(io::Error::other)?;
-    Ok(Some(accepted.acknowledgment))
+    .map_err(io::Error::other)
 }
 
 pub(crate) fn history_delivery(
