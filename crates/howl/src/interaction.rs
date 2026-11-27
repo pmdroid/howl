@@ -1,6 +1,7 @@
 use std::{io, path::Path};
 
 use howl_envelope::{AgentRole, Body, Id};
+use rmcp::schemars::{self, JsonSchema};
 use serde::Serialize;
 
 use crate::{
@@ -15,7 +16,7 @@ pub struct LocalInteraction<'a> {
     state: &'a Path,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, JsonSchema)]
 pub struct AgentAddress {
     pub id: String,
     pub device: String,
@@ -23,7 +24,7 @@ pub struct AgentAddress {
     pub availability: &'static str,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, JsonSchema)]
 pub struct Message {
     pub message: String,
     pub sender: String,
@@ -52,7 +53,7 @@ impl From<ChannelMessage> for Message {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, JsonSchema)]
 pub struct Event {
     pub cursor: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -61,7 +62,7 @@ pub struct Event {
     pub message: Message,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, JsonSchema)]
 pub(crate) struct EventPage {
     pub events: Vec<Event>,
     pub cursor: u64,
@@ -81,7 +82,7 @@ impl From<ChannelEvent> for Event {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, JsonSchema)]
 pub struct Receipt {
     pub message: String,
 }
