@@ -91,6 +91,198 @@ async fn stopped(session: &ManagedSession, phase: Phase) {
     .unwrap();
 }
 
+fn fixture_v2(script: &str, args: &[&str]) -> Harness {
+    let args = std::iter::once(script)
+        .chain(args.iter().copied())
+        .collect::<Vec<_>>();
+    Harness::new(
+        "controlled-acp",
+        std::env::var("HOWL_MANAGED_FIXTURE_IMAGE").unwrap(),
+        "/usr/local/bin/node",
+        &args,
+    )
+    .with_acp_v2()
+}
+
+#[tokio::test]
+#[ignore = "requires a local Linux engine and disposable ACP fixture image"]
+async fn negotiates_v2_and_handles_authoritative_turn_completion() {
+    use agent_client_protocol::{schema::ProtocolVersion, v2::schema};
+
+    let provider = provider();
+    let repo = repository();
+    let root = tempfile::tempdir().unwrap();
+    let journal = root.path().join("state");
+    let start = || fixture_v2("/fixture/agent-v2.mjs", &[]);
+    let session = ManagedSession::start(
+        &journal,
+        &provider,
+        snapshot(repo.path(), "tracked.txt"),
+        start(),
+    )
+    .await
+    .unwrap();
+    let initial = session.status();
+    assert_eq!(initial.protocol_version, Some(ProtocolVersion::V2));
+    assert_eq!(
+        initial.capabilities,
+        Capabilities {
+            load: false,
+            resume: true,
+            close: true
+        }
+    );
+    let mut events = session.subscribe();
+    assert_eq!(
+        session.prompt("hello".into(), LIMIT).await.unwrap(),
+        StopReason::EndTurn
+    );
+    timeout(LIMIT, async {
+        loop {
+            if let Event::UpdateV2(update) = events.recv().await.unwrap()
+                && let schema::SessionUpdate::AgentMessageChunk(chunk) = update.update
+                && let schema::ContentBlock::Text(text) = chunk.content
+            {
+                assert_eq!(text.text, "v2 fixture reply");
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(matches!(
+        session.prompt("error".into(), LIMIT).await,
+        Err(Error::Remote(-32030))
+    ));
+
+    for (prompt, expected) in [
+        ("hold", PermissionDecision::RejectOnce),
+        ("permanent", PermissionDecision::Cancelled),
+    ] {
+        let inspect = async {
+            let (offered, decision) = timeout(LIMIT, async {
+                loop {
+                    if let Event::PermissionV2 { offered, decision } = events.recv().await.unwrap()
+                    {
+                        break (offered, decision);
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert!(offered.contains(&schema::PermissionOptionKind::AllowAlways));
+            assert_eq!(decision, expected);
+            assert_eq!(session.status().phase, Phase::Active);
+            assert!(matches!(
+                session.prompt("overlap".into(), LIMIT).await,
+                Err(Error::Busy)
+            ));
+            session.cancel().await.unwrap();
+        };
+        let (result, ()) = tokio::join!(session.prompt(prompt.into(), LIMIT), inspect);
+        assert_eq!(result.unwrap(), StopReason::Cancelled);
+    }
+
+    assert!(matches!(
+        session
+            .prompt("wait".into(), Duration::from_millis(100))
+            .await,
+        Err(Error::TimedOut)
+    ));
+    assert_eq!(session.status().phase, Phase::Ready);
+    assert!(matches!(
+        session.restore(Restore::Load).await,
+        Err(Error::Unsupported("session/load"))
+    ));
+    assert!(session.prompt("crash".into(), LIMIT).await.is_err());
+    stopped(&session, Phase::Interrupted).await;
+
+    let recovered = ManagedSession::recover(
+        &journal,
+        &provider,
+        snapshot(repo.path(), "tracked.txt"),
+        start(),
+        &initial.id,
+        Restore::Resume,
+    )
+    .await
+    .unwrap();
+    assert_eq!(recovered.status().remote_session, initial.remote_session);
+    assert_eq!(
+        recovered.prompt("again".into(), LIMIT).await.unwrap(),
+        StopReason::EndTurn
+    );
+    assert_eq!(recovered.close().await.unwrap(), Close::Remote);
+    stopped(&recovered, Phase::Closed).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a local Linux engine and disposable ACP fixture image"]
+async fn initial_v2_foreground_state_blocks_prompt_until_cancelled() {
+    use agent_client_protocol::v2::schema::{SessionUpdate, StateUpdate};
+
+    let repo = repository();
+    let root = tempfile::tempdir().unwrap();
+    let session = ManagedSession::start(
+        &root.path().join("state"),
+        &provider(),
+        snapshot(repo.path(), "tracked.txt"),
+        fixture_v2("/fixture/agent-v2.mjs", &["--initial-active"]),
+    )
+    .await
+    .unwrap();
+    let mut events = session.subscribe();
+    assert!(matches!(
+        session.prompt("unexpected".into(), LIMIT).await,
+        Err(Error::Busy)
+    ));
+    session.cancel().await.unwrap();
+    timeout(LIMIT, async {
+        loop {
+            if let Event::UpdateV2(update) = events.recv().await.unwrap()
+                && matches!(
+                    update.update,
+                    SessionUpdate::StateUpdate(StateUpdate::Idle(_))
+                )
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        session.prompt("hello".into(), LIMIT).await.unwrap(),
+        StopReason::EndTurn
+    );
+    assert_eq!(session.close().await.unwrap(), Close::Remote);
+    stopped(&session, Phase::Closed).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a local Linux engine and disposable ACP fixture image"]
+async fn an_opt_in_probe_can_negotiate_back_to_v1() {
+    use agent_client_protocol::schema::ProtocolVersion;
+
+    let repo = repository();
+    let root = tempfile::tempdir().unwrap();
+    let session = ManagedSession::start(
+        &root.path().join("state"),
+        &provider(),
+        snapshot(repo.path(), "tracked.txt"),
+        fixture_v2("/fixture/agent.mjs", &["--expect-v2-offer"]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(session.status().protocol_version, Some(ProtocolVersion::V1));
+    assert_eq!(
+        session.prompt("v1 turn".into(), LIMIT).await.unwrap(),
+        StopReason::EndTurn
+    );
+    assert_eq!(session.close().await.unwrap(), Close::Remote);
+    stopped(&session, Phase::Closed).await;
+}
+
 #[tokio::test]
 #[ignore = "requires a local Linux engine and disposable ACP fixture image"]
 async fn manages_capabilities_cancellation_and_crash_recovery() {

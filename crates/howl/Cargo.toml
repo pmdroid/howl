@@ -10,7 +10,7 @@ publish = false
 workspace = true
 
 [dependencies]
-agent-client-protocol = "=5.6.1"
+agent-client-protocol = { version = "=5.6.1", features = ["unstable_protocol_v2"] }
 base64 = "0.22"
 curve25519-dalek = "5"
 ed25519-dalek = "3"
