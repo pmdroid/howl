@@ -343,6 +343,7 @@ where
                 .as_ref()
                 .ok_or_else(|| io::Error::other("ACP session unavailable"))?,
             text,
+            TURN_LIMIT,
         )
         .await
     };
@@ -361,10 +362,14 @@ where
     }
 }
 
-async fn prompt(session: &ManagedSession, text: String) -> io::Result<String> {
+pub(crate) async fn prompt(
+    session: &ManagedSession,
+    text: String,
+    limit: Duration,
+) -> io::Result<String> {
     let mut events = session.subscribe();
     let mut reply = ReplyBuffer::default();
-    let run = session.prompt(text, TURN_LIMIT);
+    let run = session.prompt(text, limit);
     tokio::pin!(run);
     loop {
         tokio::select! {
