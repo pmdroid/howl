@@ -24,12 +24,12 @@ use crate::{
         Payload, Receipt, Stream,
     },
     discovery::{self, HINT_LEN, RouteHint},
+    enrollment::{ChannelPermission, profile::Profile},
     identity::{LocalIdentity, PeerCertificate, PeerTrust, StateDirectory},
     local_control::{self, ControlServer},
     transport::{EndpointAddr, Network, ReceivedFrame, RelayUrl, Transport},
 };
 
-const EPOCH: u64 = 1;
 pub const CHAT_LIMIT: usize = 65_532;
 pub const WAKE_LIMIT: usize = CHAT_LIMIT - 32;
 const CONTROL_WORKERS: usize = 16;
@@ -38,7 +38,7 @@ const DELIVERY_KEY: &str = "delivery.key";
 const DELIVERY_DB: &str = "delivery.db";
 
 pub async fn run(state: &Path, listen: &str, relay: Option<&str>) -> io::Result<()> {
-    let identity = LocalIdentity::load_or_create(state)?;
+    let identity = Arc::new(LocalIdentity::load_or_create(state)?);
     let local = identity.certificate();
     let directory = StateDirectory::open(state)?;
     let control = ControlServer::bind(state)?;
@@ -109,11 +109,18 @@ pub async fn run(state: &Path, listen: &str, relay: Option<&str>) -> io::Result<
                 let slots = DELIVERY_WORKERS - deliveries.len();
                 let attempts = delivery.claim_due(None, unix_time()?, slots).map_err(io::Error::other)?;
                 for attempt in attempts {
-                    match target_address(state, &delivery, relay.as_ref(), &attempt) {
+                    match target_address(state, &identity, &delivery, relay.as_ref(), &attempt) {
                         Ok(destination) => {
                             let transport = Arc::clone(&transport);
+                            let identity = Arc::clone(&identity);
+                            let state = state.to_owned();
                             deliveries.spawn(async move {
-                                transport.send(&attempt.recipient.device, destination, &attempt.frame).await
+                                transport.send_authorized(
+                                    &attempt.recipient.device,
+                                    destination,
+                                    &attempt.frame,
+                                    || check_outbound(&state, &identity, &attempt),
+                                ).await
                             });
                         }
                         Err(error) => eprintln!("Delivery queued for retry. {error}"),
@@ -245,12 +252,7 @@ pub async fn stop(state: &Path) -> io::Result<()> {
 
 pub fn read(state: &Path, id: Id) -> io::Result<()> {
     let identity = LocalIdentity::load_or_create(state)?;
-    Channel::load(state, &identity, &id)?;
-    let delivery = open_delivery(
-        state,
-        &StateDirectory::open(state)?,
-        &identity.certificate(),
-    )?;
+    let (delivery, _) = history_delivery(state, &identity, id)?;
     for item in delivery
         .channel_history(id, 100)
         .map_err(io::Error::other)?
@@ -281,11 +283,9 @@ pub fn read(state: &Path, id: Id) -> io::Result<()> {
 
 pub fn status(state: &Path, channel: Id, message: Id) -> io::Result<()> {
     let identity = LocalIdentity::load_or_create(state)?;
-    Channel::load(state, &identity, &channel)?;
-    let local = identity.certificate();
-    let delivery = open_delivery(state, &StateDirectory::open(state)?, &local)?;
+    let (delivery, stream) = history_delivery(state, &identity, channel)?;
     let results = delivery
-        .delivery_status(local_stream(channel, &local), message)
+        .delivery_status(stream, message)
         .map_err(io::Error::other)?;
     if results.is_empty() {
         return Err(io::Error::new(
@@ -410,15 +410,20 @@ fn enable_grant(
             .map_err(|_| invalid("invalid wake grant generation"))?,
     );
     let roster = Channel::load(state, identity, &channel)?;
-    let sender = channel_peer(&roster, &identity.certificate(), peer)?;
+    let sender = channel_peer(
+        &roster,
+        &identity.certificate(),
+        peer,
+        ChannelPermission::Wake,
+    )?;
     delivery
-        .set_epoch(channel, EPOCH)
+        .set_epoch(channel, roster.epoch())
         .map_err(io::Error::other)?;
     delivery
         .establish_wake_time(unix_time()?)
         .map_err(io::Error::other)?;
     delivery
-        .enable_network_wake_target(channel, device(sender), *target, generation)
+        .enable_network_wake_target(channel, device_for(state, sender)?, *target, generation)
         .map_err(io::Error::other)?;
     Ok("granted".to_owned())
 }
@@ -469,10 +474,19 @@ fn queue_frame(
     } = destination;
     let roster = Channel::load(state, identity, &channel)?;
     let local = identity.certificate();
-    let target = channel_peer(&roster, &local, &peer)?;
-    let stream = local_stream(channel, &local);
+    let permission = match &body {
+        Body::Wake { .. } => ChannelPermission::Wake,
+        Body::Chat(_) | Body::AgentReply(_) => ChannelPermission::Send,
+    };
+    if !roster.allows(local.device_id(), permission) {
+        return Err(forbidden(
+            "local device lacks the required signed channel permission",
+        ));
+    }
+    let target = channel_peer(&roster, &local, &peer, ChannelPermission::Receive)?;
+    let stream = local_stream(state, channel, &local)?;
     delivery
-        .set_epoch(channel, EPOCH)
+        .set_epoch(channel, roster.epoch())
         .map_err(io::Error::other)?;
     let sequence = delivery
         .reserve_sequence(stream)
@@ -499,15 +513,15 @@ fn queue_frame(
     let sealed = howl_envelope::seal(
         Routing {
             channel,
-            sender: address(&local),
-            epoch: EPOCH,
+            sender: address(stream.sender),
+            epoch: roster.epoch(),
             sequence,
             created_at: now,
             expires_at,
         },
         body,
         &signer,
-        &[recipient(target)],
+        &[recipient(device_for(state, target)?, target)],
     )
     .map_err(io::Error::other)?;
     let metadata = howl_envelope::inspect_unverified(&sealed).map_err(io::Error::other)?;
@@ -517,12 +531,12 @@ fn queue_frame(
         Some(approved) => delivery.enqueue_agent_reply(
             outbound,
             &sealed,
-            device(target),
+            device_for(state, target)?,
             &route,
             unix_time,
             approved,
         ),
-        None => delivery.enqueue_routed(outbound, &sealed, device(target), &route, now),
+        None => delivery.enqueue_routed(outbound, &sealed, device_for(state, target)?, &route, now),
     }
     .map_err(io::Error::other)?;
     Ok(format!("queued {}", hex::encode(metadata.message_id)))
@@ -532,12 +546,13 @@ fn channel_peer<'a>(
     roster: &'a Channel,
     local: &PeerCertificate,
     id: &Id,
+    permission: ChannelPermission,
 ) -> io::Result<&'a PeerCertificate> {
     roster
         .members()
         .iter()
         .find(|member| member.device_id() == id)
-        .filter(|member| member.device_id() != local.device_id())
+        .filter(|member| member.device_id() != local.device_id() && roster.allows(id, permission))
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -548,12 +563,14 @@ fn channel_peer<'a>(
 
 fn target_address(
     state: &Path,
+    identity: &LocalIdentity,
     delivery: &DeliveryStore,
     relay: Option<&RelayUrl>,
     attempt: &crate::delivery::Attempt,
 ) -> io::Result<EndpointAddr> {
+    check_outbound(state, identity, attempt)?;
     let peer = PeerTrust::open(state)?.pinned(&attempt.recipient.device)?;
-    if device(&peer) != attempt.recipient {
+    if device_for(state, &peer)? != attempt.recipient {
         return Err(invalid(
             "stored peer route does not match the pinned device",
         ));
@@ -579,6 +596,29 @@ fn target_address(
         destination = destination.with_relay_url(url.clone());
     }
     Ok(destination)
+}
+
+fn check_outbound(
+    state: &Path,
+    identity: &LocalIdentity,
+    attempt: &crate::delivery::Attempt,
+) -> io::Result<()> {
+    let metadata = howl_envelope::inspect_unverified(&attempt.frame).map_err(io::Error::other)?;
+    let roster = Channel::load(state, identity, &metadata.routing.channel)?;
+    let permission = if metadata.intent == Intent::Wake {
+        ChannelPermission::Wake
+    } else {
+        ChannelPermission::Send
+    };
+    if roster.epoch() != metadata.routing.epoch
+        || !roster.allows(identity.certificate().device_id(), permission)
+        || !roster.allows(&attempt.recipient.device, ChannelPermission::Receive)
+    {
+        return Err(forbidden(
+            "outbox frame no longer has current signed channel authority",
+        ));
+    }
+    Ok(())
 }
 
 fn cached_address(
@@ -610,7 +650,7 @@ fn accept(
         let ack = Acknowledgment::from_bytes(bytes);
         let key = VerifyingKey::from_bytes(&peer.signing_public()).map_err(io::Error::other)?;
         delivery
-            .apply_ack(&ack, device(peer), &key)
+            .apply_ack(&ack, device_for(state, peer)?, &key)
             .map_err(io::Error::other)?;
         return Ok(None);
     }
@@ -654,25 +694,37 @@ pub(crate) fn accept_envelope(
     };
     let mailbox = matches!(source, EnvelopeSource::Mailbox);
     let roster = Channel::load(state, identity, &unverified.routing.channel)?;
-    if !roster
-        .members()
-        .iter()
-        .any(|member| member.device_id() == peer.device_id())
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "sender is outside the channel",
+    let wake = unverified.intent == Intent::Wake;
+    let permission = if wake {
+        ChannelPermission::Wake
+    } else {
+        ChannelPermission::Send
+    };
+    if !roster.allows(peer.device_id(), permission) {
+        return Err(forbidden(
+            "sender lacks the required signed channel permission",
         ));
     }
-    let allowed: Vec<_> = roster.members().iter().map(recipient).collect();
+    if !roster.allows(local.device_id(), ChannelPermission::Receive) {
+        return Err(forbidden(
+            "local device lacks the signed channel receive permission",
+        ));
+    }
+    let account = Profile::account(state)?;
+    let allowed = roster
+        .members()
+        .iter()
+        .filter(|member| roster.allows(member.device_id(), ChannelPermission::Receive))
+        .map(|member| recipient(device_with_account(member, account), member))
+        .collect::<Vec<_>>();
     let key = zeroize::Zeroizing::new(identity.encryption_key().to_bytes());
-    let secret = RecipientSecret::from_bytes(address(&local), &key).map_err(io::Error::other)?;
+    let secret = RecipientSecret::from_bytes(address(device_with_account(&local, account)), &key)
+        .map_err(io::Error::other)?;
     let now = unix_time()?;
-    let wake = unverified.intent == Intent::Wake;
     if wake && !mailbox {
         delivery.observe_wake_time(now).map_err(io::Error::other)?;
         if !delivery
-            .wake_sender_authorized(*roster.id(), device(peer))
+            .wake_sender_authorized(*roster.id(), device_with_account(peer, account))
             .map_err(io::Error::other)?
         {
             return Err(io::Error::new(
@@ -683,10 +735,10 @@ pub(crate) fn accept_envelope(
     }
     let policy = ReceivePolicy {
         channel: *roster.id(),
-        epoch: EPOCH,
+        epoch: roster.epoch(),
         now,
         sender: AuthorizedSender {
-            address: address(peer),
+            address: address(device_with_account(peer, account)),
             signing_key: peer.signing_public(),
             chat: true,
             wake,
@@ -700,7 +752,7 @@ pub(crate) fn accept_envelope(
     }
     .map_err(io::Error::other)?;
     delivery
-        .set_epoch(*roster.id(), EPOCH)
+        .set_epoch(*roster.id(), roster.epoch())
         .map_err(io::Error::other)?;
     let metadata = frame(opened.metadata);
     let payload = match &opened.body {
@@ -727,44 +779,88 @@ pub(crate) fn accept_envelope(
     .map_err(io::Error::other)
 }
 
+pub(crate) fn history_delivery(
+    state: &Path,
+    identity: &LocalIdentity,
+    channel: Id,
+) -> io::Result<(DeliveryStore, Stream)> {
+    let local = identity.certificate();
+    let directory = StateDirectory::open(state)?;
+    if Channel::history_is_enrolled(state, identity, &channel)? {
+        let delivery = open_delivery(state, &directory, &local)?;
+        return Ok((delivery, local_stream(state, channel, &local)?));
+    }
+    let key = directory.key(DELIVERY_KEY)?;
+    let device = device_with_account(&local, None);
+    let delivery =
+        DeliveryStore::open(&state.join(DELIVERY_DB), &key, device).map_err(io::Error::other)?;
+    Ok((delivery, stream_from_device(channel, &local, device)))
+}
+
 pub(crate) fn open_delivery(
     state: &Path,
     directory: &StateDirectory,
     local: &PeerCertificate,
 ) -> io::Result<DeliveryStore> {
+    let account = Profile::account(state)?;
     let key = directory.key(DELIVERY_KEY)?;
-    DeliveryStore::open(&state.join(DELIVERY_DB), &key, device(local)).map_err(io::Error::other)
+    let database = if account.is_some() {
+        "delivery-enrolled.db"
+    } else {
+        DELIVERY_DB
+    };
+    DeliveryStore::open(
+        &state.join(database),
+        &key,
+        device_with_account(local, account),
+    )
+    .map_err(io::Error::other)
 }
 
-fn address(cert: &PeerCertificate) -> DeviceAddress {
+fn address(device: Device) -> DeviceAddress {
     DeviceAddress {
-        account: cert.manual_account_id(),
+        account: device.account,
+        device: device.device,
+    }
+}
+
+pub(crate) fn device_for(state: &Path, cert: &PeerCertificate) -> io::Result<Device> {
+    Ok(device_with_account(cert, Profile::account(state)?))
+}
+
+fn device_with_account(cert: &PeerCertificate, account: Option<Id>) -> Device {
+    Device {
+        account: account.unwrap_or_else(|| cert.manual_account_id()),
         device: *cert.device_id(),
     }
 }
 
-pub(crate) fn device(cert: &PeerCertificate) -> Device {
-    let address = address(cert);
-    Device {
-        account: address.account,
-        device: address.device,
-    }
-}
-
-fn recipient(cert: &PeerCertificate) -> Recipient {
+fn recipient(device: Device, cert: &PeerCertificate) -> Recipient {
     Recipient {
-        address: address(cert),
+        address: address(device),
         encryption_key: cert.encryption_public(),
     }
 }
 
-pub(crate) fn local_stream(channel: Id, certificate: &PeerCertificate) -> Stream {
+pub(crate) fn local_stream(
+    state: &Path,
+    channel: Id,
+    certificate: &PeerCertificate,
+) -> io::Result<Stream> {
+    Ok(stream_from_device(
+        channel,
+        certificate,
+        device_for(state, certificate)?,
+    ))
+}
+
+fn stream_from_device(channel: Id, certificate: &PeerCertificate, device: Device) -> Stream {
     let mut hash = Sha256::new();
     hash.update(b"howl/key/v1/device-signing\0");
     hash.update(certificate.signing_public());
     Stream {
         channel,
-        sender: device(certificate),
+        sender: device,
         signing_key: hash.finalize().into(),
     }
 }
@@ -808,6 +904,10 @@ pub(crate) fn unix_time() -> io::Result<u64> {
         .duration_since(UNIX_EPOCH)
         .map(|time| time.as_secs())
         .map_err(io::Error::other)
+}
+
+fn forbidden(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::PermissionDenied, message)
 }
 
 fn invalid(message: &'static str) -> io::Error {

@@ -1,3 +1,5 @@
+pub mod cli;
+
 mod authority;
 mod store;
 
@@ -5,8 +7,10 @@ pub use authority::{Authority, AuthorityHead, AuthorityRecord, Id, Import};
 pub use store::AuthorityStore;
 mod membership;
 mod pairing;
+pub(crate) mod profile;
 mod recovery;
-mod roster;
+pub(crate) mod roster;
+pub mod roster_cli;
 mod roster_store;
 
 pub use membership::{Designation, DeviceCertificate, Floor, revoke, verify_revocation};
