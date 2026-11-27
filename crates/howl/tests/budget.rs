@@ -463,9 +463,17 @@ fn exact_wake_approval_and_budget_admission_commit_together() {
         store.wake_state(second.execution).unwrap(),
         Some(WakeState::Claimed)
     );
+    assert!(!store.finish_wake(first.execution).unwrap());
+    assert!(!store.mark_wake_uncertain(first.execution).unwrap());
+    assert_eq!(
+        store.wake_state(first.execution).unwrap(),
+        Some(WakeState::Running)
+    );
     let mut budget = store
         .conversation_budget(policy, human().verifying_key())
         .unwrap();
+    assert!(!budget.finish_turn(started.turn.id).unwrap());
+    budget.may_run(started.turn.id, 12).unwrap();
     assert!(matches!(
         budget.start_approved_wake(approval, &signature, || Ok(12), authorized),
         Err(WakeTurnError::Unavailable),
@@ -581,4 +589,72 @@ fn wake_admission_rechecks_fresh_time_grant_and_root_pause() {
         store.wake_state(denied.execution).unwrap(),
         Some(WakeState::Cancelled)
     );
+}
+
+#[test]
+fn either_recovery_entry_point_marks_linked_and_standalone_work_uncertain() {
+    for recover_wakes_first in [true, false] {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("approved-wakes");
+        let mut store = open_wake_store(&path);
+        let linked = accept_and_claim_wake(&mut store, 1, 10);
+        let standalone = accept_and_claim_wake(&mut store, 2, 10);
+        store
+            .start_wake(standalone.execution, || Ok(10), |_| true)
+            .unwrap()
+            .unwrap();
+
+        let mut budget = store
+            .conversation_budget(limits(), human().verifying_key())
+            .unwrap();
+        let independent_turn = begin(&mut budget, 1, B, 10);
+        let approval = approve(&linked, 2);
+        let signature = human().sign(&approval.signing_bytes(LOCAL)).to_bytes();
+        let turn = budget
+            .start_approved_wake(approval, &signature, || Ok(10), authorized)
+            .unwrap()
+            .turn;
+        drop(store);
+
+        let mut reopened = DeliveryStore::open(&path, &STORE_KEY, LOCAL).unwrap();
+        if recover_wakes_first {
+            assert_eq!(reopened.recover_wakes().unwrap(), 2);
+            let mut budget = reopened
+                .conversation_budget(limits(), human().verifying_key())
+                .unwrap();
+            assert!(matches!(
+                budget.may_run(turn.id, 11),
+                Err(BudgetError::Cause)
+            ));
+            budget.may_run(independent_turn.id, 11).unwrap();
+            assert_eq!(budget.recover_turns().unwrap(), 1);
+        } else {
+            let mut budget = reopened
+                .conversation_budget(limits(), human().verifying_key())
+                .unwrap();
+            assert_eq!(budget.recover_turns().unwrap(), 2);
+            assert!(matches!(
+                budget.may_run(turn.id, 11),
+                Err(BudgetError::Cause)
+            ));
+            assert_eq!(
+                reopened.wake_state(linked.execution).unwrap(),
+                Some(WakeState::Uncertain)
+            );
+            assert_eq!(
+                reopened.wake_state(standalone.execution).unwrap(),
+                Some(WakeState::Running)
+            );
+            assert_eq!(reopened.recover_wakes().unwrap(), 1);
+        }
+        assert_eq!(
+            reopened.wake_state(linked.execution).unwrap(),
+            Some(WakeState::Uncertain)
+        );
+        assert_eq!(
+            reopened.wake_state(standalone.execution).unwrap(),
+            Some(WakeState::Uncertain)
+        );
+        assert_eq!(reopened.recover_wakes().unwrap(), 0);
+    }
 }

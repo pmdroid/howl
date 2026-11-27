@@ -6,7 +6,7 @@ use std::io;
 use ed25519_dalek::{Signature, VerifyingKey};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
-use super::{DeliveryStore, Device, Id};
+use super::{DeliveryStore, Device, Id, wake::recover_linked_wakes};
 
 type Result<T> = std::result::Result<T, BudgetError>;
 
@@ -244,16 +244,19 @@ impl ConversationBudget<'_> {
 
     pub fn finish_turn(&self, turn: Id) -> Result<bool> {
         let changed = self.connection.execute(
-            "UPDATE budget_turns SET state = 0 WHERE id = ?1 AND state = 1",
+            "UPDATE budget_turns SET state = 0 WHERE id = ?1 AND state = 1
+             AND NOT EXISTS (SELECT 1 FROM budget_wakes WHERE turn = ?1)",
             [turn],
         )?;
         Ok(changed == 1)
     }
 
     pub fn recover_turns(&self) -> Result<usize> {
-        Ok(self
-            .connection
-            .execute("UPDATE budget_turns SET state = 2 WHERE state = 1", [])?)
+        let tx = Transaction::new_unchecked(self.connection, TransactionBehavior::Immediate)?;
+        let (_, linked) = recover_linked_wakes(&tx)?;
+        let standalone = tx.execute("UPDATE budget_turns SET state = 2 WHERE state = 1", [])?;
+        tx.commit()?;
+        Ok(linked + standalone)
     }
 
     fn decision(&mut self, now: u64) -> Result<Transaction<'_>> {

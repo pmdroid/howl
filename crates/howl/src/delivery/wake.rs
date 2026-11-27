@@ -92,9 +92,10 @@ impl DeliveryStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute("UPDATE wake_targets SET status = 2 WHERE status = 1", [])?;
         tx.execute("UPDATE wake_queue SET state = 4 WHERE state = 1", [])?;
-        let uncertain = tx.execute("UPDATE wake_queue SET state = 5 WHERE state = 2", [])?;
+        let (linked, _) = recover_linked_wakes(&tx)?;
+        let standalone = tx.execute("UPDATE wake_queue SET state = 5 WHERE state = 2", [])?;
         tx.commit()?;
-        Ok(uncertain)
+        Ok(linked + standalone)
     }
 
     pub fn claim_wake(&mut self, channel: Id, target: Id, now: u64) -> Result<Option<WakeClaim>> {
@@ -166,7 +167,8 @@ impl DeliveryStore {
 
     pub fn finish_wake(&self, execution: Id) -> Result<bool> {
         let changed = self.connection.execute(
-            "UPDATE wake_queue SET state = 3 WHERE execution = ?1 AND state = 2",
+            "UPDATE wake_queue SET state = 3 WHERE execution = ?1 AND state = 2
+             AND NOT EXISTS (SELECT 1 FROM budget_wakes WHERE execution = ?1)",
             [execution],
         )?;
         Ok(changed == 1)
@@ -183,7 +185,8 @@ impl DeliveryStore {
 
     pub fn mark_wake_uncertain(&self, execution: Id) -> Result<bool> {
         let changed = self.connection.execute(
-            "UPDATE wake_queue SET state = 5 WHERE execution = ?1 AND state = 2",
+            "UPDATE wake_queue SET state = 5 WHERE execution = ?1 AND state = 2
+             AND NOT EXISTS (SELECT 1 FROM budget_wakes WHERE execution = ?1)",
             [execution],
         )?;
         Ok(changed == 1)
@@ -207,6 +210,20 @@ impl DeliveryStore {
             .optional()?;
         Ok(state)
     }
+}
+
+pub(super) fn recover_linked_wakes(connection: &Connection) -> rusqlite::Result<(usize, usize)> {
+    let wakes = connection.execute(
+        "UPDATE wake_queue SET state = 5 WHERE state = 2
+         AND execution IN (SELECT execution FROM budget_wakes)",
+        [],
+    )?;
+    let turns = connection.execute(
+        "UPDATE budget_turns SET state = 2 WHERE state = 1
+         AND id IN (SELECT turn FROM budget_wakes)",
+        [],
+    )?;
+    Ok((wakes, turns))
 }
 
 pub(super) fn claimed_job(
