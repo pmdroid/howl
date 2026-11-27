@@ -400,13 +400,16 @@ impl ObserverProcess {
     }
 
     pub fn start_broker(&self, executable: &Path, args: &[&str]) -> Result<Child> {
+        Ok(self.broker_command(executable, args)?.spawn()?)
+    }
+
+    pub(crate) fn broker_command(&self, executable: &Path, args: &[&str]) -> Result<Command> {
         if !executable.is_absolute() {
             return Err(Error::InvalidExecutable);
         }
         let container = self.container.as_ref().ok_or(Error::UnsupportedEngine)?;
-        Ok(container
-            .provider
-            .command()
+        let mut command = container.provider.command();
+        command
             .args([
                 "exec",
                 "--interactive",
@@ -418,8 +421,8 @@ impl ObserverProcess {
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?)
+            .stderr(Stdio::piped());
+        Ok(command)
     }
 
     pub fn wait(&mut self) -> io::Result<ExitStatus> {
