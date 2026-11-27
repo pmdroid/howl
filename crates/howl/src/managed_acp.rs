@@ -7,7 +7,7 @@ mod v2;
 
 pub use chatgpt::ChatGptPlanAuth;
 use host::HostAgent;
-pub use host::{HostClaude, HostCodex, HostGrok};
+pub use host::{HostClaude, HostCodex, HostGrok, HostOpenCode};
 use repository::RepositoryEndpoint;
 use repository_http::RepositoryHttp;
 
@@ -151,6 +151,14 @@ impl Harness {
 
     pub fn host_codex(repository_image: String, codex: HostCodex) -> Self {
         Self::host_agent("codex-host", repository_image, HostAgent::Codex(codex))
+    }
+
+    pub fn host_opencode(repository_image: String, opencode: HostOpenCode) -> Self {
+        Self::host_agent(
+            "opencode-host",
+            repository_image,
+            HostAgent::OpenCode(opencode),
+        )
     }
 
     fn host_agent(name: &str, repository_image: String, host: HostAgent) -> Self {
