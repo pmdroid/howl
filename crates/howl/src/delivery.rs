@@ -1,4 +1,5 @@
 mod budget;
+mod mailbox_outbox;
 mod messages;
 #[cfg(test)]
 mod reply_tests;
@@ -7,6 +8,7 @@ pub use budget::{
     ApprovedWake, BudgetError, BudgetLimit, BudgetLimits, ConversationBudget, HumanAction,
     HumanCommand, Turn, WakeApproval, WakeOutcome, WakeTurnError,
 };
+pub(crate) use mailbox_outbox::MAILBOX_OUTBOX_BATCH;
 pub use messages::ChannelMessage;
 pub use wake::{WakeClaim, WakeJob, WakeState};
 

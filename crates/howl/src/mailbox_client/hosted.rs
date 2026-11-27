@@ -1,12 +1,16 @@
 use std::{io, path::Path};
 
-use howl_envelope::DeviceAddress;
+use howl_envelope::{DeviceAddress, Intent, inspect_unverified};
 use reqwest::StatusCode;
 use serde::Deserialize;
 
 use crate::{
+    channel::Channel,
     control_client::{ControlClient, read_response},
-    delivery::Id,
+    delivery::{Device, Id, MAILBOX_OUTBOX_BATCH},
+    enrollment::{ChannelPermission, profile::Profile},
+    identity::{LocalIdentity, StateDirectory},
+    node,
     transport::MAX_FRAME_BYTES,
 };
 
@@ -21,6 +25,106 @@ pub struct PullReport {
     pub stored: usize,
     pub acknowledged: usize,
     pub unacknowledged: usize,
+}
+
+#[derive(Default)]
+pub struct DepositReport {
+    pub stored: usize,
+    pub already_stored: usize,
+    pub skipped: usize,
+    pub next: Option<i64>,
+}
+
+pub async fn deposit(state: &Path, recipient: Id, mut after: i64) -> io::Result<DepositReport> {
+    if after < 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid mailbox cursor",
+        ));
+    }
+    let account = Profile::account(state)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "hosted mailbox requires an enrolled device",
+        )
+    })?;
+    let control = ControlClient::open(state).await?;
+    let identity = control.identity();
+    let local = identity.certificate();
+    let sender = Device {
+        account,
+        device: *local.device_id(),
+    };
+    if recipient == sender.device {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "mailbox recipient is the local device",
+        ));
+    }
+    let delivery = node::open_delivery(state, &StateDirectory::open(state)?, &local)?;
+    let recipient = Device {
+        account,
+        device: recipient,
+    };
+    let mut report = DepositReport::default();
+    for _ in 0..MAX_PAGES {
+        let page = delivery
+            .mailbox_outbox(recipient, after, node::unix_time()?)
+            .map_err(io::Error::other)?;
+        let more = page.len() > MAILBOX_OUTBOX_BATCH;
+        for item in page.into_iter().take(MAILBOX_OUTBOX_BATCH) {
+            after = item.cursor;
+            if !may_deposit(state, identity, sender, recipient, &item.frame)? {
+                report.skipped += 1;
+                continue;
+            }
+            let request = serde_json::json!({
+                "recipient": hex::encode(recipient.device),
+                "ciphertext": hex::encode(item.frame),
+            })
+            .to_string();
+            let response = control
+                .post_json("/v1/mailbox/deposit", "mailbox-deposit", request.as_bytes())
+                .await?;
+            match response.status() {
+                StatusCode::CREATED => report.stored += 1,
+                StatusCode::NO_CONTENT => report.already_stored += 1,
+                StatusCode::GONE => report.skipped += 1,
+                _ => return Err(io::Error::other("hosted mailbox deposit failed")),
+            }
+        }
+        if !more {
+            return Ok(report);
+        }
+    }
+    report.next = Some(after);
+    Ok(report)
+}
+
+fn may_deposit(
+    state: &Path,
+    identity: &LocalIdentity,
+    sender: Device,
+    recipient: Device,
+    bytes: &[u8],
+) -> io::Result<bool> {
+    let metadata = inspect_unverified(bytes).map_err(io::Error::other)?;
+    let routing = metadata.routing;
+    if routing.sender.account != sender.account || routing.sender.device != sender.device {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "outbox envelope has an unexpected sender",
+        ));
+    }
+    let roster = Channel::load(state, identity, &routing.channel)?;
+    let permission = if metadata.intent == Intent::Wake {
+        ChannelPermission::Wake
+    } else {
+        ChannelPermission::Send
+    };
+    Ok(roster.epoch() == routing.epoch
+        && roster.allows(&sender.device, permission)
+        && roster.allows(&recipient.device, ChannelPermission::Receive))
 }
 
 #[derive(Deserialize)]

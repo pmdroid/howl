@@ -78,6 +78,14 @@ async fn main() -> ExitCode {
             };
             node::run(Path::new(state), listen, relay).await
         }
+        [group, command, action, state, recipient, cursor @ ..]
+            if group == "mesh"
+                && command == "mailbox"
+                && action == "deposit"
+                && cursor.len() <= 1 =>
+        {
+            mailbox_deposit(state, recipient, cursor.first()).await
+        }
         [group, command, action, state]
             if group == "mesh" && command == "mailbox" && action == "fetch" =>
         {
@@ -185,6 +193,29 @@ async fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+async fn mailbox_deposit(
+    state: &OsStr,
+    recipient: &OsStr,
+    cursor: Option<&OsString>,
+) -> io::Result<()> {
+    let recipient = parse_id(recipient)?;
+    let after = match cursor {
+        Some(cursor) => required_text(cursor)?
+            .parse::<i64>()
+            .map_err(|_| invalid_input("invalid mailbox cursor"))?,
+        None => 0,
+    };
+    let report = mailbox_client::deposit(Path::new(state), recipient, after).await?;
+    println!(
+        "Mailbox deposited {}, previously accepted {}, and skipped {} message(s).",
+        report.stored, report.already_stored, report.skipped,
+    );
+    if let Some(next) = report.next {
+        println!("More retained messages after mailbox cursor {next}.");
+    }
+    Ok(())
 }
 
 async fn workflow_command(args: &[OsString]) -> io::Result<()> {
