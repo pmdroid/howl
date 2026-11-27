@@ -10,6 +10,8 @@ use sha2::{Digest, Sha256};
 use super::{DeliveryStore, Error, Frame, Id, Result};
 
 const MAX_RUN_TIME: i64 = 900;
+const EXPIRE_DUE_RUNS: &str = "UPDATE integration_runs SET state = 2, updated_at = max(updated_at, ?1)
+    WHERE state = 0 AND CASE WHEN run_message IS NULL THEN dispatch_before ELSE finish_before END <= ?1";
 
 #[derive(Clone, Copy)]
 pub(crate) struct NewIntegrationRun<'a> {
@@ -379,11 +381,14 @@ pub(super) fn record_reply(
 
 fn expire(connection: &Connection, owner: &str, id: Id, now: i64) -> Result<()> {
     connection.execute(
-        "UPDATE integration_runs SET state = 2, updated_at = max(updated_at, ?3)
-         WHERE owner = ?1 AND id = ?2 AND state = 0
-           AND CASE WHEN run_message IS NULL THEN dispatch_before ELSE finish_before END <= ?3",
-        params![owner, id, now],
+        &format!("{EXPIRE_DUE_RUNS} AND owner = ?2 AND id = ?3"),
+        params![now, owner, id],
     )?;
+    Ok(())
+}
+
+pub(super) fn expire_due(connection: &Connection, now: i64) -> Result<()> {
+    connection.execute(EXPIRE_DUE_RUNS, [now])?;
     Ok(())
 }
 
