@@ -16,7 +16,7 @@ pub(super) struct RepositoryHttp {
 }
 
 impl RepositoryHttp {
-    pub(super) async fn start(node: &Path, socket: &Path) -> Result<Self> {
+    pub(super) async fn start(node: &Path, socket: &Path, editable: bool) -> Result<Self> {
         let mut random = [0; 32];
         getrandom::fill(&mut random).map_err(io::Error::other)?;
         let token = Zeroizing::new(hex::encode(random));
@@ -24,6 +24,7 @@ impl RepositoryHttp {
             .arg("-e")
             .arg(include_str!("../host_agents/repository-http.cjs"))
             .arg(socket)
+            .arg(if editable { "edit" } else { "read" })
             .env_clear()
             .env("HOWL_REPOSITORY_MCP_TOKEN", &*token)
             .stdin(Stdio::piped())

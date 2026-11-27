@@ -42,7 +42,7 @@ impl HostClaude {
         }
     }
 
-    pub(super) fn start(&self) -> Result<HostProcess> {
+    pub(super) fn start(&self, editable: bool) -> Result<HostProcess> {
         let scratch = tempfile::Builder::new().prefix("howl-host-").tempdir()?;
         let scratch_path = fs::canonicalize(scratch.path())?;
         let cwd = scratch_path.join("workspace");
@@ -59,6 +59,7 @@ impl HostClaude {
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))?;
         launch(&self.adapter, &self.node, scratch, cwd, &home, |command| {
             command
+                .env("HOWL_EDITABLE_WORKSPACE", if editable { "1" } else { "0" })
                 .env("CLAUDE_AGENT_ACP_PROTOCOL", "v1")
                 .env("CLAUDE_CODE_EXECUTABLE", executable)
                 .env("HOWL_CLAUDE_NODE", &self.node)
@@ -99,7 +100,7 @@ impl HostGrok {
         }
     }
 
-    fn start(&self) -> Result<HostProcess> {
+    fn start(&self, editable: bool) -> Result<HostProcess> {
         let scratch = tempfile::Builder::new().prefix("howl-host-").tempdir()?;
         let scratch_path = fs::canonicalize(scratch.path())?;
         let cwd = scratch_path.join("workspace");
@@ -111,6 +112,7 @@ impl HostGrok {
         launch(&self.node, &self.node, scratch, cwd, &home, |command| {
             command
                 .arg(wrapper)
+                .env("HOWL_EDITABLE_WORKSPACE", if editable { "1" } else { "0" })
                 .env("HOWL_GROK_EXECUTABLE", &self.grok)
                 .env("HOWL_GROK_AUTH_PATH", &self.auth);
         })
@@ -160,7 +162,7 @@ impl HostCodex {
         }
     }
 
-    fn start(&self, repository: &RepositoryHttp) -> Result<HostProcess> {
+    fn start(&self, repository: &RepositoryHttp, editable: bool) -> Result<HostProcess> {
         let scratch = tempfile::Builder::new().prefix("howl-host-").tempdir()?;
         let scratch_path = fs::canonicalize(scratch.path())?;
         let cwd = scratch_path.join("workspace");
@@ -172,6 +174,7 @@ impl HostCodex {
         launch(&self.node, &self.node, scratch, cwd, &home, |command| {
             command
                 .arg(wrapper)
+                .env("HOWL_EDITABLE_WORKSPACE", if editable { "1" } else { "0" })
                 .env("HOWL_CODEX_EXECUTABLE", &self.codex)
                 .env("HOWL_CODEX_HOME", &self.home)
                 .env("HOWL_REPOSITORY_MCP_URL", repository.url())
@@ -223,7 +226,7 @@ impl HostOpenCode {
         }
     }
 
-    fn start(&self) -> Result<HostProcess> {
+    fn start(&self, editable: bool) -> Result<HostProcess> {
         let scratch = tempfile::Builder::new().prefix("howl-host-").tempdir()?;
         let scratch_path = fs::canonicalize(scratch.path())?;
         let cwd = scratch_path.join("workspace");
@@ -258,11 +261,33 @@ impl HostOpenCode {
                 "action": action, "resource": resource, "effect": effect
             })
         };
-        let permissions = [
-            rule("*", "*", "deny"),
-            rule("howl_repository_read_file", "*", "allow"),
-            rule("howl_repository_list_directory", "*", "allow"),
+        let mut tools = vec![
+            "howl_repository_read_file",
+            "howl_repository_list_directory",
         ];
+        if editable {
+            tools.extend([
+                "howl_repository_write_file",
+                "howl_repository_delete_file",
+                "howl_repository_run_tests",
+            ]);
+        }
+        let mut permissions = vec![rule("*", "*", "deny")];
+        permissions.extend(tools.iter().map(|name| rule(name, "*", "allow")));
+        let mut policies = vec![
+            rule("provider.use", "*", "deny"),
+            rule("provider.use", "opencode-go", "allow"),
+            rule("mcp.use", "*", "deny"),
+            rule("mcp.use", "howl_repository", "allow"),
+            rule("plugin.use", "*", "deny"),
+            rule("skill.use", "*", "deny"),
+            rule("websearch.use", "*", "deny"),
+            rule("tool.use", "*", "deny"),
+        ];
+        policies.extend(tools.iter().map(|name| {
+            let resource = format!("{name}:*");
+            serde_json::json!({"action":"tool.use","resource":resource,"effect":"allow"})
+        }));
         let config = serde_json::json!({
             "model": model,
             "small_model": model,
@@ -278,18 +303,7 @@ impl HostOpenCode {
                 }
             },
             "permissions": permissions,
-            "policies": [
-                rule("provider.use", "*", "deny"),
-                rule("provider.use", "opencode-go", "allow"),
-                rule("mcp.use", "*", "deny"),
-                rule("mcp.use", "howl_repository", "allow"),
-                rule("plugin.use", "*", "deny"),
-                rule("skill.use", "*", "deny"),
-                rule("websearch.use", "*", "deny"),
-                rule("tool.use", "*", "deny"),
-                rule("tool.use", "howl_repository_read_file:*", "allow"),
-                rule("tool.use", "howl_repository_list_directory:*", "allow"),
-            ]
+            "policies": policies
         });
         launch(&self.opencode, &self.node, scratch, cwd, &home, |command| {
             configure(command);
@@ -330,12 +344,16 @@ impl HostAgent {
         matches!(self, Self::Codex(_))
     }
 
-    pub(super) fn start(self, repository: Option<&RepositoryHttp>) -> Result<HostProcess> {
+    pub(super) fn start(
+        self,
+        repository: Option<&RepositoryHttp>,
+        editable: bool,
+    ) -> Result<HostProcess> {
         match self {
-            Self::Claude(agent) => agent.start(),
-            Self::Grok(agent) => agent.start(),
-            Self::Codex(agent) => agent.start(repository.ok_or(Error::HostAgent)?),
-            Self::OpenCode(agent) => agent.start(),
+            Self::Claude(agent) => agent.start(editable),
+            Self::Grok(agent) => agent.start(editable),
+            Self::Codex(agent) => agent.start(repository.ok_or(Error::HostAgent)?, editable),
+            Self::OpenCode(agent) => agent.start(editable),
         }
     }
 }

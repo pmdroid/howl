@@ -2,8 +2,10 @@ const fs = require("node:fs/promises");
 const { constants } = require("node:fs");
 const path = require("node:path");
 
-const workspace = "/workspace";
-const requestLimit = 16 * 1024;
+const { execFile } = require("node:child_process");
+const editable = process.argv[1] === "edit";
+const workspace = editable ? "/scratch/workspace" : "/workspace";
+const requestLimit = editable ? 128 * 1024 : 16 * 1024;
 const fileLimit = 64 * 1024;
 const entryLimit = 256;
 const protocols = new Set(["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"]);
@@ -33,14 +35,44 @@ const tools = [
   },
 ];
 
-async function resolve(relative, allowRoot) {
+if (editable) {
+  const string = { type: "string" };
+  for (const [name, description, properties] of [
+    ["write_file", "Write a UTF-8 file in the disposable Docker workspace.", { path: string, content: string }],
+    ["delete_file", "Delete a file in the disposable Docker workspace.", { path: string }],
+    ["run_tests", "Run a test command in the Docker workspace. Pass the executable and each argument separately.", {
+      argv: { type: "array", items: string, minItems: 1, maxItems: 32 },
+    }],
+  ]) {
+    tools.push({
+      name, description,
+      inputSchema: { type: "object", properties, required: Object.keys(properties), additionalProperties: false },
+    });
+  }
+}
+
+async function resolve(relative, allowRoot, create = false) {
   if (relative === "" && allowRoot) return workspace;
   if (typeof relative !== "string" || relative.length > 4096 || relative.includes("\\")
-      || relative.includes("\0") || relative.split("/").some(part => !part || part === "." || part === "..")) {
+      || relative.includes("\0") || relative.split("/").some(part => !part || part === "." || part === ".." || (editable && part.startsWith(".")))) {
     throw new Error("Use a relative path in the approved snapshot.");
   }
   const file = path.join(workspace, relative);
-  if (await fs.realpath(file) !== file) throw new Error("Symbolic links are unavailable.");
+  if (create) {
+    let parent = workspace;
+    for (const part of relative.split("/").slice(0, -1)) {
+      parent = path.join(parent, part);
+      await fs.mkdir(parent).catch(error => { if (error.code !== "EEXIST") throw error; });
+      if (await fs.realpath(parent) !== parent) throw new Error("Symbolic links are unavailable.");
+    }
+    try {
+      if (!(await fs.lstat(file)).isFile()) throw new Error("Expected a regular file.");
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+  } else if (await fs.realpath(file) !== file) {
+    throw new Error("Symbolic links are unavailable.");
+  }
   return file;
 }
 
@@ -85,6 +117,41 @@ function content(text, isError) {
 
 async function callTool(params) {
   const { name, arguments: args } = params ?? {};
+  if (editable && name === "run_tests") {
+    const { argv } = args ?? {};
+    if (!Array.isArray(argv) || argv.length < 1 || argv.length > 32 ||
+        argv.some(arg => typeof arg !== "string" || arg.length > 4096 || arg.includes("\0")) || !argv[0]) {
+      return content("Supply a test executable and its arguments.", true);
+    }
+    const [program, ...arguments_] = argv;
+    return new Promise(resolve => {
+      execFile(program, arguments_, {
+        cwd: workspace, timeout: 30000, killSignal: "SIGKILL", maxBuffer: 16 * 1024,
+      }, (error, stdout, stderr) => {
+        const status = error ? (error.killed ? "Test command exceeded its limit" : "Test command failed: " + error.code) : "Exit 0";
+        resolve(content(status + "\n" + stdout + stderr, Boolean(error)));
+      });
+    });
+  }
+  if (editable && name === "write_file") {
+    try {
+      if (typeof args?.content !== "string" || Buffer.byteLength(args.content) > fileLimit) {
+        return content("Supply UTF-8 text of at most 64 KiB.", true);
+      }
+      const file = await resolve(args.path, false, true);
+      const handle = await fs.open(file, constants.O_WRONLY | constants.O_CREAT | constants.O_NOFOLLOW | constants.O_NONBLOCK, 0o644);
+      try {
+        if (!(await handle.stat()).isFile()) throw new Error("Expected a regular file.");
+        await handle.truncate();
+        await handle.writeFile(args.content);
+      } finally {
+        await handle.close();
+      }
+      return content("File written.", false);
+    } catch {
+      return content("The file could not be written in the Docker workspace.", true);
+    }
+  }
   if (!args || Object.keys(args).length !== 1 || typeof args.path !== "string") {
     return content("Supply one relative repository path.", true);
   }
@@ -92,6 +159,10 @@ async function callTool(params) {
     switch (name) {
       case "read_file":
         return content(await readFile(await resolve(args.path, false)), false);
+      case "delete_file":
+        if (!editable) return content("Unknown repository tool.", true);
+        await fs.unlink(await resolve(args.path, false));
+        return content("File deleted.", false);
       case "list_directory":
         return content(await listDirectory(await resolve(args.path, true)), false);
       default:

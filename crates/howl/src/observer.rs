@@ -105,7 +105,7 @@ impl ObserverProvider {
         executable: &Path,
         args: &[&str],
     ) -> Result<ObserverProcess> {
-        self.launch_isolated(snapshot, image, executable, args, None)
+        self.launch_isolated(snapshot, image, executable, args, None, false)
     }
 
     pub(crate) fn launch_managed(
@@ -115,11 +115,12 @@ impl ObserverProvider {
         executable: &Path,
         args: &[&str],
         session: &str,
+        editable: bool,
     ) -> Result<ObserverProcess> {
         if !digest(session, &[32]) {
             return Err(Error::InvalidSnapshot);
         }
-        self.launch_isolated(snapshot, image, executable, args, Some(session))
+        self.launch_isolated(snapshot, image, executable, args, Some(session), editable)
     }
 
     fn launch_isolated(
@@ -129,6 +130,7 @@ impl ObserverProvider {
         executable: &Path,
         args: &[&str],
         session: Option<&str>,
+        editable: bool,
     ) -> Result<ObserverProcess> {
         if !executable.is_absolute() {
             return Err(Error::InvalidExecutable);
@@ -193,7 +195,11 @@ impl ObserverProvider {
                 "--shm-size=16m",
                 "--ulimit=nofile=256:256",
                 "--stop-timeout=1",
-                "--tmpfs=/scratch:rw,noexec,nosuid,nodev,size=64m,uid=65532,gid=65532,mode=0700",
+                if editable {
+                    "--tmpfs=/scratch:rw,nosuid,nodev,size=256m,uid=65532,gid=65532,mode=0700"
+                } else {
+                    "--tmpfs=/scratch:rw,noexec,nosuid,nodev,size=64m,uid=65532,gid=65532,mode=0700"
+                },
                 "--env=HOME=/scratch",
                 "--env=TMPDIR=/scratch",
                 "--env=XDG_CONFIG_HOME=/scratch/config",
