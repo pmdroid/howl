@@ -346,6 +346,70 @@ impl ManagedSession {
         Self::open(root, provider, snapshot, harness, id, None).await
     }
 
+    pub(crate) async fn guest(
+        root: &Path,
+        snapshot: &Snapshot,
+        link: tokio::net::UnixStream,
+    ) -> Result<Self> {
+        let mut random = [0; 16];
+        getrandom::fill(&mut random).map_err(io::Error::other)?;
+        let journal = Journal::new(
+            root,
+            SessionState {
+                id: hex::encode(random),
+                harness: "microvm".into(),
+                commit: snapshot.commit().into(),
+                snapshot: snapshot.selection(),
+                profile: [0; 32],
+                engine: "qemu".into(),
+                remote_session: None,
+                container: None,
+                capabilities: Capabilities::default(),
+                protocol_version: None,
+                phase: Phase::Starting,
+            },
+        )?;
+        let status = journal.subscribe();
+        let (commands, requests) = mpsc::channel(8);
+        let (events, _) = broadcast::channel(64);
+        let (ready, initialized) = oneshot::channel();
+        let driver = Driver {
+            journal: Arc::new(journal),
+            events: events.clone(),
+            restore: Restore::Fresh,
+            channels: Arc::new(Mutex::new(Some((requests, ready)))),
+            mode: ClientMode::V1,
+            workspace: None,
+            guest: true,
+        };
+        tokio::spawn(async move {
+            let (input, output) = link.into_split();
+            let outgoing = SinkExt::<String>::sink_map_err(
+                FramedWrite::new(output, LinesCodec::new()),
+                io::Error::other,
+            );
+            let incoming = FramedRead::new(input, LinesCodec::new_with_max_length(MAX_ACP_MESSAGE))
+                .map_err(io::Error::other);
+            let result = driver
+                .clone()
+                .connect_to(Lines::new(outgoing, incoming))
+                .await;
+            driver.fail_uninitialized(result.err().map_or(Error::Disconnected, remote_error));
+            if driver.journal.state().phase != Phase::Closed {
+                let _ = driver
+                    .journal
+                    .update(|state| state.phase = Phase::Interrupted);
+            }
+        });
+        initialized.await.map_err(|_| Error::Disconnected)??;
+        Ok(Self {
+            commands,
+            status,
+            events,
+            export: None,
+        })
+    }
+
     pub async fn recover(
         root: &Path,
         provider: &ObserverProvider,
@@ -510,6 +574,7 @@ impl ManagedSession {
             channels: Arc::new(Mutex::new(Some((requests, ready)))),
             mode: ClientMode::V1,
             workspace: host.as_ref().map(|host| host.workspace.clone()),
+            guest: false,
         };
         let export = editable
             .then(|| {
@@ -803,6 +868,7 @@ struct Driver {
     channels: Arc<Mutex<Option<DriverChannels>>>,
     mode: ClientMode,
     workspace: Option<HostWorkspace>,
+    guest: bool,
 }
 
 impl Driver {
@@ -843,6 +909,7 @@ async fn drive_v1(
         channels,
         mode,
         workspace,
+        guest,
     } = driver;
     let notifications = journal.subscribe();
     let permission_state = journal.subscribe();
@@ -886,7 +953,7 @@ async fn drive_v1(
                                 | "mcp__howl_repository__run_tests"
                         )
                     );
-                let (kind, selected) = if repository_read || repository_edit {
+                let (kind, selected) = if guest || repository_read || repository_edit {
                     (
                         PermissionOptionKind::AllowOnce,
                         PermissionDecision::AllowOnce,

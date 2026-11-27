@@ -114,6 +114,18 @@ On the agent's mesh node, create a `conversations.json` file in its state direct
 
 With that node's mesh daemon running, start `howl agent serve "$HOWL_STATE" claude "$HOWL_REPOSITORY_IMAGE"` using the environment for the selected host agent. In the TUI, select the agent as a direct peer and send a message. For MCP, configure a conversation entry with `integration` set to the signed integration ID shown in the gateway's chat events. Send through the `dm` tool and read the same direct conversation. When using direct routing, set `route` to the configured peer address.
 
+### Run an isolated worker
+
+Install an ARM64 QEMU binary with HVF or KVM. Create a mode `600` file named `microvm.json` in the agent's state directory with absolute paths to the QEMU binary, a Linux kernel and a trusted initramfs. Set `memory_mib` and `vcpus` for each worker. To make model calls through Howl's guest provider bridge, add `provider` with the `provider` name (`openai` or `xai`) and `model`, and set the corresponding provider key in the host runner's environment.
+
+The guest init extracts the read-only tar disk at `/dev/vda` into its writable `/workspace`. Identify the serial ports by name in `/sys/class/virtio-ports`. The guest sends `HOWL_ACP_READY` followed by a newline on `howl.acp`, then runs its ACP adapter over that port. At teardown it returns an eight-byte big-endian patch length and the patch bytes on `howl.patch`. Set the length to zero for a worker that produced no patch. For inference, run `crates/howl/src/provider_bridge.cjs` in the guest over `howl.provider`, and configure the guest's agent to use its loopback endpoint.
+
+```sh
+howl worker run "$HOWL_STATE" /path/to/repo main < instruction.txt
+```
+
+Worker patches are saved under `worker-patches` in the node's state directory.
+
 ## Deliver events to a webhook
 
 Give the webhook worker its own protected JSON configuration. Run it with the enrolled node state and pair each endpoint with the channels and event types the receiver has consent to process. Use metadata-only delivery when a receiver only needs to acknowledge or route an event. Set `include_content` to `true` when the receiver needs message content and the participants have authorized its disclosure.

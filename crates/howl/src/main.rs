@@ -40,6 +40,9 @@ async fn main() -> ExitCode {
         [group, action, state, driver, image] if group == "agent" && action == "serve" => {
             serve_agent(Path::new(state), driver, image).await
         }
+        [group, action, state, repo, revision] if group == "worker" && action == "run" => {
+            run_worker(Path::new(state), Path::new(repo), revision).await
+        }
         [group, action, state]
             if (group == "identity" && action == "show")
                 || (group == "mesh" && action == "init") =>
@@ -487,6 +490,17 @@ async fn serve_agent(state: &Path, driver: &OsStr, image: &OsStr) -> io::Result<
         host_harness(&driver, image.clone())
     })
     .await
+}
+
+async fn run_worker(state: &Path, repo: &Path, revision: &OsStr) -> io::Result<()> {
+    let mut instruction = String::new();
+    io::stdin()
+        .take(32 * 1024 + 1)
+        .read_to_string(&mut instruction)?;
+    if instruction.trim().is_empty() || instruction.len() > 32 * 1024 {
+        return Err(invalid_input("enter a worker instruction of up to 32 KiB"));
+    }
+    howl::microvm::run(state, repo, required_text(revision)?, instruction).await
 }
 
 fn host_harness(driver: &str, image: String) -> io::Result<Harness> {

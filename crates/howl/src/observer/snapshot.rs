@@ -153,6 +153,25 @@ impl Snapshot {
     pub fn commit(&self) -> &str {
         &self.commit
     }
+
+    pub(crate) fn archive(&self, destination: &Path) -> io::Result<()> {
+        let output = std::fs::File::create_new(destination)?;
+        let command = Command::new("/usr/bin/tar")
+            .env_clear()
+            .args(["-cf", "-"])
+            .arg("-C")
+            .arg(self.directory.path().join("tree"))
+            .arg(".")
+            .stdout(output)
+            .stderr(Stdio::null())
+            .status()?;
+        if !command.success() {
+            return Err(io::Error::other(
+                "could not archive the repository snapshot",
+            ));
+        }
+        Ok(())
+    }
 }
 
 fn repository_root(path: &Path) -> Result<PathBuf> {

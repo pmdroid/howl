@@ -82,6 +82,16 @@ pub(crate) struct Broker {
 }
 
 impl Broker {
+    pub(crate) async fn serve_guest(self, link: tokio::net::UnixStream) -> io::Result<()> {
+        let (input, output) = link.into_split();
+        let mut requests = FramedRead::new(input, LinesCodec::new_with_max_length(WIRE_BYTES));
+        if !matches!(timeout(Duration::from_secs(60), requests.next()).await, Ok(Some(Ok(line))) if line == "ready")
+        {
+            return Err(io::Error::other("guest provider bridge did not start"));
+        }
+        self.serve(requests, output).await
+    }
+
     pub(crate) fn from_environment(provider: Provider, model: &str) -> Result<Self, Error> {
         let keys = match provider {
             Provider::OpenAi => ["HOWL_OPENAI_API_KEY", "OPENAI_API_KEY"],
