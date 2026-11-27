@@ -23,6 +23,7 @@ const OLD_PROTOCOL: &str = "2025-11-25";
 struct Gateway {
     _temp: tempfile::TempDir,
     configuration: PathBuf,
+    state: PathBuf,
     identity: LocalIdentity,
     delivery: DeliveryStore,
     channel: Id,
@@ -53,10 +54,13 @@ impl Gateway {
         let configuration = temp.path().join("gateway.json");
         write_config(&configuration, &endpoint, channel, true);
         let config = configuration.clone();
-        let server = tokio::spawn(async move { serve_gateway(&state, &config, listener).await });
+        let node_state = state.clone();
+        let server =
+            tokio::spawn(async move { serve_gateway(&node_state, &config, listener).await });
         Self {
             _temp: temp,
             configuration,
+            state,
             identity,
             delivery,
             channel,
@@ -73,7 +77,7 @@ impl Gateway {
         }
     }
 
-    fn commit(&mut self, channel: Id) -> u64 {
+    fn commit(&mut self, channel: Id) -> String {
         self.sequence += 1;
         let now = node::unix_time().unwrap();
         let frame = Frame {
@@ -97,30 +101,57 @@ impl Gateway {
                 self.identity.signing_key(),
             )
             .unwrap();
-        self.delivery
-            .channel_events(channel, 0, 256)
+        hex::encode(frame.message)
+    }
+
+    async fn restart(&mut self) {
+        self.server.abort();
+        let _ = (&mut self.server).await;
+        let address = self
+            .endpoint
+            .strip_prefix("http://")
             .unwrap()
-            .last()
-            .unwrap()
-            .cursor
+            .strip_suffix("/mcp")
+            .unwrap();
+        let listener = TcpListener::bind(address).await.unwrap();
+        let state = self.state.clone();
+        let config = self.configuration.clone();
+        self.server = tokio::spawn(async move { serve_gateway(&state, &config, listener).await });
     }
 
     fn post(&self, body: Value) -> RequestBuilder {
+        self.post_as(body, TOKEN)
+    }
+
+    fn post_as(&self, body: Value, token: &str) -> RequestBuilder {
         self.client
             .post(&self.endpoint)
-            .bearer_auth(TOKEN)
+            .bearer_auth(token)
             .header(header::CONTENT_TYPE, "application/json")
             .header(header::ACCEPT, "application/json, text/event-stream")
             .body(body.to_string())
     }
 
-    fn modern(&self, method: &str, name: Option<&str>, mut params: Value) -> RequestBuilder {
+    fn modern(&self, method: &str, name: Option<&str>, params: Value) -> RequestBuilder {
+        self.modern_as(method, name, params, TOKEN)
+    }
+
+    fn modern_as(
+        &self,
+        method: &str,
+        name: Option<&str>,
+        mut params: Value,
+        token: &str,
+    ) -> RequestBuilder {
         params["_meta"]["io.modelcontextprotocol/protocolVersion"] = json!(NEW_PROTOCOL);
         params["_meta"]["io.modelcontextprotocol/clientInfo"] =
             json!({"name": "subscription-test", "version": "1"});
         params["_meta"]["io.modelcontextprotocol/clientCapabilities"] = json!({});
         let request = self
-            .post(json!({"jsonrpc": "2.0", "id": 7, "method": method, "params": params}))
+            .post_as(
+                json!({"jsonrpc": "2.0", "id": 7, "method": method, "params": params}),
+                token,
+            )
             .header("Mcp-Protocol-Version", NEW_PROTOCOL)
             .header("Mcp-Method", method);
         if let Some(name) = name {
@@ -145,7 +176,23 @@ impl Gateway {
         Sse::new(response)
     }
 
-    async fn read_events(&self, after: u64, limit: usize) -> Value {
+    async fn tool_as(&self, token: &str, name: &str, arguments: Value) -> Value {
+        let response = self
+            .modern_as(
+                "tools/call",
+                Some(name),
+                json!({"name": name, "arguments": arguments}),
+                token,
+            )
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        rpc_message(response).await
+    }
+
+    async fn read_events(&self, after: Value, limit: usize) -> Value {
         let response = self
             .modern(
                 "tools/call",
@@ -221,16 +268,24 @@ fn enrolled(state: &Path) -> LocalIdentity {
 
 fn write_config(path: &Path, endpoint: &str, channel: Id, granted: bool) {
     let grants = if granted {
-        vec![json!({
-            "id": "reader",
-            "token_sha256": hex::encode(Sha256::digest(TOKEN)),
-            "expires_at": node::unix_time().unwrap() + 300,
-            "channels": [hex::encode(channel)],
-            "permissions": ["read"]
-        })]
+        vec![grant("reader", TOKEN, &[channel])]
     } else {
         Vec::new()
     };
+    write_grants(path, endpoint, grants);
+}
+
+fn grant(owner: &str, token: &str, channels: &[Id]) -> Value {
+    json!({
+        "id": owner,
+        "token_sha256": hex::encode(Sha256::digest(token)),
+        "expires_at": node::unix_time().unwrap() + 300,
+        "channels": channels.iter().map(hex::encode).collect::<Vec<_>>(),
+        "permissions": ["read"]
+    })
+}
+
+fn write_grants(path: &Path, endpoint: &str, grants: Vec<Value>) {
     let next = path.with_extension("next");
     std::fs::write(
         &next,
@@ -290,7 +345,15 @@ impl Sse {
 }
 
 async fn rpc_result(response: Response) -> Value {
-    let reply = if response.headers()[header::CONTENT_TYPE]
+    let reply = rpc_message(response).await;
+    reply
+        .get("result")
+        .unwrap_or_else(|| panic!("unexpected MCP response {reply}"))
+        .clone()
+}
+
+async fn rpc_message(response: Response) -> Value {
+    if response.headers()[header::CONTENT_TYPE]
         .to_str()
         .unwrap()
         .starts_with("application/json")
@@ -298,11 +361,7 @@ async fn rpc_result(response: Response) -> Value {
         serde_json::from_str::<Value>(&response.text().await.unwrap()).unwrap()
     } else {
         Sse::new(response).message().await
-    };
-    reply
-        .get("result")
-        .unwrap_or_else(|| panic!("unexpected MCP response {reply}"))
-        .clone()
+    }
 }
 
 #[tokio::test]
@@ -322,7 +381,7 @@ async fn modern_listen_catches_up_after_disconnect_and_stops_on_revocation() {
     assert!(timeout(TICK + TICK, stream.next()).await.is_err());
 
     let mut timings = Vec::new();
-    let mut last = 0;
+    let mut last = String::new();
     for _ in 0..15 {
         let started = Instant::now();
         last = gateway.commit(gateway.channel);
@@ -342,31 +401,39 @@ async fn modern_listen_catches_up_after_disconnect_and_stops_on_revocation() {
     assert!(p95 < Duration::from_secs(1));
 
     drop(stream);
+    let before = gateway.read_events(json!(0), 20).await;
+    assert_eq!(
+        before["events"].as_array().unwrap().last().unwrap()["message"],
+        last
+    );
+    let after = before["cursor"].clone();
     let missed = gateway.commit(gateway.channel);
     let newest = gateway.commit(gateway.channel);
-    let first = gateway.read_events(last, 1).await;
-    assert_eq!(first["cursor"], missed);
+    let first = gateway.read_events(after, 1).await;
+    assert_eq!(first["events"][0]["message"], missed);
+    assert_eq!(first["cursor"], first["events"][0]["cursor"]);
     assert_eq!(first["more"], true);
-    let caught_up = gateway.read_events(missed, 1).await;
-    assert_eq!(caught_up["cursor"], newest);
+    let caught_up = gateway.read_events(first["cursor"].clone(), 1).await;
+    assert_eq!(caught_up["events"][0]["message"], newest);
     assert_eq!(caught_up["more"], false);
-    assert!(
-        gateway.read_events(newest, 1).await["events"]
-            .as_array()
-            .unwrap()
-            .is_empty()
-    );
+    let after = caught_up["cursor"].clone();
+    let empty = gateway.read_events(after.clone(), 1).await;
+    assert!(empty["events"].as_array().unwrap().is_empty());
+    assert_eq!(empty["cursor"], after);
 
-    let lost = gateway.commit(gateway.channel);
+    gateway.commit(gateway.channel);
     let now = node::unix_time().unwrap();
     gateway
         .delivery
         .prune(gateway.channel, now + 1, now)
         .unwrap();
-    let gap = gateway.read_events(newest, 1).await;
-    assert_eq!(gap["cursor"], lost);
+    let gap = gateway.read_events(after.clone(), 1).await;
+    assert_ne!(gap["cursor"], after);
     assert_eq!(gap["gap"], true);
-    assert_eq!(gateway.read_events(lost, 1).await["gap"], false);
+    assert_eq!(
+        gateway.read_events(gap["cursor"].clone(), 1).await["gap"],
+        false
+    );
 
     let mut denied = gateway.modern_listen(gateway.other).await;
     assert_eq!(
@@ -394,9 +461,85 @@ async fn modern_listen_catches_up_after_disconnect_and_stops_on_revocation() {
 }
 
 #[tokio::test]
+async fn cursors_survive_gateway_restart_and_rotation_without_crossing_scope() {
+    const ROTATED: &str = "54f4ef8f3d5973d17dfc1984ce8750d1";
+    const OTHER: &str = "bd53ce1bedfe42a44d32b0e0c10c4417";
+    let mut gateway = Gateway::start().await;
+    let message = gateway.commit(gateway.channel);
+    let initial = gateway
+        .tool_as(
+            TOKEN,
+            "read",
+            json!({"channel": hex::encode(gateway.channel)}),
+        )
+        .await;
+    let initial = &initial["result"]["structuredContent"];
+    let cursor = initial["cursor"].as_str().unwrap().to_owned();
+    assert_eq!(initial["events"][0]["message"], message);
+    assert_eq!(initial["events"][0]["cursor"], cursor);
+
+    write_grants(
+        &gateway.configuration,
+        &gateway.endpoint,
+        vec![
+            grant("reader", ROTATED, &[gateway.channel, gateway.other]),
+            grant("other-reader", OTHER, &[gateway.channel, gateway.other]),
+        ],
+    );
+    gateway.restart().await;
+    let next = gateway.commit(gateway.channel);
+    let resumed = gateway
+        .tool_as(
+            ROTATED,
+            "read_events",
+            json!({"channel": hex::encode(gateway.channel), "after": cursor}),
+        )
+        .await;
+    let resumed = &resumed["result"]["structuredContent"];
+    assert_eq!(resumed["events"][0]["message"], next);
+    let old_char = cursor.as_bytes()[20];
+    let tampered = format!(
+        "{}{}{}",
+        &cursor[..20],
+        if old_char == b'A' { "B" } else { "A" },
+        &cursor[21..]
+    );
+    for (token, args) in [
+        (
+            ROTATED,
+            json!({"channel": hex::encode(gateway.other), "after": cursor}),
+        ),
+        (
+            OTHER,
+            json!({"channel": hex::encode(gateway.channel), "after": cursor}),
+        ),
+        (
+            ROTATED,
+            json!({"channel": hex::encode(gateway.channel), "peer": hex::encode([77u8; 32]), "after": cursor}),
+        ),
+        (
+            ROTATED,
+            json!({"channel": hex::encode(gateway.channel), "after": tampered}),
+        ),
+        (
+            ROTATED,
+            json!({"channel": hex::encode(gateway.channel), "after": 42}),
+        ),
+    ] {
+        let rejected = gateway.tool_as(token, "read_events", args).await;
+        assert_eq!(
+            rejected["error"]["message"], "invalid cursor for this event feed",
+            "{rejected}"
+        );
+        assert!(rejected["error"].get("data").is_none());
+    }
+}
+
+#[tokio::test]
 async fn bounded_wait_emits_request_progress_and_reads_after_the_saved_cursor() {
     let mut gateway = Gateway::start().await;
-    let after = gateway.commit(gateway.channel);
+    gateway.commit(gateway.channel);
+    let after = gateway.read_events(json!(0), 1).await["cursor"].clone();
     let request = gateway.modern(
         "tools/call",
         Some("wait_for_events"),
@@ -418,7 +561,9 @@ async fn bounded_wait_emits_request_progress_and_reads_after_the_saved_cursor() 
     assert_eq!(progress["params"]["message"], "Waiting for channel events");
     let next = gateway.commit(gateway.channel);
     let result = stream.message().await;
-    assert_eq!(result["result"]["structuredContent"]["cursor"], next);
+    let page = &result["result"]["structuredContent"];
+    assert_eq!(page["events"][0]["message"], next);
+    assert_eq!(page["events"][0]["cursor"], page["cursor"]);
     assert_eq!(
         result["result"]["structuredContent"]["events"]
             .as_array()
@@ -488,11 +633,29 @@ async fn legacy_sse_pushes_updates_to_only_subscribed_resources() {
             .unwrap();
         assert!(rpc_result(response).await.is_object());
     }
-    gateway.commit(gateway.channel);
+    let message = gateway.commit(gateway.channel);
     let update = stream.message().await;
     assert_eq!(update["method"], "notifications/resources/updated");
     assert_eq!(update["params"]["uri"], uri);
     assert!(timeout(TICK + TICK, stream.next()).await.is_err());
+    let response = gateway.post(json!({
+        "jsonrpc": "2.0",
+        "id": 10,
+        "method": "tools/call",
+        "params": {"name": "read", "arguments": {"channel": hex::encode(gateway.channel), "after": 0}}
+    }))
+        .header("Mcp-Protocol-Version", OLD_PROTOCOL)
+        .header("Mcp-Session-Id", &session)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let page = rpc_result(response).await["structuredContent"].clone();
+    let cursor = page["cursor"].clone();
+    assert!(cursor.is_string());
+    assert_eq!(page["events"][0]["message"], message);
+    assert_eq!(page["events"][0]["cursor"], cursor);
     let response = gateway
         .legacy_call(&session, uri, "resources/unsubscribe")
         .send()
@@ -501,6 +664,8 @@ async fn legacy_sse_pushes_updates_to_only_subscribed_resources() {
         .error_for_status()
         .unwrap();
     assert!(rpc_result(response).await.is_object());
-    gateway.commit(gateway.channel);
+    let next = gateway.commit(gateway.channel);
     assert!(timeout(TICK + TICK, stream.next()).await.is_err());
+    let replay = gateway.read_events(cursor, 1).await;
+    assert_eq!(replay["events"][0]["message"], next);
 }

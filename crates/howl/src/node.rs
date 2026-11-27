@@ -38,7 +38,7 @@ const INTEGRATION_CHAT_LIMIT: usize = CHAT_LIMIT - 32;
 pub(crate) const INTEGRATION_WAKE_LIMIT: usize = WAKE_LIMIT - 32;
 const CONTROL_WORKERS: usize = 16;
 const DELIVERY_WORKERS: usize = 8;
-const DELIVERY_KEY: &str = "delivery.key";
+pub(crate) const DELIVERY_KEY: &str = "delivery.key";
 const DELIVERY_DB: &str = "delivery.db";
 
 pub async fn run(state: &Path, listen: &str, relay: Option<&str>) -> io::Result<()> {

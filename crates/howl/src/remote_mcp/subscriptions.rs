@@ -24,7 +24,11 @@ use tokio::{
 
 use crate::interaction::LocalInteraction;
 
-use super::{IntegrationPermission, IntegrationPrincipal, authenticated, resources};
+use super::{
+    IntegrationPermission, IntegrationPrincipal, authenticated,
+    cursors::{CursorInput, CursorKey},
+    resources,
+};
 
 const MAX_SUBSCRIPTIONS: usize = 32;
 const MAX_RESOURCES: usize = 8;
@@ -39,7 +43,7 @@ static EVENT_WAITS: Semaphore = Semaphore::const_new(32);
 pub(crate) struct EventQuery {
     pub channel: Id,
     pub peer: Option<Id>,
-    pub after: u64,
+    pub after: Option<CursorInput>,
     pub limit: usize,
     pub wait: Duration,
 }
@@ -220,6 +224,7 @@ impl Subscriptions {
 
 pub(crate) async fn events(
     state: Arc<PathBuf>,
+    cursor_key: &CursorKey,
     context: &RequestContext<RoleServer>,
     query: EventQuery,
 ) -> Result<CallToolResult, ErrorData> {
@@ -227,7 +232,17 @@ pub(crate) async fn events(
     if !principal.permits(&query.channel, IntegrationPermission::Read) {
         return Err(inaccessible());
     }
-    let wait = query.wait.min(MAX_WAIT);
+    require_current(principal).await?;
+    let EventQuery {
+        channel,
+        peer,
+        after: input,
+        limit,
+        wait,
+    } = query;
+    let scope = cursor_key.scoped(principal.id(), channel, peer);
+    let after = scope.decode(input.as_ref())?;
+    let wait = wait.min(MAX_WAIT);
     let _slot = if wait.is_zero() {
         None
     } else {
@@ -239,13 +254,6 @@ pub(crate) async fn events(
     loop {
         require_current(principal).await?;
         let local = Arc::clone(&state);
-        let EventQuery {
-            channel,
-            peer,
-            after,
-            limit,
-            ..
-        } = query;
         let page = tokio::task::spawn_blocking(move || {
             LocalInteraction::new(&local).event_page(
                 channel,
@@ -259,7 +267,11 @@ pub(crate) async fn events(
         .map_err(|_| inaccessible())?;
         require_current(principal).await?;
         if page.gap || !page.events.is_empty() || Instant::now() >= deadline {
-            return Ok(CallToolResult::structured(json!(page)));
+            return Ok(CallToolResult::structured(json!(scope.page(
+                page,
+                input.as_ref(),
+                after
+            )?)));
         }
         if Instant::now() >= progress_at {
             progress(
