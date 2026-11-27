@@ -18,6 +18,8 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
+use crate::discovery::RouteHint;
+
 pub type Id = [u8; 32];
 
 const MAX_FRAME: usize = 77_112;
@@ -113,6 +115,7 @@ enum EnqueueTime<'a> {
 
 enum AdmissionTime<'a> {
     Known(u64),
+    MailboxHistory(u64),
     NetworkWake(&'a dyn Fn() -> io::Result<u64>),
 }
 
@@ -250,6 +253,28 @@ impl DeliveryStore {
         tx.commit()?;
 
         Ok(Self { connection, local })
+    }
+
+    pub(crate) fn import_hint(&self, hint: &RouteHint) -> Result<bool> {
+        let changed = self.connection.execute(
+            "INSERT INTO peer_hints (device, issued, hint) VALUES (?1, ?2, ?3)
+             ON CONFLICT(device) DO UPDATE SET issued = excluded.issued, hint = excluded.hint
+             WHERE peer_hints.issued < excluded.issued OR peer_hints.hint = excluded.hint",
+            params![hint.device(), hint.issued(), hint.as_bytes()],
+        )?;
+        Ok(changed > 0)
+    }
+
+    pub(crate) fn peer_hint(&self, device: &Id) -> Result<Option<RouteHint>> {
+        let bytes = self
+            .connection
+            .query_row(
+                "SELECT hint FROM peer_hints WHERE device = ?1",
+                [device],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(bytes.map(RouteHint::from_bytes))
     }
 
     pub fn presence(&mut self) -> crate::presence::Presence<'_> {
@@ -651,6 +676,23 @@ impl DeliveryStore {
         )
     }
 
+    pub(crate) fn accept_mailbox_history(
+        &mut self,
+        frame: Frame,
+        bytes: &[u8],
+        payload: Payload<'_>,
+        now: u64,
+        local_signer: &SigningKey,
+    ) -> Result<Receipt> {
+        self.accept_payload(
+            frame,
+            bytes,
+            payload,
+            AdmissionTime::MailboxHistory(now),
+            local_signer,
+        )
+    }
+
     fn accept_payload(
         &mut self,
         frame: Frame,
@@ -667,7 +709,12 @@ impl DeliveryStore {
                 (1, None, body, None)
             }
             Payload::Wake { target, text } if frame.expires_at != 0 && text.len() <= 65_504 => {
-                (2, Some(target), text, None)
+                let kind = if matches!(time, AdmissionTime::MailboxHistory(_)) {
+                    4
+                } else {
+                    2
+                };
+                (kind, Some(target), text, None)
             }
             Payload::AgentReply(reply)
                 if frame.expires_at == 0
@@ -706,6 +753,7 @@ impl DeliveryStore {
                 }
                 now
             }
+            AdmissionTime::MailboxHistory(now) => now,
             AdmissionTime::NetworkWake(clock) => {
                 let target = target.ok_or(Error::InvalidFrame)?;
                 let now = clock()?;
@@ -790,7 +838,7 @@ impl DeliveryStore {
                         reply.context_digest
                     ],
                 )?;
-            } else {
+            } else if kind == 2 {
                 tx.execute(
                     "INSERT INTO wake_queue (cursor, generation, state)
                      SELECT ?1, generation, 0 FROM wake_targets WHERE channel = ?2 AND target = ?3 AND status = 1",
@@ -875,7 +923,7 @@ impl DeliveryStore {
         )?;
         tx.execute(
             "UPDATE inbox SET body = NULL WHERE substr(stream, 1, 32) = ?1
-             AND ((kind IN (1, 3) AND received < ?2) OR (kind = 2 AND (epoch < ?3 OR expires <= ?4)))",
+             AND ((kind IN (1, 3, 4) AND received < ?2) OR (kind = 2 AND (epoch < ?3 OR expires <= ?4)))",
             params![channel, old_chat, epoch, now],
         )?;
         tx.execute(

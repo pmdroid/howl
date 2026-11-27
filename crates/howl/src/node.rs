@@ -21,8 +21,9 @@ use crate::{
     channel::Channel,
     delivery::{
         ACK_LENGTH, ACK_TAG, Acknowledgment, ApprovedAgentReply, DeliveryStore, Device, Frame,
-        Payload, Stream,
+        Payload, Receipt, Stream,
     },
+    discovery::{self, HINT_LEN, RouteHint},
     identity::{LocalIdentity, PeerCertificate, PeerTrust, StateDirectory},
     local_control::{self, ControlServer},
     transport::{EndpointAddr, Network, ReceivedFrame, RelayUrl, Transport},
@@ -108,7 +109,7 @@ pub async fn run(state: &Path, listen: &str, relay: Option<&str>) -> io::Result<
                 let slots = DELIVERY_WORKERS - deliveries.len();
                 let attempts = delivery.claim_due(None, unix_time()?, slots).map_err(io::Error::other)?;
                 for attempt in attempts {
-                    match target_address(state, relay.as_ref(), &attempt) {
+                    match target_address(state, &delivery, relay.as_ref(), &attempt) {
                         Ok(destination) => {
                             let transport = Arc::clone(&transport);
                             deliveries.spawn(async move {
@@ -134,6 +135,32 @@ pub async fn run(state: &Path, listen: &str, relay: Option<&str>) -> io::Result<
     drop(control);
     if let Some(mut link) = stop_link {
         local_control::reply(&mut link, Ok("stopped".to_owned())).await?;
+    }
+    Ok(())
+}
+
+pub fn export_hint(state: &Path, address: SocketAddr) -> io::Result<String> {
+    let identity = LocalIdentity::load_or_create(state)?;
+    let hint = RouteHint::issue(&identity, address, discovery::now()?)?;
+    Ok(hex::encode(hint.as_bytes()))
+}
+
+pub fn import_hint(state: &Path, encoded: &str) -> io::Result<()> {
+    let mut bytes = [0; HINT_LEN];
+    hex::decode_to_slice(encoded, &mut bytes)
+        .map_err(|_| invalid("invalid address hint encoding"))?;
+    let hint = RouteHint::from_bytes(bytes);
+    let peer = PeerTrust::open(state)?.pinned(hint.device())?;
+    if hint.address(&peer, discovery::now()?)?.is_none() {
+        return Err(invalid("address hint expired"));
+    }
+    let identity = LocalIdentity::load_or_create(state)?;
+    let directory = StateDirectory::open(state)?;
+    let delivery = open_delivery(state, &directory, &identity.certificate())?;
+    if !delivery.import_hint(&hint).map_err(io::Error::other)? {
+        return Err(invalid(
+            "address hint is older than or conflicts with the saved hint",
+        ));
     }
     Ok(())
 }
@@ -241,7 +268,12 @@ pub fn read(state: &Path, id: Id) -> io::Result<()> {
                 item.received_at,
                 reply.text,
             ),
-            Body::Wake { .. } => return Err(invalid("unexpected wake in channel history")),
+            Body::Wake { session, text } => println!(
+                "wake-history {sender} target={} message={} {} {text:?}",
+                hex::encode(session),
+                hex::encode(item.message),
+                item.received_at,
+            ),
         }
     }
     Ok(())
@@ -304,7 +336,12 @@ fn queue(
         .ok_or_else(|| invalid("invalid peer route"))?;
     let route = parse_route(route)?;
     if route.is_none() && !has_relay {
-        return Err(invalid("peer address or relay is required"));
+        let peer = PeerTrust::open(state)?.pinned(peer)?;
+        if cached_address(delivery, &peer)?.is_none() {
+            return Err(invalid(
+                "peer address, signed address hint, or relay is required",
+            ));
+        }
     }
     let address = Destination {
         channel: *channel,
@@ -511,6 +548,7 @@ fn channel_peer<'a>(
 
 fn target_address(
     state: &Path,
+    delivery: &DeliveryStore,
     relay: Option<&RelayUrl>,
     attempt: &crate::delivery::Attempt,
 ) -> io::Result<EndpointAddr> {
@@ -520,20 +558,40 @@ fn target_address(
             "stored peer route does not match the pinned device",
         ));
     }
-    let route = attempt
-        .route
-        .as_deref()
-        .ok_or_else(|| invalid("peer route is missing"))?;
+    let explicit = parse_route(attempt.route.as_deref().unwrap_or("-").as_bytes())?;
+    let address = match explicit {
+        Some(address) => Some(address),
+        None => match cached_address(delivery, &peer) {
+            Ok(address) => address,
+            Err(_) if relay.is_some() => None,
+            Err(error) => return Err(error),
+        },
+    };
     let mut destination = EndpointAddr::new(peer.endpoint());
-    if let Some(address) = parse_route(route.as_bytes())? {
+    if let Some(address) = address {
         destination = destination.with_ip_addr(address);
     } else if relay.is_none() {
-        return Err(invalid("peer address or relay is required"));
+        return Err(invalid(
+            "peer address, signed address hint, or relay is required",
+        ));
     }
     if let Some(url) = relay {
         destination = destination.with_relay_url(url.clone());
     }
     Ok(destination)
+}
+
+fn cached_address(
+    delivery: &DeliveryStore,
+    peer: &PeerCertificate,
+) -> io::Result<Option<SocketAddr>> {
+    match delivery
+        .peer_hint(peer.device_id())
+        .map_err(io::Error::other)?
+    {
+        Some(hint) => hint.address(peer, discovery::now()?),
+        None => Ok(None),
+    }
 }
 
 fn accept(
@@ -558,6 +616,43 @@ fn accept(
     }
 
     let unverified = howl_envelope::inspect_unverified(bytes).map_err(io::Error::other)?;
+    let receipt = accept_envelope(
+        state,
+        identity,
+        delivery,
+        bytes,
+        unverified,
+        EnvelopeSource::Peer(peer),
+    )?;
+    Ok(Some(receipt.acknowledgment))
+}
+
+pub(crate) enum EnvelopeSource<'a> {
+    Peer(&'a PeerCertificate),
+    Mailbox,
+}
+
+pub(crate) fn accept_envelope(
+    state: &Path,
+    identity: &LocalIdentity,
+    delivery: &mut DeliveryStore,
+    bytes: &[u8],
+    unverified: Metadata,
+    source: EnvelopeSource<'_>,
+) -> io::Result<Receipt> {
+    let local = identity.certificate();
+    let peer_pin;
+    let peer = match source {
+        EnvelopeSource::Peer(peer) => peer,
+        EnvelopeSource::Mailbox => {
+            if unverified.routing.sender.device == *local.device_id() {
+                return Err(invalid("mailbox envelope claims the local sender"));
+            }
+            peer_pin = PeerTrust::open(state)?.pinned(&unverified.routing.sender.device)?;
+            &peer_pin
+        }
+    };
+    let mailbox = matches!(source, EnvelopeSource::Mailbox);
     let roster = Channel::load(state, identity, &unverified.routing.channel)?;
     if !roster
         .members()
@@ -571,11 +666,10 @@ fn accept(
     }
     let allowed: Vec<_> = roster.members().iter().map(recipient).collect();
     let key = zeroize::Zeroizing::new(identity.encryption_key().to_bytes());
-    let local = identity.certificate();
     let secret = RecipientSecret::from_bytes(address(&local), &key).map_err(io::Error::other)?;
     let now = unix_time()?;
     let wake = unverified.intent == Intent::Wake;
-    if wake {
+    if wake && !mailbox {
         delivery.observe_wake_time(now).map_err(io::Error::other)?;
         if !delivery
             .wake_sender_authorized(*roster.id(), device(peer))
@@ -599,45 +693,38 @@ fn accept(
         },
         authorized_recipients: &allowed,
     };
-    let message = howl_envelope::open(bytes, &policy, &secret).map_err(io::Error::other)?;
+    let opened = if mailbox {
+        howl_envelope::open_history(bytes, &policy, &secret)
+    } else {
+        howl_envelope::open(bytes, &policy, &secret)
+    }
+    .map_err(io::Error::other)?;
     delivery
         .set_epoch(*roster.id(), EPOCH)
         .map_err(io::Error::other)?;
-    let metadata = frame(message.metadata);
-    let accepted = match &message.body {
-        Body::Chat(text) => delivery.accept_authenticated(
-            metadata,
-            bytes,
-            Payload::Chat(text),
-            now,
-            identity.signing_key(),
-        ),
-        Body::Wake { session, text } => delivery.accept_network_wake(
-            metadata,
-            bytes,
-            Payload::Wake {
-                target: *session,
-                text,
-            },
-            unix_time,
-            identity.signing_key(),
-        ),
-        Body::AgentReply(reply) => delivery.accept_authenticated(
-            metadata,
-            bytes,
-            Payload::AgentReply(AgentReply {
-                agent: reply.agent,
-                role: reply.role,
-                in_reply_to: reply.in_reply_to,
-                context_digest: reply.context_digest,
-                text: &reply.text,
-            }),
-            now,
-            identity.signing_key(),
-        ),
+    let metadata = frame(opened.metadata);
+    let payload = match &opened.body {
+        Body::Chat(text) => Payload::Chat(text),
+        Body::Wake { session, text } => Payload::Wake {
+            target: *session,
+            text,
+        },
+        Body::AgentReply(reply) => Payload::AgentReply(AgentReply {
+            agent: reply.agent,
+            role: reply.role,
+            in_reply_to: reply.in_reply_to,
+            context_digest: reply.context_digest,
+            text: &reply.text,
+        }),
+    };
+    if mailbox {
+        delivery.accept_mailbox_history(metadata, bytes, payload, now, identity.signing_key())
+    } else if wake {
+        delivery.accept_network_wake(metadata, bytes, payload, unix_time, identity.signing_key())
+    } else {
+        delivery.accept_authenticated(metadata, bytes, payload, now, identity.signing_key())
     }
-    .map_err(io::Error::other)?;
-    Ok(Some(accepted.acknowledgment))
+    .map_err(io::Error::other)
 }
 
 pub(crate) fn open_delivery(
@@ -671,7 +758,7 @@ fn recipient(cert: &PeerCertificate) -> Recipient {
     }
 }
 
-fn local_stream(channel: Id, certificate: &PeerCertificate) -> Stream {
+pub(crate) fn local_stream(channel: Id, certificate: &PeerCertificate) -> Stream {
     let mut hash = Sha256::new();
     hash.update(b"howl/key/v1/device-signing\0");
     hash.update(certificate.signing_public());

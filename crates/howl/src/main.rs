@@ -13,6 +13,7 @@ use howl::{
     managed_acp::{Harness, HostClaude, HostCodex, HostGrok},
     node,
     observer::{ObserverProvider, Snapshot},
+    web,
     workflow::{self, RunTurn},
 };
 use howl_envelope::AgentRole;
@@ -76,6 +77,19 @@ async fn main() -> ExitCode {
             };
             node::run(Path::new(state), listen, relay).await
         }
+        [group, command, action, state, address]
+            if group == "mesh" && command == "hint" && action == "export" =>
+        {
+            required_text(address)
+                .and_then(|address| address.parse().map_err(io::Error::other))
+                .and_then(|address| node::export_hint(Path::new(state), address))
+                .map(|hint| println!("{hint}"))
+        }
+        [group, command, action, state, hint]
+            if group == "mesh" && command == "hint" && action == "import" =>
+        {
+            required_text(hint).and_then(|hint| node::import_hint(Path::new(state), hint))
+        }
         [group, action, state] if group == "mesh" && action == "stop" => {
             node::stop(Path::new(state)).await
         }
@@ -97,6 +111,16 @@ async fn main() -> ExitCode {
                     .map(|receipt| println!("{receipt}")),
                 Err(error) => Err(error),
             }
+        }
+        [command, state, port @ ..] if command == "web" && port.len() <= 1 => {
+            let port = match port.first() {
+                Some(value) => match value.to_str().and_then(|text| text.parse::<u16>().ok()) {
+                    Some(port) => port,
+                    None => return invalid_arguments(),
+                },
+                None => 0,
+            };
+            web::run(Path::new(state), port).await
         }
         [command, state, channel] if command == "read" => {
             parse_id(channel).and_then(|channel| node::read(Path::new(state), channel))

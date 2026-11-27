@@ -8,10 +8,14 @@ pub use store::AuthorityStore;
 mod membership;
 mod pairing;
 mod recovery;
+mod roster;
+mod roster_store;
 
 pub use membership::{Designation, DeviceCertificate, Floor, revoke, verify_revocation};
 pub use pairing::{Enroll, PairingOffer, PairingResponse, PairingTicket};
 pub use recovery::RecoveryPackage;
+pub use roster::{ChannelPermission, Roster, RosterChain, RosterMember};
+pub use roster_store::RosterStore;
 
 #[cfg(test)]
 mod tests {
