@@ -316,15 +316,15 @@ async fn mailbox_deposit(
 
 async fn workflow_command(args: &[OsString]) -> io::Result<()> {
     match args {
-        [command, state, role] if command == "id" => {
-            let id = workflow::agent_id(Path::new(state), parse_role(role)?)?;
+        [command, state, role @ ..] if command == "id" => {
+            let id = workflow::agent_id(Path::new(state), optional_role(role)?)?;
             println!("{}", hex::encode(id));
         }
-        [command, state, channel, sender, role, generation] if command == "grant" => {
+        [command, state, channel, sender, role @ .., generation] if command == "grant" => {
             let state = Path::new(state);
             let channel = parse_id(channel)?;
             let sender = parse_id(sender)?;
-            let target = workflow::agent_id(state, parse_role(role)?)?;
+            let target = workflow::agent_id(state, optional_role(role)?)?;
             let generation = required_text(generation)?
                 .parse::<u64>()
                 .ok()
@@ -333,11 +333,15 @@ async fn workflow_command(args: &[OsString]) -> io::Result<()> {
             node::grant_wake(state, channel, sender, target, generation).await?;
             println!("Wake grant installed for {}.", hex::encode(target));
         }
-        [command, state, channel, peer, route, target, lifetime] if command == "wake" => {
+        [command, state, channel, peer, route, target @ .., lifetime] if command == "wake" => {
             let channel = parse_id(channel)?;
             let peer = parse_id(peer)?;
             let route = required_text(route)?;
-            let target = parse_id(target)?;
+            let target = match target {
+                [] => AgentRole::default().agent_id(&peer),
+                [target] => parse_id(target)?,
+                _ => return Err(invalid_input("expected a single agent target")),
+            };
             let lifetime = required_text(lifetime)?
                 .parse::<u16>()
                 .ok()
@@ -364,8 +368,8 @@ async fn workflow_command(args: &[OsString]) -> io::Result<()> {
             .await?;
             println!("{receipt}");
         }
-        [command, state, channel, role] if command == "next" => {
-            let job = workflow::claim(Path::new(state), parse_id(channel)?, parse_role(role)?)?;
+        [command, state, channel, role @ ..] if command == "next" => {
+            let job = workflow::claim(Path::new(state), parse_id(channel)?, optional_role(role)?)?;
             if let Some(job) = job {
                 println!("Execution {}", hex::encode(job.claim.execution));
                 println!("Sender {}", hex::encode(job.claim.stream.sender.device));
@@ -393,19 +397,16 @@ async fn workflow_command(args: &[OsString]) -> io::Result<()> {
 }
 
 async fn run_workflow(args: &[OsString]) -> io::Result<()> {
-    let [
-        state,
-        channel,
-        role,
-        execution,
-        route,
-        driver,
-        repo,
-        commit,
-        image,
-        options @ ..,
-    ] = args
-    else {
+    let [state, channel, args @ ..] = args else {
+        return Err(invalid_input(
+            "invalid workflow run arguments; run howl --help",
+        ));
+    };
+    let (role, args) = match args.split_first() {
+        Some((first, rest)) if let Ok(role) = parse_role(first) => (role, rest),
+        _ => (AgentRole::default(), args),
+    };
+    let [execution, route, driver, repo, commit, image, options @ ..] = args else {
         return Err(invalid_input(
             "invalid workflow run arguments; run howl --help",
         ));
@@ -438,7 +439,7 @@ async fn run_workflow(args: &[OsString]) -> io::Result<()> {
     let request = RunTurn {
         state: Path::new(state),
         channel: parse_id(channel)?,
-        role: parse_role(role)?,
+        role,
         execution: parse_id(execution)?,
         route: required_text(route)?,
         context: &context,
@@ -529,11 +530,19 @@ fn host_harness(driver: &str, image: String) -> io::Result<Harness> {
     Ok(harness)
 }
 
+fn optional_role(args: &[OsString]) -> io::Result<AgentRole> {
+    match args {
+        [] => Ok(AgentRole::default()),
+        [role] => parse_role(role),
+        _ => Err(invalid_input("too many workflow arguments")),
+    }
+}
+
 fn parse_role(value: &OsStr) -> io::Result<AgentRole> {
     match value.to_str() {
         Some("architect") => Ok(AgentRole::Architect),
         Some("reviewer") => Ok(AgentRole::Reviewer),
-        _ => Err(invalid_input("role must be architect or reviewer")),
+        _ => Err(invalid_input("unrecognized legacy agent target")),
     }
 }
 

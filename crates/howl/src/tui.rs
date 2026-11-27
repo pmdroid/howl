@@ -34,9 +34,7 @@ use tokio::{
 use crate::{
     delivery::DeliveryStatus,
     identity::StateDirectory,
-    interaction::{
-        AgentAddress, ChannelSummary, Event, EventPage, LocalDevice, LocalInteraction, Wake,
-    },
+    interaction::{ChannelSummary, Event, EventPage, LocalDevice, LocalInteraction, Wake},
     node,
     project::{self, Project},
 };
@@ -83,7 +81,6 @@ struct ConversationView {
     gap: bool,
     more: bool,
     workflows: Vec<WorkflowView>,
-    agents: Vec<AgentAddress>,
 }
 
 impl ConversationView {
@@ -125,7 +122,6 @@ struct Catalog {
 struct ViewUpdate {
     key: Conversation,
     page: io::Result<EventPage>,
-    agents: Option<Vec<AgentAddress>>,
     workflows: Option<Vec<WorkflowView>>,
     project: Option<Option<Project>>,
 }
@@ -160,11 +156,9 @@ impl RefreshRequest {
                         .and_then(|status| serde_json::from_value(status).ok())
                 })
                 .flatten();
-            let agents = self.catalog.then(|| local.agents(channel).ok()).flatten();
             ViewUpdate {
                 key,
                 page,
-                agents,
                 workflows,
                 project: self.catalog.then(|| Project::load(state, channel).ok()),
             }
@@ -307,7 +301,6 @@ impl App {
         if let Some(ViewUpdate {
             key,
             page,
-            agents,
             workflows,
             project,
         }) = update.view
@@ -332,9 +325,6 @@ impl App {
                     }
                     let view = self.views.entry(key).or_default();
                     view.append(page);
-                    if let Some(agents) = agents {
-                        view.agents = agents;
-                    }
                     if let Some(workflows) = workflows {
                         view.workflows = workflows;
                     }
@@ -497,40 +487,14 @@ impl App {
 
     fn suggestions(&self) -> Vec<String> {
         let input = self.draft.trim_start();
-        let prefix = if let Some((target, role)) = input.split_once(' ')
-            && target.starts_with('@')
-            && role.starts_with('@')
-            && !role.contains(char::is_whitespace)
-            && self
-                .recipient_shortcuts()
-                .iter()
-                .any(|(name, _, peer)| name == target && peer.is_some())
-        {
-            return ["@architect", "@reviewer"]
-                .into_iter()
-                .filter(|name| name.starts_with(role))
-                .map(str::to_owned)
-                .collect();
-        } else if input.starts_with(['@', '#']) && !input.contains(char::is_whitespace) {
-            input
-        } else {
+        if !input.starts_with(['@', '#']) || input.contains(char::is_whitespace) {
             return Vec::new();
-        };
-        let mut matches = self
-            .recipient_shortcuts()
+        }
+        self.recipient_shortcuts()
             .into_iter()
             .map(|(name, _, _)| name)
-            .filter(|name| name.starts_with(prefix))
-            .collect::<Vec<_>>();
-        if self.peer.is_some() {
-            matches.extend(
-                ["@architect", "@reviewer"]
-                    .into_iter()
-                    .filter(|name| name.starts_with(prefix))
-                    .map(str::to_owned),
-            );
-        }
-        matches
+            .filter(|name| name.starts_with(input))
+            .collect()
     }
 
     fn complete(&mut self) -> bool {
@@ -538,13 +502,7 @@ impl App {
             return false;
         }
         if let Some(value) = self.suggestions().into_iter().next() {
-            if self.draft.trim_start().contains(char::is_whitespace)
-                && let Some((target, _)) = self.draft.split_once(' ')
-            {
-                self.draft = format!("{target} {value} ");
-            } else {
-                self.draft = format!("{value} ");
-            }
+            self.draft = format!("{value} ");
             return true;
         }
         let Some(value) = self.draft.strip_prefix(":repo ") else {
@@ -625,45 +583,57 @@ impl App {
         let (mut channel, mut peer) = self
             .conversation()
             .ok_or_else(|| invalid("Select a signed channel first."))?;
+        let (prefix, body) = input.split_once(char::is_whitespace).unwrap_or((input, ""));
         let mut text = input;
-        if let Some((prefix, body)) = input.split_once(char::is_whitespace)
-            && !matches!(prefix, "@reviewer" | "@architect")
-        {
-            let shortcuts = self.recipient_shortcuts();
-            let mut matches = shortcuts.iter().filter(|(name, _, _)| name == prefix);
-            if let Some((_, destination, direct)) = matches.next() {
-                if matches.next().is_some() {
-                    return Err(invalid(
-                        "Choose the peer in the Direct peers list to resolve this name.",
-                    ));
-                }
-                (channel, peer, text) = (*destination, *direct, body.trim_start());
-                if text.is_empty() {
-                    return Err(invalid("Enter a message after its destination."));
-                }
-                self.channel = Some(channel);
-                self.peer = peer;
+        let mut named_agent = false;
+        let shortcuts = self.recipient_shortcuts();
+        let mut matches = shortcuts
+            .iter()
+            .filter(|(name, _, _)| name == prefix && !matches!(prefix, "@reviewer" | "@architect"));
+        if let Some(first) = matches.next() {
+            let (_, destination, direct) = if matches.next().is_some() {
+                shortcuts
+                    .iter()
+                    .find(|(name, destination, direct)| {
+                        name == prefix && *destination == channel && *direct == peer
+                    })
+                    .ok_or_else(|| {
+                        invalid("Select the destination in the sidebar to resolve this name.")
+                    })?
+            } else {
+                first
+            };
+            (channel, peer, text) = (*destination, *direct, body.trim_start());
+            if text.is_empty() {
+                return Err(invalid("Enter a message after its destination."));
             }
+            named_agent = direct.is_some();
+            self.channel = Some(channel);
+            self.peer = peer;
         }
         let route = peer
             .and_then(|peer| self.routes.get(&peer).cloned())
             .unwrap_or_else(|| "-".into());
-        if let Some((role, text)) = mention(text)? {
-            let peer =
-                peer.ok_or_else(|| invalid("Select the agent’s peer before sending a wake."))?;
-            let text = self
+        let legacy = legacy_mention(text);
+        if named_agent || legacy.is_some() {
+            let peer = peer.ok_or_else(|| invalid("Select an agent before sending a task."))?;
+            let (role, task) = legacy.unwrap_or_else(|| (AgentRole::default(), text));
+            if task.is_empty() {
+                return Err(invalid("Enter a task for the agent."));
+            }
+            let task = self
                 .projects
                 .get(&channel)
-                .map_or_else(|| text.to_owned(), |project| project.instruction(text));
-            if text.len() > node::WAKE_LIMIT {
-                return Err(invalid("Enter a shorter wake message."));
+                .map_or_else(|| task.to_owned(), |project| project.instruction(task));
+            if task.len() > node::WAKE_LIMIT {
+                return Err(invalid("Enter a shorter task."));
             }
             return Ok(Some(Action::Wake {
                 channel,
                 peer,
                 route,
                 target: role.agent_id(&peer),
-                text,
+                text: task,
             }));
         }
         let text = if text == input {
@@ -955,23 +925,14 @@ fn enrollment_args(args: &[&str]) -> io::Result<Vec<String>> {
     }
 }
 
-fn mention(input: &str) -> io::Result<Option<(AgentRole, &str)>> {
-    let Some((prefix, text)) = input.split_once(char::is_whitespace) else {
-        return match input {
-            "@architect" | "@reviewer" => Err(invalid("Add a message after the role to wake.")),
-            _ => Ok(None),
-        };
-    };
+fn legacy_mention(input: &str) -> Option<(AgentRole, &str)> {
+    let (prefix, text) = input.split_once(char::is_whitespace).unwrap_or((input, ""));
     let role = match prefix {
         "@architect" => AgentRole::Architect,
         "@reviewer" => AgentRole::Reviewer,
-        _ => return Ok(None),
+        _ => return None,
     };
-    let text = text.trim();
-    if text.is_empty() || text.len() > node::WAKE_LIMIT {
-        return Err(invalid("Enter a wake message within the size limit."));
-    }
-    Ok(Some((role, text)))
+    Some((role, text.trim()))
 }
 
 fn shift(selected: usize, count: usize, offset: isize) -> usize {
@@ -1353,7 +1314,7 @@ fn draw(frame: &mut Frame<'_>, app: &App) -> HitMap {
     } else if app.pending {
         "Working…".into()
     } else if app.draft.is_empty() {
-        "Type a message. Tab completes @peers, @roles and #channels.".into()
+        "Type a message or assign with @agent. Tab completes names.".into()
     } else {
         let shown = compose.width.saturating_sub(2) as usize;
         let tail = app.draft.chars().rev().take(shown).collect::<Vec<_>>();
@@ -1624,28 +1585,20 @@ fn status_text(app: &App) -> String {
     let Some(view) = app.conversation().and_then(|key| app.views.get(&key)) else {
         return visible(&app.notice);
     };
-    let peer = app.peer.map(hex::encode);
-    let mut agents = view
-        .agents
-        .iter()
-        .filter(|agent| peer.as_ref() == Some(&agent.device))
-        .map(|agent| format!("{} {}", visible(agent.role), visible(agent.availability)))
-        .collect::<Vec<_>>();
+    let mut details = Vec::new();
     let workflow = view.workflows.iter().find(|work| {
-        peer.is_none()
-            || view
-                .agents
-                .iter()
-                .any(|agent| peer.as_ref() == Some(&agent.device) && agent.id == work.target)
+        app.peer.is_none_or(|peer| {
+            id(&work.target).is_ok_and(|target| AgentRole::matches_agent_id(&peer, &target))
+        })
     });
     if let Some(work) = workflow {
-        agents.push(if work.paused {
+        details.push(if work.paused {
             "paused".into()
         } else {
             visible(&work.state)
         });
         if let Some(root) = &work.root {
-            agents.push(format!("root {}", visible(root)));
+            details.push(format!("root {}", visible(root)));
         }
     }
     if !app.delivery.is_empty() {
@@ -1659,20 +1612,20 @@ fn status_text(app: &App) -> String {
             .iter()
             .map(|status| u64::from(status.attempts))
             .sum();
-        agents.push(format!(
+        details.push(format!(
             "Last delivery {delivered}/{} acknowledged · {attempts} attempts",
             app.delivery.len()
         ));
     }
     if view.gap {
-        agents.push("Older events unavailable".into());
+        details.push("Older events unavailable".into());
     } else if view.more {
-        agents.push("Replaying events".into());
+        details.push("Replaying events".into());
     }
     if !app.notice.is_empty() {
-        agents.push(visible(&app.notice));
+        details.push(visible(&app.notice));
     }
-    agents.join(" · ")
+    details.join(" · ")
 }
 
 fn draw_device(frame: &mut Frame<'_>, area: Rect, app: &App) {

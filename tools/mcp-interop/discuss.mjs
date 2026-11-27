@@ -21,8 +21,8 @@ const { channel, targets } = settings;
 const id = value => typeof value === 'string' && /^[0-9a-f]{64}$/.test(value);
 assert.ok(id(channel), 'an explicit channel ID is required');
 assert.ok(Array.isArray(targets) && targets.length === 2 &&
-  targets.every(target => id(target.peer) && id(target.target)) &&
-  targets[0].target !== targets[1].target, 'distinct architect and reviewer targets are required');
+  targets.every(target => id(target.peer) && (target.target === undefined || id(target.target))) &&
+  (targets[0].peer !== targets[1].peer || targets[0].target !== targets[1].target), 'two distinct agent addresses are required');
 
 let topic = '';
 process.stdin.setEncoding('utf8');

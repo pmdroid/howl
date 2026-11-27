@@ -98,7 +98,7 @@ struct DirectArgs {
 struct WakeArgs {
     channel: String,
     peer: String,
-    target: String,
+    target: Option<String>,
     key: String,
     lifetime: u16,
     text: String,
@@ -299,7 +299,7 @@ impl GatewayTools {
     }
 
     #[tool(
-        description = "Request a bounded agent wake and return a durable run handle. Reuse the same key and arguments to retry.",
+        description = "Assign work to a peer and return a durable run handle. The peer selects its default agent target. Reuse the same key and arguments to retry.",
         output_schema = rmcp::handler::server::tool::schema_for_type::<IntegrationRunSummary>(),
         annotations(
             read_only_hint = false,
@@ -316,11 +316,13 @@ impl GatewayTools {
         let channel = permitted(&context, &args.channel, IntegrationPermission::Wake)?;
         let principal = authenticated(&context)?.clone();
         let peer = parse_id(&args.peer)?;
-        let target = parse_id(&args.target)?;
-        if ![AgentRole::Architect, AgentRole::Reviewer]
-            .into_iter()
-            .any(|role| role.agent_id(&peer) == target)
-        {
+        let target = args
+            .target
+            .as_deref()
+            .map(parse_id)
+            .transpose()?
+            .unwrap_or_else(|| AgentRole::default().agent_id(&peer));
+        if !AgentRole::matches_agent_id(&peer, &target) {
             return Err(ErrorData::invalid_params(
                 "agent address does not match peer",
                 None,

@@ -103,7 +103,7 @@ fn resources_require_signed_channel_membership_and_own_run() {
             .as_array()
             .unwrap()
             .len(),
-        2
+        0
     );
     let no_access_for_writer = resource_value(&state, &writer, &agents).unwrap_err();
     let hidden_channel =

@@ -3,7 +3,7 @@ import { createRoot } from "react-dom/client";
 
 type Device = { id: string; certificate: string; fingerprint: string };
 type Channel = { id: string; members: string[]; manifest: string };
-type Overview = { local: Device; peers: Device[]; channels: Channel[]; agents: { role: string; id: string }[] };
+type Overview = { local: Device; peers: Device[]; channels: Channel[]; agents: { id: string }[] };
 type Message = { message: string; sender: string; time: number; text: string; role: string | null };
 type Work = { message: string; target: string; state: string; root: string | null; paused: boolean };
 type Conversation = { messages: Message[]; work: Work[] };
@@ -132,7 +132,7 @@ function App() {
       peer: input(data, "peer"),
       route: input(data, "route").trim() || "-",
       text: input(data, "text"),
-      ...(wake ? { target: input(data, "target"), lifetime: Number(input(data, "lifetime")) } : {}),
+      ...(wake ? { lifetime: Number(input(data, "lifetime")) } : {}),
     });
     setMessageId(receipt.message);
     setNotice(wake ? "Wake queued." : "Message queued.");
@@ -256,7 +256,6 @@ function App() {
               <form onSubmit={form((data, element) => send(data, element, true))}>
                 <div className="form-row"><PeerSelect peers={peers} /><Field label="Peer route (optional)"><input name="route" placeholder="IP:port" /></Field></div>
                 <div className="form-row">
-                  <Field label="Target agent ID"><input name="target" required /></Field>
                   <Field label="Expires in (seconds)"><input name="lifetime" type="number" min={1} max={300} defaultValue={120} required /></Field>
                 </div>
                 <Field label="Wake request"><textarea name="text" required rows={3} /></Field>
@@ -266,7 +265,7 @@ function App() {
             <details>
               <summary>Agents and pause</summary>
               <ul className="agents">{overview?.agents.map(agent => <li key={agent.id}>
-                <strong>{agent.role}</strong><code className="digest">{agent.id}</code>
+                <code className="digest">{agent.id}</code>
               </li>)}</ul>
               {conversation?.work.length === 0 && <p className="muted">No wake requests received.</p>}
               <ul className="agents">{conversation?.work.map(work => <li key={work.message}>
@@ -279,11 +278,10 @@ function App() {
                   })}>Pause conversation</button>}
               </li>)}</ul>
               {peers.length > 0 && <form onSubmit={form(async data => {
-                await api("grant", { channel: selected, peer: input(data, "peer"), role: input(data, "role"), generation: Number(input(data, "generation")) });
+                await api("grant", { channel: selected, peer: input(data, "peer"), generation: Number(input(data, "generation")) });
                 setNotice("Wake grant saved.");
               })}>
                 <div className="form-row"><PeerSelect peers={peers} />
-                  <Field label="Local agent"><select name="role"><option value="architect">Architect</option><option value="reviewer">Reviewer</option></select></Field>
                   <Field label="Grant generation"><input name="generation" type="number" min={1} defaultValue={1} required /></Field>
                 </div>
                 <button disabled={busy}>Grant wake permission</button>
