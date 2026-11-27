@@ -17,7 +17,7 @@ pub struct GitHub {
 }
 
 #[derive(Deserialize)]
-pub struct DeviceCode {
+pub(crate) struct DeviceCode {
     device_code: String,
     pub user_code: String,
     verification_uri: String,
@@ -43,7 +43,7 @@ struct User {
     id: i64,
 }
 
-pub enum Poll {
+pub(crate) enum Poll {
     Pending,
     SlowDown(Option<i32>),
     Denied,
@@ -73,7 +73,7 @@ impl GitHub {
         })
     }
 
-    pub async fn begin(&self) -> Result<DeviceCode> {
+    pub(crate) async fn begin(&self) -> Result<DeviceCode> {
         let mut result: DeviceCode = json(
             self.http
                 .post(format!("{}/device/code", self.login))
@@ -101,7 +101,7 @@ impl GitHub {
         Ok(result)
     }
 
-    pub async fn poll(&self, device_code: &str) -> Result<Poll> {
+    pub(crate) async fn poll(&self, device_code: &str) -> Result<Poll> {
         let token: TokenResponse = json(
             self.http
                 .post(format!("{}/oauth/access_token", self.login))

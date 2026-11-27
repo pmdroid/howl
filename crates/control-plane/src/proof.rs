@@ -37,17 +37,17 @@ pub fn credential_digest(credential: &str) -> Result<Id> {
     Ok(hash(&decode::<32>(credential)?))
 }
 
-pub fn hash(bytes: &[u8]) -> Id {
+pub(crate) fn hash(bytes: &[u8]) -> Id {
     Sha256::digest(bytes).into()
 }
 
-pub fn decode<const N: usize>(text: &str) -> Result<[u8; N]> {
+pub(crate) fn decode<const N: usize>(text: &str) -> Result<[u8; N]> {
     let mut result = [0; N];
     hex::decode_to_slice(text, &mut result).map_err(|_| Error::Invalid)?;
     Ok(result)
 }
 
-pub fn key(key: Id) -> Result<VerifyingKey> {
+pub(crate) fn key(key: Id) -> Result<VerifyingKey> {
     let verifying = VerifyingKey::from_bytes(&key).map_err(|_| Error::Invalid)?;
     if verifying.is_weak()
         || !CompressedEdwardsY(key)
@@ -59,7 +59,7 @@ pub fn key(key: Id) -> Result<VerifyingKey> {
     Ok(verifying)
 }
 
-pub fn operation_name(operation: &str) -> Result<()> {
+pub(crate) fn operation_name(operation: &str) -> Result<()> {
     if operation.is_empty()
         || operation.len() > 32
         || !operation
@@ -71,7 +71,7 @@ pub fn operation_name(operation: &str) -> Result<()> {
     Ok(())
 }
 
-pub async fn issue(
+pub(crate) async fn issue(
     tx: &Transaction<'_>,
     subject: &Id,
     operation: &str,
@@ -92,7 +92,7 @@ pub async fn issue(
     Ok(nonce)
 }
 
-pub struct Use<'a> {
+pub(crate) struct Use<'a> {
     pub subject: Id,
     pub signing_key: Id,
     pub operation: &'a str,
@@ -100,7 +100,7 @@ pub struct Use<'a> {
     pub body: &'a [u8],
 }
 
-pub async fn consume(
+pub(crate) async fn consume(
     tx: &Transaction<'_>,
     audience: Id,
     proof: &Proof,
