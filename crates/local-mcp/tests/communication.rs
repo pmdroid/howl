@@ -358,6 +358,7 @@ async fn real_stdio_mcp_shim_has_stable_tools_and_obeys_live_revocation() {
         send(&mut input, call).await;
         let denied = receive(&mut output).await;
         assert_eq!(denied["result"]["isError"], true);
+        assert_eq!(denied["result"]["content"][0]["text"], "operation denied");
         assert_eq!(fixture.calls.lock().unwrap().len(), 1);
         drop(input);
         assert!(process.wait().await.unwrap().success());
