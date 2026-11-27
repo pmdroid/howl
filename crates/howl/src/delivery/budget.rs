@@ -1,3 +1,6 @@
+mod approved_wake;
+pub use approved_wake::{ApprovedWake, WakeApproval, WakeOutcome, WakeTurnError};
+
 use std::io;
 
 use ed25519_dalek::{Signature, VerifyingKey};
@@ -198,38 +201,12 @@ impl ConversationBudget<'_> {
             }
             _ => return Err(BudgetError::Human),
         };
-        let saved = tx.execute(
-            "INSERT OR IGNORE INTO budget_controls(nonce) VALUES (?1)",
-            [command.nonce],
-        )?;
-        if saved == 0 {
-            return Err(BudgetError::Replay);
-        }
+        record_control(&tx, command.nonce)?;
 
         let admitted = match command.action {
-            HumanAction::Begin { agent } => {
-                let root = random_id()?;
-                let expires_at = now
-                    .checked_add(limits.lifetime_seconds)
-                    .ok_or(BudgetError::Limit(BudgetLimit::Lifetime))?;
-                tx.execute(
-                    "INSERT INTO budget_roots(root, expires, ceiling) VALUES (?1, ?2, ?3)",
-                    params![root, expires_at.to_be_bytes(), limits.turns],
-                )?;
-                Some(admit_turn(&tx, limits, now, root, None, agent)?)
-            }
+            HumanAction::Begin { agent } => Some(begin_human(&tx, limits, now, agent)?),
             HumanAction::Continue { cause, agent } => {
-                let base = read_turn(&tx, cause)?;
-                let root = read_root(&tx, base.root, now)?;
-                let ceiling = root
-                    .ceiling
-                    .checked_add(limits.turns)
-                    .ok_or(BudgetError::Limit(BudgetLimit::Turns))?;
-                tx.execute(
-                    "UPDATE budget_roots SET ceiling = ?2 WHERE root = ?1",
-                    params![base.root, ceiling],
-                )?;
-                Some(admit_turn(&tx, limits, now, base.root, Some(base), agent)?)
+                Some(continue_human(&tx, limits, now, cause, agent)?)
             }
             HumanAction::Pause { root } => {
                 if tx.execute("UPDATE budget_roots SET paused = 1 WHERE root = ?1", [root])? == 0 {
@@ -280,14 +257,8 @@ impl ConversationBudget<'_> {
     }
 
     fn decision(&mut self, now: u64) -> Result<Transaction<'_>> {
+        record_budget_time(self.connection, now)?;
         let now = now.to_be_bytes();
-        let advanced = self.connection.execute(
-            "UPDATE budget_policy SET clock = ?1 WHERE singleton = 1 AND (clock IS NULL OR clock <= ?1)",
-            [now],
-        )?;
-        if advanced == 0 {
-            return Err(BudgetError::Clock);
-        }
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -301,6 +272,60 @@ impl ConversationBudget<'_> {
         }
         Ok(tx)
     }
+}
+
+fn record_budget_time(connection: &Connection, now: u64) -> Result<()> {
+    let advanced = connection.execute(
+        "UPDATE budget_policy SET clock = ?1 WHERE singleton = 1 AND (clock IS NULL OR clock <= ?1)",
+        [now.to_be_bytes()],
+    )?;
+    if advanced == 0 {
+        return Err(BudgetError::Clock);
+    }
+    Ok(())
+}
+
+fn record_control(connection: &Connection, nonce: Id) -> Result<()> {
+    let saved = connection.execute(
+        "INSERT OR IGNORE INTO budget_controls(nonce) VALUES (?1)",
+        [nonce],
+    )?;
+    if saved == 0 {
+        return Err(BudgetError::Replay);
+    }
+    Ok(())
+}
+
+fn begin_human(tx: &Connection, limits: BudgetLimits, now: u64, agent: Id) -> Result<Turn> {
+    let root = random_id()?;
+    let expires_at = now
+        .checked_add(limits.lifetime_seconds)
+        .ok_or(BudgetError::Limit(BudgetLimit::Lifetime))?;
+    tx.execute(
+        "INSERT INTO budget_roots(root, expires, ceiling) VALUES (?1, ?2, ?3)",
+        params![root, expires_at.to_be_bytes(), limits.turns],
+    )?;
+    admit_turn(tx, limits, now, root, None, agent)
+}
+
+fn continue_human(
+    tx: &Connection,
+    limits: BudgetLimits,
+    now: u64,
+    cause: Id,
+    agent: Id,
+) -> Result<Turn> {
+    let base = read_turn(tx, cause)?;
+    let root = read_root(tx, base.root, now)?;
+    let ceiling = root
+        .ceiling
+        .checked_add(limits.turns)
+        .ok_or(BudgetError::Limit(BudgetLimit::Turns))?;
+    tx.execute(
+        "UPDATE budget_roots SET ceiling = ?2 WHERE root = ?1",
+        params![base.root, ceiling],
+    )?;
+    admit_turn(tx, limits, now, base.root, Some(base), agent)
 }
 
 struct Root {
