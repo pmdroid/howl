@@ -245,12 +245,7 @@ pub async fn stop(state: &Path) -> io::Result<()> {
 
 pub fn read(state: &Path, id: Id) -> io::Result<()> {
     let identity = LocalIdentity::load_or_create(state)?;
-    Channel::known(state, &identity, &id)?;
-    let delivery = open_delivery(
-        state,
-        &StateDirectory::open(state)?,
-        &identity.certificate(),
-    )?;
+    let (delivery, _) = history_delivery(state, &identity, id)?;
     for item in delivery
         .channel_history(id, 100)
         .map_err(io::Error::other)?
@@ -276,11 +271,9 @@ pub fn read(state: &Path, id: Id) -> io::Result<()> {
 
 pub fn status(state: &Path, channel: Id, message: Id) -> io::Result<()> {
     let identity = LocalIdentity::load_or_create(state)?;
-    Channel::known(state, &identity, &channel)?;
-    let local = identity.certificate();
-    let delivery = open_delivery(state, &StateDirectory::open(state)?, &local)?;
+    let (delivery, stream) = history_delivery(state, &identity, channel)?;
     let results = delivery
-        .delivery_status(local_stream(state, channel, &local)?, message)
+        .delivery_status(stream, message)
         .map_err(io::Error::other)?;
     if results.is_empty() {
         return Err(io::Error::new(
@@ -736,6 +729,24 @@ fn accept(
     Ok(Some(accepted.acknowledgment))
 }
 
+pub(crate) fn history_delivery(
+    state: &Path,
+    identity: &LocalIdentity,
+    channel: Id,
+) -> io::Result<(DeliveryStore, Stream)> {
+    let local = identity.certificate();
+    let directory = StateDirectory::open(state)?;
+    if Channel::history_is_enrolled(state, identity, &channel)? {
+        let delivery = open_delivery(state, &directory, &local)?;
+        return Ok((delivery, local_stream(state, channel, &local)?));
+    }
+    let key = directory.key(DELIVERY_KEY)?;
+    let device = device_with_account(&local, None);
+    let delivery =
+        DeliveryStore::open(&state.join(DELIVERY_DB), &key, device).map_err(io::Error::other)?;
+    Ok((delivery, stream_from_device(channel, &local, device)))
+}
+
 pub(crate) fn open_delivery(
     state: &Path,
     directory: &StateDirectory,
@@ -786,14 +797,22 @@ pub(crate) fn local_stream(
     channel: Id,
     certificate: &PeerCertificate,
 ) -> io::Result<Stream> {
+    Ok(stream_from_device(
+        channel,
+        certificate,
+        device_for(state, certificate)?,
+    ))
+}
+
+fn stream_from_device(channel: Id, certificate: &PeerCertificate, device: Device) -> Stream {
     let mut hash = Sha256::new();
     hash.update(b"howl/key/v1/device-signing\0");
     hash.update(certificate.signing_public());
-    Ok(Stream {
+    Stream {
         channel,
-        sender: device_for(state, certificate)?,
+        sender: device,
         signing_key: hash.finalize().into(),
-    })
+    }
 }
 
 fn frame(metadata: Metadata) -> Frame {

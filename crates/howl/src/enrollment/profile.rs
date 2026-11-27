@@ -17,6 +17,7 @@ pub(crate) struct Profile {
     pub designation: Designation,
     pub local: DeviceCertificate,
     state: StateDirectory,
+    path: std::path::PathBuf,
     trust: PeerTrust,
 }
 
@@ -38,6 +39,7 @@ impl Profile {
             designation,
             local,
             state,
+            path: path.to_owned(),
             trust,
         }))
     }
@@ -50,17 +52,33 @@ impl Profile {
         Ok(Some(AuthorityStore::open(path)?.load()?.account()))
     }
 
+    pub(crate) fn revocations(&self) -> io::Result<RosterStore> {
+        RosterStore::account_revocations(&self.path, self.local.account)
+    }
+
     pub(crate) fn member(&self, device: Id, permissions: u8) -> io::Result<RosterMember> {
         let certificate = if device == self.local.device {
             self.local.clone()
         } else {
             self.peer(device)?.0
         };
+        let address = DeviceAddress {
+            account: certificate.account,
+            device,
+        };
+        if certificate.sequence
+            <= self
+                .revocations()?
+                .load(&self.authority)?
+                .revoked_through(address)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "the device certificate has been revoked",
+            ));
+        }
         Ok(RosterMember {
-            address: DeviceAddress {
-                account: certificate.account,
-                device,
-            },
+            address,
             certificate: certificate.digest,
             permissions,
         })

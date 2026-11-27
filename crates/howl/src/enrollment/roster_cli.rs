@@ -61,12 +61,16 @@ pub fn run(args: &[OsString]) -> io::Result<()> {
                 .map_err(io::Error::other)?;
             let signer = operator_signer(&StateDirectory::open(state)?)?;
             let record = revoke(&profile.designation, &signer, Floor { device, sequence })?;
-            store.revoke(&profile.authority, &profile.designation, &record)?;
+            profile
+                .revocations()?
+                .revoke(&profile.authority, &profile.designation, &record)?;
             Some(record)
         }
         (Some("apply-revocation"), [record]) => {
             let record = decode_record(record)?;
-            store.revoke(&profile.authority, &profile.designation, &record)?;
+            profile
+                .revocations()?
+                .revoke(&profile.authority, &profile.designation, &record)?;
             None
         }
         (Some("show"), []) => {

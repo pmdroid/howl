@@ -17,6 +17,7 @@ const REVOKE: u8 = 2;
 pub struct RosterStore {
     state: StateDirectory,
     channel: Id,
+    prefix: String,
 }
 
 struct History {
@@ -30,6 +31,15 @@ impl RosterStore {
         Ok(Self {
             state: StateDirectory::open(path)?,
             channel,
+            prefix: format!("roster-{}", hex::encode(channel)),
+        })
+    }
+
+    pub(crate) fn account_revocations(path: &Path, account: Id) -> io::Result<Self> {
+        Ok(Self {
+            state: StateDirectory::open(path)?,
+            channel: [0; 32],
+            prefix: format!("enrollment-revocations-{}", hex::encode(account)),
         })
     }
 
@@ -128,7 +138,7 @@ impl RosterStore {
     }
 
     fn name(&self, index: usize) -> String {
-        format!("roster-{}-{index:04x}", hex::encode(self.channel))
+        format!("{}-{index:04x}", self.prefix)
     }
 }
 
