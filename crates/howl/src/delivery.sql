@@ -59,3 +59,18 @@ CREATE TABLE IF NOT EXISTS conflicts (
     frame BLOB NOT NULL,
     PRIMARY KEY (inbox_id, digest)
 ) STRICT;
+CREATE TABLE IF NOT EXISTS wake_targets (
+    channel BLOB NOT NULL REFERENCES channels(channel),
+    target BLOB NOT NULL,
+    generation BLOB NOT NULL CHECK (length(generation) = 8),
+    status INTEGER NOT NULL CHECK (status BETWEEN 0 AND 2),
+    PRIMARY KEY (channel, target)
+) STRICT;
+CREATE TABLE IF NOT EXISTS wake_queue (
+    cursor INTEGER PRIMARY KEY REFERENCES inbox(id),
+    execution BLOB UNIQUE CHECK (execution IS NULL OR length(execution) = 32),
+    generation BLOB NOT NULL CHECK (length(generation) = 8),
+    state INTEGER NOT NULL CHECK (state BETWEEN 0 AND 5),
+    CHECK (state = 4 OR ((state = 0) = (execution IS NULL)))
+) STRICT;
+CREATE INDEX IF NOT EXISTS wakes_pending ON wake_queue(cursor) WHERE state = 0;
