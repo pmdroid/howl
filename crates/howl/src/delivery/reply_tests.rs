@@ -109,7 +109,7 @@ fn only_the_linked_running_wake_can_publish_and_finish_in_one_transaction() {
             b"signed agent reply",
             other,
             "127.0.0.1:9",
-            11,
+            || Ok(11),
             publication,
         ),
         Err(Error::WakeGrant)
@@ -130,7 +130,7 @@ fn only_the_linked_running_wake_can_publish_and_finish_in_one_transaction() {
             b"signed agent reply",
             PEER,
             "127.0.0.1:9",
-            11,
+            || Ok(11),
             publication,
         )
         .unwrap();
@@ -151,7 +151,7 @@ fn only_the_linked_running_wake_can_publish_and_finish_in_one_transaction() {
             b"signed agent reply",
             PEER,
             "127.0.0.1:9",
-            11,
+            || Ok(11),
             publication,
         ),
         Err(Error::WakeGrant)
@@ -162,5 +162,65 @@ fn only_the_linked_running_wake_can_publish_and_finish_in_one_transaction() {
             .unwrap()
             .len(),
         1
+    );
+
+    let next = Frame {
+        sequence: 2,
+        ..frame(PEER, 17, 40)
+    };
+    store
+        .accept_network_wake(next, b"next signed wake", payload, 11, &signer)
+        .unwrap();
+    let claim = store.claim_wake(CHANNEL, agent, 11).unwrap().unwrap();
+    let approval = WakeApproval {
+        claim: &claim,
+        nonce: [18; 32],
+        ..approval
+    };
+    let signature = human.sign(&approval.signing_bytes(LOCAL)).to_bytes();
+    store
+        .conversation_budget(limits, human.verifying_key())
+        .unwrap()
+        .start_approved_wake(approval, &signature, || Ok(11), |_, _| true)
+        .unwrap();
+    let outgoing = Frame {
+        sequence: 2,
+        ..frame(LOCAL, 19, 0)
+    };
+    store.reserve_sequence(outgoing.stream).unwrap();
+    let publication = ApprovedAgentReply {
+        execution: claim.execution,
+        reply: AgentReply {
+            in_reply_to: next.message,
+            ..publication.reply
+        },
+    };
+    assert!(matches!(
+        store.enqueue_agent_reply(
+            outgoing,
+            b"late reply",
+            PEER,
+            "127.0.0.1:9",
+            || Ok(21),
+            publication
+        ),
+        Err(Error::WakeGrant)
+    ));
+    assert!(matches!(
+        store.enqueue_agent_reply(
+            outgoing,
+            b"rolled back clock",
+            PEER,
+            "127.0.0.1:9",
+            || Ok(12),
+            publication
+        ),
+        Err(Error::WakeClock)
+    ));
+    assert!(
+        store
+            .delivery_status(outgoing.stream, outgoing.message)
+            .unwrap()
+            .is_empty()
     );
 }

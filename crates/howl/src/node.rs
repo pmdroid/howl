@@ -477,9 +477,14 @@ fn queue_frame(
     let route = route.map_or("-".to_owned(), |address| address.to_string());
     let outbound = frame(metadata);
     match approved {
-        Some(approved) => {
-            delivery.enqueue_agent_reply(outbound, &sealed, device(target), &route, now, approved)
-        }
+        Some(approved) => delivery.enqueue_agent_reply(
+            outbound,
+            &sealed,
+            device(target),
+            &route,
+            unix_time,
+            approved,
+        ),
         None => delivery.enqueue_routed(outbound, &sealed, device(target), &route, now),
     }
     .map_err(io::Error::other)?;
