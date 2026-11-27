@@ -46,6 +46,7 @@ use tokio::{
 use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec};
 
 use crate::observer::{ObserverProcess, ObserverProvider, Snapshot, WORKSPACE};
+use crate::ongoing::WorkTools;
 use crate::provider_broker::{self, Broker, Provider};
 use journal::Journal;
 
@@ -108,6 +109,7 @@ pub struct Harness {
     host: Option<HostAgent>,
     prefer_v2: bool,
     editable: bool,
+    work_tools: Option<Arc<WorkTools>>,
 }
 
 impl Harness {
@@ -141,11 +143,17 @@ impl Harness {
             host: None,
             prefer_v2: false,
             editable: false,
+            work_tools: None,
         }
     }
 
     pub fn host_claude(repository_image: String, claude: HostClaude) -> Self {
         Self::host_agent("claude-host", repository_image, HostAgent::Claude(claude))
+    }
+
+    pub(crate) fn with_work_tools(mut self, tools: Arc<WorkTools>) -> Self {
+        self.work_tools = Some(tools);
+        self
     }
 
     pub fn host_grok(repository_image: String, grok: HostGrok) -> Self {
@@ -327,6 +335,7 @@ pub struct ManagedSession {
     status: watch::Receiver<SessionState>,
     events: broadcast::Sender<Event>,
     export: Option<std::process::Command>,
+    work_tools: Option<Arc<WorkTools>>,
 }
 
 impl ManagedSession {
@@ -407,6 +416,7 @@ impl ManagedSession {
             status,
             events,
             export: None,
+            work_tools: None,
         })
     }
 
@@ -490,8 +500,10 @@ impl ManagedSession {
         let prefer_v2 = harness.prefer_v2;
         let editable = harness.editable;
         let host = harness.host;
+        let work_tools = harness.work_tools;
         let harness = Harness {
             host: None,
+            work_tools: None,
             ..harness
         };
         let root = root.to_owned();
@@ -542,7 +554,8 @@ impl ManagedSession {
         .map_err(|_| Error::Disconnected)??;
 
         let host = if let Some(host) = host {
-            match start_host_agent(&mut process, host, editable).await {
+            let work_tools = work_tools.clone().map(|tools| (tools, journal.subscribe()));
+            match start_host_agent(&mut process, host, editable, work_tools).await {
                 Ok(host) => Some(host),
                 Err(error) => {
                     journal.update(|state| state.phase = Phase::Interrupted)?;
@@ -591,7 +604,14 @@ impl ManagedSession {
             status,
             events,
             export,
+            work_tools,
         })
+    }
+
+    pub(crate) fn conversation_source(&self, source: crate::delivery::OngoingSource) {
+        if let Some(tools) = &self.work_tools {
+            tools.set_source(source);
+        }
     }
 
     pub fn status(&self) -> SessionState {
@@ -706,6 +726,7 @@ struct HostSession {
 #[derive(Clone)]
 struct HostWorkspace {
     editable: bool,
+    work: bool,
     cwd: PathBuf,
     server: McpServer,
 }
@@ -714,6 +735,7 @@ async fn start_host_agent(
     process: &mut ObserverProcess,
     host: HostAgent,
     editable: bool,
+    work_tools: Option<(Arc<WorkTools>, watch::Receiver<SessionState>)>,
 ) -> Result<HostSession> {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -728,7 +750,8 @@ async fn start_host_agent(
     if ready != "ready\n" {
         return Err(Error::Disconnected);
     }
-    let repository = RepositoryEndpoint::start(process, editable)?;
+    let work = work_tools.is_some();
+    let repository = RepositoryEndpoint::start(process, editable, work_tools)?;
     let http = if host.uses_http() {
         Some(RepositoryHttp::start(host.node(), &repository.socket(), editable).await?)
     } else {
@@ -738,9 +761,10 @@ async fn start_host_agent(
         Some(http) => McpServer::Http(McpServerHttp::new("howl_repository", http.url())),
         None => repository.mcp_server(host.node())?,
     };
-    let process = host.start(http.as_ref(), editable)?;
+    let process = host.start(http.as_ref(), editable, work)?;
     let workspace = HostWorkspace {
         editable,
+        work,
         cwd: process.cwd.clone(),
         server,
     };
@@ -916,6 +940,7 @@ async fn drive_v1(
     let updates = events.clone();
     let host_workspace = workspace.is_some();
     let editable = workspace.as_ref().is_some_and(|work| work.editable);
+    let work_tools = workspace.as_ref().is_some_and(|work| work.work);
     Client
         .v1()
         .on_receive_notification(
@@ -953,17 +978,28 @@ async fn drive_v1(
                                 | "mcp__howl_repository__run_tests"
                         )
                     );
-                let (kind, selected) = if guest || repository_read || repository_edit {
-                    (
-                        PermissionOptionKind::AllowOnce,
-                        PermissionDecision::AllowOnce,
-                    )
-                } else {
-                    (
-                        PermissionOptionKind::RejectOnce,
-                        PermissionDecision::RejectOnce,
-                    )
-                };
+                let conversation_tool = work_tools
+                    && matches!(
+                        request.tool_call.fields.name.as_deref(),
+                        Some(
+                            "mcp__howl_repository__start_work"
+                                | "howl_repository_start_work"
+                                | "mcp__howl_repository__send_peer"
+                                | "howl_repository_send_peer"
+                        )
+                    );
+                let (kind, selected) =
+                    if guest || repository_read || repository_edit || conversation_tool {
+                        (
+                            PermissionOptionKind::AllowOnce,
+                            PermissionDecision::AllowOnce,
+                        )
+                    } else {
+                        (
+                            PermissionOptionKind::RejectOnce,
+                            PermissionDecision::RejectOnce,
+                        )
+                    };
                 let option = in_turn
                     .then(|| request.options.iter().find(|option| option.kind == kind))
                     .flatten();

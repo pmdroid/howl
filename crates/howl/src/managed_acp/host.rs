@@ -42,7 +42,7 @@ impl HostClaude {
         }
     }
 
-    pub(super) fn start(&self, editable: bool) -> Result<HostProcess> {
+    pub(super) fn start(&self, editable: bool, work: bool) -> Result<HostProcess> {
         let scratch = tempfile::Builder::new().prefix("howl-host-").tempdir()?;
         let scratch_path = fs::canonicalize(scratch.path())?;
         let cwd = scratch_path.join("workspace");
@@ -60,6 +60,7 @@ impl HostClaude {
         launch(&self.adapter, &self.node, scratch, cwd, &home, |command| {
             command
                 .env("HOWL_EDITABLE_WORKSPACE", if editable { "1" } else { "0" })
+                .env("HOWL_WORK_TOOLS", if work { "1" } else { "0" })
                 .env("CLAUDE_AGENT_ACP_PROTOCOL", "v1")
                 .env("CLAUDE_CODE_EXECUTABLE", executable)
                 .env("HOWL_CLAUDE_NODE", &self.node)
@@ -100,7 +101,7 @@ impl HostGrok {
         }
     }
 
-    fn start(&self, editable: bool) -> Result<HostProcess> {
+    fn start(&self, editable: bool, work: bool) -> Result<HostProcess> {
         let scratch = tempfile::Builder::new().prefix("howl-host-").tempdir()?;
         let scratch_path = fs::canonicalize(scratch.path())?;
         let cwd = scratch_path.join("workspace");
@@ -113,6 +114,7 @@ impl HostGrok {
             command
                 .arg(wrapper)
                 .env("HOWL_EDITABLE_WORKSPACE", if editable { "1" } else { "0" })
+                .env("HOWL_WORK_TOOLS", if work { "1" } else { "0" })
                 .env("HOWL_GROK_EXECUTABLE", &self.grok)
                 .env("HOWL_GROK_AUTH_PATH", &self.auth);
         })
@@ -162,7 +164,12 @@ impl HostCodex {
         }
     }
 
-    fn start(&self, repository: &RepositoryHttp, editable: bool) -> Result<HostProcess> {
+    fn start(
+        &self,
+        repository: &RepositoryHttp,
+        editable: bool,
+        work: bool,
+    ) -> Result<HostProcess> {
         let scratch = tempfile::Builder::new().prefix("howl-host-").tempdir()?;
         let scratch_path = fs::canonicalize(scratch.path())?;
         let cwd = scratch_path.join("workspace");
@@ -175,6 +182,7 @@ impl HostCodex {
             command
                 .arg(wrapper)
                 .env("HOWL_EDITABLE_WORKSPACE", if editable { "1" } else { "0" })
+                .env("HOWL_WORK_TOOLS", if work { "1" } else { "0" })
                 .env("HOWL_CODEX_EXECUTABLE", &self.codex)
                 .env("HOWL_CODEX_HOME", &self.home)
                 .env("HOWL_REPOSITORY_MCP_URL", repository.url())
@@ -226,7 +234,7 @@ impl HostOpenCode {
         }
     }
 
-    fn start(&self, editable: bool) -> Result<HostProcess> {
+    fn start(&self, editable: bool, work: bool) -> Result<HostProcess> {
         let scratch = tempfile::Builder::new().prefix("howl-host-").tempdir()?;
         let scratch_path = fs::canonicalize(scratch.path())?;
         let cwd = scratch_path.join("workspace");
@@ -271,6 +279,9 @@ impl HostOpenCode {
                 "howl_repository_delete_file",
                 "howl_repository_run_tests",
             ]);
+        }
+        if work {
+            tools.extend(["howl_repository_start_work", "howl_repository_send_peer"]);
         }
         let mut permissions = vec![rule("*", "*", "deny")];
         permissions.extend(tools.iter().map(|name| rule(name, "*", "allow")));
@@ -348,12 +359,13 @@ impl HostAgent {
         self,
         repository: Option<&RepositoryHttp>,
         editable: bool,
+        work: bool,
     ) -> Result<HostProcess> {
         match self {
-            Self::Claude(agent) => agent.start(editable),
-            Self::Grok(agent) => agent.start(editable),
-            Self::Codex(agent) => agent.start(repository.ok_or(Error::HostAgent)?, editable),
-            Self::OpenCode(agent) => agent.start(editable),
+            Self::Claude(agent) => agent.start(editable, work),
+            Self::Grok(agent) => agent.start(editable, work),
+            Self::Codex(agent) => agent.start(repository.ok_or(Error::HostAgent)?, editable, work),
+            Self::OpenCode(agent) => agent.start(editable, work),
         }
     }
 }

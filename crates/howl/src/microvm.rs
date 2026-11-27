@@ -10,7 +10,7 @@ use serde_json::json;
 use tokio::{
     io::AsyncReadExt,
     net::{UnixListener, UnixStream},
-    process::{Child, Command},
+    process::{Child, ChildStdin, Command},
     task::JoinHandle,
     time::timeout,
 };
@@ -25,6 +25,21 @@ use crate::{
 const BOOT: Duration = Duration::from_secs(60);
 const RUN_LIMIT: Duration = Duration::from_secs(900);
 const PATCH_LIMIT: usize = 4 * 1024 * 1024;
+const WATCH_OWNER: &str = r#"
+exec 3<&0
+"$@" </dev/null 3<&- &
+machine=$!
+(
+    IFS= read -r unused <&3 || :
+    kill -KILL "$machine" 2>/dev/null
+) &
+watcher=$!
+wait "$machine"
+status=$?
+kill "$watcher" 2>/dev/null || :
+wait "$watcher" 2>/dev/null || :
+exit "$status"
+"#;
 
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -70,6 +85,7 @@ pub(crate) struct Guest {
     pub session: ManagedSession,
     patch: UnixStream,
     process: Child,
+    owner: Option<ChildStdin>,
     _directory: tempfile::TempDir,
     broker: Option<JoinHandle<io::Result<()>>>,
 }
@@ -79,6 +95,7 @@ impl Drop for Guest {
         if let Some(broker) = &self.broker {
             broker.abort();
         }
+        drop(self.owner.take());
         let _ = self.process.start_kill();
     }
 }
@@ -123,11 +140,14 @@ impl Guest {
             .tempdir_in("/tmp")?;
         let archive = directory.path().join("repo.tar");
         snapshot.archive(&archive)?;
-        let mut command = Command::new(&profile.qemu);
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", WATCH_OWNER, "howl-microvm"])
+            .arg(&profile.qemu);
         command
             .env_clear()
             .current_dir(directory.path())
-            .stdin(Stdio::null())
+            .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .kill_on_drop(true)
@@ -174,6 +194,10 @@ impl Guest {
             })
             .transpose()?;
         let mut process = command.spawn()?;
+        let owner = process
+            .stdin
+            .take()
+            .ok_or_else(|| io::Error::other("microVM owner pipe unavailable"))?;
         let connect = async {
             let (mut acp, _) = acp.accept().await?;
             let (patch, _) = patch.accept().await?;
@@ -201,6 +225,7 @@ impl Guest {
             session,
             patch,
             process,
+            owner: Some(owner),
             _directory: directory,
             broker,
         })
@@ -287,5 +312,28 @@ mod tests {
             .await
             .unwrap();
         assert!(read_patch(&mut host).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn owner_pipe_outlives_startup_polling_and_stops_the_guest_on_close() {
+        let mut process = Command::new("/bin/sh")
+            .args(["-c", WATCH_OWNER, "howl-watchdog-test", "/bin/sleep", "20"])
+            .stdin(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let owner = process.stdin.take().unwrap();
+        assert!(
+            timeout(Duration::from_millis(150), process.wait())
+                .await
+                .is_err()
+        );
+        drop(owner);
+        let status = timeout(Duration::from_secs(3), process.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!status.success());
     }
 }

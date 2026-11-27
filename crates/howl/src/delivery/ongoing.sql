@@ -23,3 +23,23 @@ CREATE TABLE IF NOT EXISTS ongoing_turns (
     UNIQUE (scope, source)
 ) STRICT;
 CREATE INDEX IF NOT EXISTS ongoing_turns_by_scope ON ongoing_turns(scope, id DESC);
+CREATE TABLE IF NOT EXISTS ongoing_work (
+    id BLOB PRIMARY KEY,
+    scope BLOB NOT NULL REFERENCES ongoing_threads(scope),
+    request_key TEXT NOT NULL,
+    queued_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    instruction TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('queued', 'running', 'completed', 'failed', 'cancelled')),
+    cancelled INTEGER NOT NULL DEFAULT 0,
+    feedback TEXT,
+    result TEXT,
+    reported INTEGER NOT NULL DEFAULT 0,
+    UNIQUE (scope, request_key)
+) STRICT;
+CREATE TABLE IF NOT EXISTS ongoing_peer_requests (
+    scope BLOB NOT NULL REFERENCES ongoing_threads(scope),
+    message BLOB NOT NULL,
+    peer BLOB NOT NULL,
+    expires INTEGER NOT NULL,
+    PRIMARY KEY (scope, message)
+) STRICT;

@@ -75,10 +75,12 @@ const settings = JSON.stringify({
   disableClaudeAiConnectors: true,
 });
 const editable = process.env.HOWL_EDITABLE_WORKSPACE === "1";
+const work = process.env.HOWL_WORK_TOOLS === "1";
 const tools = ["read_file", "list_directory"];
 if (editable) tools.push("write_file", "delete_file", "run_tests");
+if (work) tools.push("start_work", "send_peer");
 args.push(
-  "--restricted", "--strict-mcp-config", "--tools", "", "--permission-mode", editable ? "default" : "plan",
+  "--restricted", "--strict-mcp-config", "--tools", "", "--permission-mode", editable || work ? "default" : "plan",
   "--allowedTools", ...tools.map(name => "mcp__howl_repository__" + name),
   "--settings", settings,
 );
