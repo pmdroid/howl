@@ -292,6 +292,13 @@ pub fn inspect_unverified(frame: &[u8]) -> Result<Metadata, Error> {
     Ok(wire::parse(frame)?.metadata)
 }
 
+pub fn inspect_single_recipient_unverified(frame: &[u8]) -> Result<Option<DeviceAddress>, Error> {
+    let decoded = wire::parse(frame)?;
+    let mut recipients = decoded.recipients();
+    let first = recipients.next().map(|(_, address, _)| address);
+    Ok(first.filter(|_| recipients.next().is_none()))
+}
+
 pub fn open(
     frame: &[u8],
     policy: &ReceivePolicy<'_>,

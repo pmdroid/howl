@@ -2,7 +2,8 @@ use aes_gcm::{Aes256Gcm, KeyInit, Nonce, aead::AeadInPlace};
 use ed25519_dalek::Signer;
 use howl_envelope::{
     AgentReply, AgentRole, AuthorizedSender, Body, DeviceAddress, Error, MAX_FRAME_SIZE,
-    ReceivePolicy, Recipient, RecipientSecret, Routing, SigningKey, inspect_unverified, open, seal,
+    ReceivePolicy, Recipient, RecipientSecret, Routing, SigningKey,
+    inspect_single_recipient_unverified, inspect_unverified, open, seal,
 };
 use hpke::{Kem, Serializable, kem::X25519HkdfSha256};
 use serde_json::Value;
@@ -162,6 +163,12 @@ fn authenticates_every_recipient_and_the_expected_channel_epoch() {
     let routing = chat_routing();
     let body = Body::Chat("hello");
     let frame = seal(routing, body, &signer, &recipients).unwrap();
+    assert_eq!(inspect_single_recipient_unverified(&frame), Ok(None));
+    let direct = seal(routing, Body::Chat("hello"), &signer, &recipients[..1]).unwrap();
+    assert_eq!(
+        inspect_single_recipient_unverified(&direct),
+        Ok(Some(address(2)))
+    );
     let mut policy = policy(routing, signer.verifying_key().to_bytes(), &recipients, 1);
     for recipient in [&first, &second] {
         let opened = open(&frame, &policy, recipient).unwrap();
