@@ -16,6 +16,7 @@ use zeroize::Zeroizing;
 mod enrollment;
 mod github;
 mod login;
+pub mod mailbox;
 mod proof;
 mod sessions;
 
