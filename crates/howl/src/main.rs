@@ -9,6 +9,7 @@ use std::{
 use howl::{
     HELP,
     channel::{Channel, MAX_MANIFEST_LEN},
+    control_client, discovery_client,
     identity::{LocalIdentity, PeerCertificate, PeerTrust},
     managed_acp::{Harness, HostClaude, HostCodex, HostGrok},
     node,
@@ -89,8 +90,40 @@ async fn main() -> ExitCode {
         {
             required_text(hint).and_then(|hint| node::import_hint(Path::new(state), hint))
         }
+        [group, command, action, state, address]
+            if group == "mesh" && command == "hint" && action == "publish" =>
+        {
+            match required_text(address)
+                .and_then(|address| address.parse().map_err(io::Error::other))
+            {
+                Ok(address) => discovery_client::publish(Path::new(state), address).await,
+                Err(error) => Err(error),
+            }
+        }
+        [group, command, action, state, peer]
+            if group == "mesh" && command == "hint" && action == "fetch" =>
+        {
+            match parse_id(peer) {
+                Ok(peer) => discovery_client::fetch(Path::new(state), peer).await,
+                Err(error) => Err(error),
+            }
+        }
         [group, action, state] if group == "mesh" && action == "stop" => {
             node::stop(Path::new(state)).await
+        }
+        [group, command, state] if group == "control" && command == "login" => {
+            control_client::login(Path::new(state)).await
+        }
+        [group, command, state, authority, designation, certificate]
+            if group == "control" && command == "enroll" =>
+        {
+            control_client::enroll(
+                Path::new(state),
+                Path::new(authority),
+                Path::new(designation),
+                Path::new(certificate),
+            )
+            .await
         }
         [group, command @ ..] if group == "workflow" => workflow_command(command).await,
         [command, state, channel, peer, route] if command == "send" => {

@@ -9,7 +9,7 @@ use curve25519_dalek::edwards::CompressedEdwardsY;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use iroh_base::{EndpointId, SecretKey};
 use rustix::{
-    fs::{AtFlags, Mode, OFlags, linkat, open, openat, unlinkat},
+    fs::{AtFlags, Mode, OFlags, linkat, open, openat, renameat, unlinkat},
     process::geteuid,
 };
 use sha2::{Digest, Sha256};
@@ -216,7 +216,7 @@ impl PeerTrust {
     }
 }
 
-fn verify(key: &[u8; 32], signed: &[u8], signature: &[u8; 64]) -> io::Result<()> {
+pub(crate) fn verify(key: &[u8; 32], signed: &[u8], signature: &[u8; 64]) -> io::Result<()> {
     if !CompressedEdwardsY(*key)
         .decompress()
         .is_some_and(|point| point.is_torsion_free())
@@ -312,6 +312,34 @@ impl StateDirectory {
     }
 
     pub(crate) fn write(&self, filename: &str, bytes: &[u8]) -> io::Result<bool> {
+        self.write_staged(filename, bytes, false)
+    }
+
+    pub(crate) fn replace(&self, filename: &str, bytes: &[u8]) -> io::Result<()> {
+        match self.open_private(filename) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        self.write_staged(filename, bytes, true).map(|_| ())
+    }
+
+    pub(crate) fn lock(&self, filename: &str) -> io::Result<File> {
+        let lock = File::from(openat(
+            &self.handle,
+            filename,
+            OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::RUSR | Mode::WUSR,
+        )?);
+        check_private(&lock, &self.path.join(filename), false)?;
+        lock.try_lock().map_err(|error| match error {
+            std::fs::TryLockError::WouldBlock => io::ErrorKind::WouldBlock.into(),
+            std::fs::TryLockError::Error(error) => error,
+        })?;
+        Ok(lock)
+    }
+
+    fn write_staged(&self, filename: &str, bytes: &[u8], replace: bool) -> io::Result<bool> {
         let mut nonce = [0; 16];
         getrandom::fill(&mut nonce).map_err(io::Error::other)?;
         let staged_name = format!(".howl-{}", hex::encode(nonce));
@@ -326,6 +354,10 @@ impl StateDirectory {
             check_private(&staged, &self.path.join(&staged_name), false)?;
             staged.write_all(bytes)?;
             staged.sync_all()?;
+            if replace {
+                renameat(&self.handle, staged_name.as_str(), &self.handle, filename)?;
+                return Ok(true);
+            }
             match linkat(
                 &self.handle,
                 staged_name.as_str(),
@@ -340,7 +372,9 @@ impl StateDirectory {
         })();
         let removed = unlinkat(&self.handle, staged_name.as_str(), AtFlags::empty());
         let published = published?;
-        removed?;
+        if !replace {
+            removed?;
+        }
         self.handle.sync_all()?;
         Ok(published)
     }
