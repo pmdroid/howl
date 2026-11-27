@@ -214,6 +214,14 @@ impl Authority {
         Ok(self.head)
     }
 
+    pub fn known_head(&self, digest: Id) -> io::Result<AuthorityHead> {
+        self.head()?;
+        self.entries
+            .get(&digest)
+            .map(|entry| entry.head)
+            .ok_or_else(|| invalid("authority head is outside the pinned history"))
+    }
+
     pub fn records(&self) -> &[AuthorityRecord] {
         &self.records
     }
