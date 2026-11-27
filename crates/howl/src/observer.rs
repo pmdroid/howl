@@ -13,6 +13,7 @@ use tempfile::TempDir;
 
 pub use snapshot::Snapshot;
 
+const MANAGED_LABEL: &str = "com.howl.managed-session";
 const TOOL_PATH: &str = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin";
 pub const WORKSPACE: &str = "/workspace";
 
@@ -44,6 +45,7 @@ type Result<T> = std::result::Result<T, Error>;
 #[derive(Clone)]
 pub struct ObserverProvider {
     socket: PathBuf,
+    engine_id: String,
     config: Arc<TempDir>,
 }
 
@@ -54,8 +56,9 @@ impl ObserverProvider {
         {
             return Err(Error::UnsupportedEngine);
         }
-        let provider = Self {
+        let mut provider = Self {
             socket: socket.to_path_buf(),
+            engine_id: String::new(),
             config: Arc::new(
                 tempfile::Builder::new()
                     .prefix("howl-engine-config-")
@@ -65,7 +68,7 @@ impl ObserverProvider {
         let info = provider.run(
             provider.command().args([
                 "info", "--format",
-                r#"{"os":{{json .OSType}},"cgroup":{{json .CgroupVersion}},"memory":{{json .MemoryLimit}},"swap":{{json .SwapLimit}},"cpu":{{json .CPUCfsQuota}},"pids":{{json .PidsLimit}},"security":{{json .SecurityOptions}}}"#,
+                r#"{"id":{{json .ID}},"os":{{json .OSType}},"cgroup":{{json .CgroupVersion}},"memory":{{json .MemoryLimit}},"swap":{{json .SwapLimit}},"cpu":{{json .CPUCfsQuota}},"pids":{{json .PidsLimit}},"security":{{json .SecurityOptions}}}"#,
             ]),
             "check Linux isolation",
         )?;
@@ -83,7 +86,16 @@ impl ObserverProvider {
         {
             return Err(Error::UnsupportedEngine);
         }
+        provider.engine_id = info["id"]
+            .as_str()
+            .filter(|id| !id.is_empty() && id.len() <= 128 && !id.chars().any(char::is_control))
+            .ok_or(Error::UnsupportedEngine)?
+            .to_owned();
         Ok(provider)
+    }
+
+    pub(crate) fn engine_id(&self) -> &str {
+        &self.engine_id
     }
 
     pub fn launch(
@@ -93,11 +105,37 @@ impl ObserverProvider {
         executable: &Path,
         args: &[&str],
     ) -> Result<ObserverProcess> {
+        self.launch_isolated(snapshot, image, executable, args, None)
+    }
+
+    pub(crate) fn launch_managed(
+        &self,
+        snapshot: &Snapshot,
+        image: &str,
+        executable: &Path,
+        args: &[&str],
+        session: &str,
+    ) -> Result<ObserverProcess> {
+        if !digest(session, &[32]) {
+            return Err(Error::InvalidSnapshot);
+        }
+        self.launch_isolated(snapshot, image, executable, args, Some(session))
+    }
+
+    fn launch_isolated(
+        &self,
+        snapshot: &Snapshot,
+        image: &str,
+        executable: &Path,
+        args: &[&str],
+        session: Option<&str>,
+    ) -> Result<ObserverProcess> {
         if !executable.is_absolute() {
             return Err(Error::InvalidExecutable);
         }
         self.verify_image(image)?;
-        let volume = self.create_volume()?;
+        let label = session.map(|session| format!("{MANAGED_LABEL}={session}"));
+        let volume = self.create_volume(label.as_deref())?;
         let mount = format!(
             "type=volume,src={},dst={WORKSPACE},volume-nocopy",
             volume.name
@@ -105,8 +143,11 @@ impl ObserverProvider {
 
         {
             let mut stage = self.command();
+            stage.arg("create");
+            if let Some(label) = &label {
+                stage.args(["--label", label]);
+            }
             stage.args([
-                "create",
                 "--pull=never",
                 "--network=none",
                 "--no-healthcheck",
@@ -128,9 +169,12 @@ impl ObserverProvider {
 
         let readonly = format!("{mount},readonly");
         let mut create = self.command();
+        create.arg("create");
+        if let Some(label) = &label {
+            create.args(["--label", label]);
+        }
         create
             .args([
-                "create",
                 "--pull=never",
                 "--interactive",
                 "--init",
@@ -222,15 +266,68 @@ impl ObserverProvider {
         Ok(())
     }
 
-    fn create_volume(&self) -> Result<Volume> {
+    pub(crate) fn reap_managed(&self, session: &str) -> Result<()> {
+        if !digest(session, &[32]) {
+            return Err(Error::InvalidSnapshot);
+        }
+        let filter = format!("label={MANAGED_LABEL}={session}");
+        let ids = self.run(
+            self.command().args([
+                "container",
+                "ls",
+                "--all",
+                "--quiet",
+                "--no-trunc",
+                "--filter",
+                &filter,
+            ]),
+            "find previous observer processes",
+        )?;
+        for id in str::from_utf8(&ids)
+            .map_err(|_| Error::UnsupportedEngine)?
+            .lines()
+        {
+            if !digest(id, &[64]) {
+                return Err(Error::UnsupportedEngine);
+            }
+            self.run(
+                self.command().args(["rm", "--force", id]),
+                "remove previous observer process",
+            )?;
+        }
+        let volumes = self.run(
+            self.command()
+                .args(["volume", "ls", "--quiet", "--filter", &filter]),
+            "find previous observer snapshots",
+        )?;
+        for volume in str::from_utf8(&volumes)
+            .map_err(|_| Error::UnsupportedEngine)?
+            .lines()
+        {
+            if !volume
+                .strip_prefix("howl-observer-")
+                .is_some_and(|id| digest(id, &[32]))
+            {
+                return Err(Error::UnsupportedEngine);
+            }
+            self.run(
+                self.command().args(["volume", "rm", volume]),
+                "remove previous observer snapshot",
+            )?;
+        }
+        Ok(())
+    }
+
+    fn create_volume(&self, label: Option<&str>) -> Result<Volume> {
         let mut random = [0; 16];
         getrandom::fill(&mut random).map_err(io::Error::other)?;
         let name = format!("howl-observer-{}", hex::encode(random));
-        self.run(
-            self.command()
-                .args(["volume", "create", "--driver", "local", "--name", &name]),
-            "create disposable snapshot volume",
-        )?;
+        let mut command = self.command();
+        command.args(["volume", "create", "--driver", "local", "--name", &name]);
+        if let Some(label) = label {
+            command.args(["--label", label]);
+        }
+        self.run(&mut command, "create disposable snapshot volume")?;
         Ok(Volume {
             provider: self.clone(),
             name,
@@ -284,6 +381,12 @@ pub struct ObserverProcess {
 }
 
 impl ObserverProcess {
+    pub(crate) fn container_id(&self) -> Option<&str> {
+        self.container
+            .as_ref()
+            .map(|container| container.id.as_str())
+    }
+
     pub fn take_stdin(&mut self) -> Option<ChildStdin> {
         self.child.stdin.take()
     }
@@ -321,6 +424,18 @@ impl ObserverProcess {
 
     pub fn wait(&mut self) -> io::Result<ExitStatus> {
         self.child.wait()
+    }
+
+    pub(crate) fn stop(&mut self) -> Result<()> {
+        if let Some(container) = &self.container {
+            container.remove_owned()?;
+        }
+        if let Some(mut container) = self.container.take() {
+            container.id.clear();
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        Ok(())
     }
 }
 
