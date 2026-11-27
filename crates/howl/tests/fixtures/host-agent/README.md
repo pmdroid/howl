@@ -25,3 +25,12 @@ export HOWL_HOST_GROK=$(command -v grok)
 export HOWL_HOST_GROK_AUTH_PATH="$HOME/.grok/auth.json"
 cargo test --locked -p howl --test host_agents live_host_grok -- --ignored
 ```
+
+## Host Codex
+
+Use native Codex CLI 0.159.3 signed in with ChatGPT. Set the Node, Docker socket, and repository image as above.
+
+```sh
+export HOWL_HOST_CODEX=$(command -v codex)
+cargo test --locked -p howl --test host_agents live_host_codex -- --ignored
+```

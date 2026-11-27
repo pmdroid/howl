@@ -2,12 +2,14 @@ mod chatgpt;
 mod host;
 mod journal;
 mod repository;
+mod repository_http;
 mod v2;
 
 pub use chatgpt::ChatGptPlanAuth;
 use host::HostAgent;
-pub use host::{HostClaude, HostGrok};
+pub use host::{HostClaude, HostCodex, HostGrok};
 use repository::RepositoryEndpoint;
+use repository_http::RepositoryHttp;
 
 use std::{
     future::Future,
@@ -25,7 +27,7 @@ use agent_client_protocol::{
         ConnectionTo,
         schema::{
             CancelNotification, CloseSessionRequest, InitializeRequest, LoadSessionRequest,
-            McpServer, NewSessionRequest, PermissionOptionKind, PromptRequest,
+            McpServer, McpServerHttp, NewSessionRequest, PermissionOptionKind, PromptRequest,
             RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
             ResumeSessionRequest, SelectedPermissionOutcome, SessionId, SessionNotification,
             StopReason,
@@ -145,6 +147,10 @@ impl Harness {
 
     pub fn host_grok(repository_image: String, grok: HostGrok) -> Self {
         Self::host_agent("grok-host", repository_image, HostAgent::Grok(grok))
+    }
+
+    pub fn host_codex(repository_image: String, codex: HostCodex) -> Self {
+        Self::host_agent("codex-host", repository_image, HostAgent::Codex(codex))
     }
 
     fn host_agent(name: &str, repository_image: String, host: HostAgent) -> Self {
@@ -553,6 +559,7 @@ struct HostSession {
     process: host::HostProcess,
     workspace: HostWorkspace,
     _repository: RepositoryEndpoint,
+    _http: Option<RepositoryHttp>,
 }
 
 #[derive(Clone)]
@@ -576,8 +583,16 @@ async fn start_host_agent(process: &mut ObserverProcess, host: HostAgent) -> Res
         return Err(Error::Disconnected);
     }
     let repository = RepositoryEndpoint::start(process)?;
-    let server = repository.mcp_server(host.node())?;
-    let process = host.start()?;
+    let http = if host.uses_http() {
+        Some(RepositoryHttp::start(host.node(), &repository.socket()).await?)
+    } else {
+        None
+    };
+    let server = match &http {
+        Some(http) => McpServer::Http(McpServerHttp::new("howl_repository", http.url())),
+        None => repository.mcp_server(host.node())?,
+    };
+    let process = host.start(http.as_ref())?;
     let workspace = HostWorkspace {
         cwd: process.cwd.clone(),
         server,
@@ -586,6 +601,7 @@ async fn start_host_agent(process: &mut ObserverProcess, host: HostAgent) -> Res
         process,
         workspace,
         _repository: repository,
+        _http: http,
     })
 }
 
