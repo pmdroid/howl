@@ -182,7 +182,7 @@ async fn workflow_command(args: &[OsString]) -> io::Result<()> {
         }
         [command, state] if command == "recover" => {
             let count = workflow::recover(Path::new(state))?;
-            println!("Recovered {count} workflow jobs.");
+            println!("Recovered {count} interrupted workflow jobs.");
         }
         [command, options @ ..] if command == "run" => run_workflow(options).await?,
         _ => return Err(invalid_input("invalid workflow arguments; run howl --help")),

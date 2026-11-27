@@ -129,6 +129,7 @@ pub async fn run_turn(
     snapshot: Snapshot,
     harness: Harness,
 ) -> io::Result<WorkflowReply> {
+    node::parse_route(request.route.as_bytes())?;
     let _lock = WorkflowLock::acquire(request.state)?;
     let identity = LocalIdentity::load_or_create(request.state)?;
     let local = identity.certificate();
