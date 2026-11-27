@@ -49,6 +49,13 @@ async fn both_brokered_harnesses_stream_from_a_host_fixture() {
             "howl-fixture-model",
         ),
         (
+            Provider::ChatGptPlan,
+            "HOWL_CODEX_IMAGE",
+            "/usr/local/bin/node",
+            "/fixture/codex-wrapper.mjs",
+            "howl-fixture-model",
+        ),
+        (
             Provider::XAi,
             "HOWL_GROK_IMAGE",
             "/bin/sh",
@@ -83,11 +90,12 @@ async fn both_brokered_harnesses_stream_from_a_host_fixture() {
             &provider,
             snapshot,
             harness,
-            if kind == Provider::OpenAi {
-                "a".repeat(32)
-            } else {
-                "b".repeat(32)
-            },
+            match kind {
+                Provider::OpenAi => "a",
+                Provider::XAi => "b",
+                Provider::ChatGptPlan => "c",
+            }
+            .repeat(32),
             None,
             Some(Broker::fixture(kind, model, port)),
         )
