@@ -1,5 +1,7 @@
 mod budget;
 mod messages;
+#[cfg(test)]
+mod reply_tests;
 mod wake;
 pub use budget::{
     ApprovedWake, BudgetError, BudgetLimit, BudgetLimits, ConversationBudget, HumanAction,

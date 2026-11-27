@@ -696,7 +696,7 @@ fn frame(metadata: Metadata) -> Frame {
     }
 }
 
-fn parse_route(route: &[u8]) -> io::Result<Option<SocketAddr>> {
+pub(crate) fn parse_route(route: &[u8]) -> io::Result<Option<SocketAddr>> {
     if route == b"-" {
         return Ok(None);
     }
