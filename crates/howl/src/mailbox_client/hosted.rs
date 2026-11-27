@@ -117,7 +117,7 @@ fn may_deposit(
         ));
     }
     let roster = Channel::load(state, identity, &routing.channel)?;
-    let permission = if metadata.intent.is_wake() {
+    let permission = if metadata.intent.requires_wake_permission() {
         ChannelPermission::Wake
     } else {
         ChannelPermission::Send
