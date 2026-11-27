@@ -31,6 +31,7 @@ async fn run() -> Result<()> {
     let url = Zeroizing::new(required("HOWL_CONTROL_DATABASE_URL")?);
     let config: Config = url.parse().map_err(|_| Error::Configuration)?;
     if config.get_hosts().is_empty()
+        || config.get_hostaddrs().iter().any(|ip| !ip.is_loopback())
         || !config.get_hosts().iter().all(|host| match host {
             Host::Tcp(host) => host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback()),
             #[cfg(unix)]
