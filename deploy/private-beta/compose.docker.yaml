@@ -1,0 +1,68 @@
+x-control: &control
+  image: howl-beta-control-runtime:1
+  build:
+    context: .
+    dockerfile: Dockerfile.control
+  network_mode: service:postgres
+  user: "${HOWL_BETA_UID:?set HOWL_BETA_UID}:${HOWL_BETA_GID:?set HOWL_BETA_GID}"
+  depends_on:
+    postgres:
+      condition: service_healthy
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  entrypoint: ["/bin/sh", "/opt/howl/control.sh"]
+
+services:
+  postgres:
+    ports:
+      - "127.0.0.1:${HOWL_BETA_API_PORT:-18080}:18080"
+      - "127.0.0.1:${HOWL_BETA_RELAY_PORT:-13340}:13340"
+
+  api:
+    <<: *control
+    command: []
+    environment:
+      HOWL_BETA_DB_ROLE: howl_control_runtime
+      HOWL_BETA_DB: ${HOWL_BETA_DB:-howl}
+      HOWL_CONTROL_BIND: 127.0.0.1:8080
+      HOWL_GITHUB_CLIENT_ID: fixture
+      HOWL_GITHUB_CLIENT_SECRET: local-fixture
+    volumes:
+      - ${HOWL_BETA_CONTROL_BINARY:?set HOWL_BETA_CONTROL_BINARY}:/opt/howl/howl-control-plane:ro
+      - ./control.sh:/opt/howl/control.sh:ro
+      - ${HOWL_BETA_PRIVATE_DIR:?set HOWL_BETA_PRIVATE_DIR}/postgres-runtime:/run/howl/database-password:ro
+      - ${HOWL_BETA_PRIVATE_DIR:?set HOWL_BETA_PRIVATE_DIR}/state-key:/run/howl/state-key:ro
+      - ${HOWL_BETA_PRIVATE_DIR:?set HOWL_BETA_PRIVATE_DIR}/audience:/run/howl/audience:ro
+
+  operator:
+    <<: *control
+    profiles: [operator]
+    command: ["--migrate"]
+    environment:
+      HOWL_BETA_DB_ROLE: howl_control_owner
+      HOWL_BETA_DB: ${HOWL_BETA_DB:-howl}
+    volumes:
+      - ${HOWL_BETA_CONTROL_BINARY:?set HOWL_BETA_CONTROL_BINARY}:/opt/howl/howl-control-plane:ro
+      - ./control.sh:/opt/howl/control.sh:ro
+      - ${HOWL_BETA_PRIVATE_DIR:?set HOWL_BETA_PRIVATE_DIR}/postgres-owner:/run/howl/database-password:ro
+
+  relay:
+    image: docker.io/library/debian:bookworm-slim@sha256:e67eeead736ff7bbe258ef088bff683635c561b1fcfefad0806c1df4ab49ce0e
+    network_mode: service:postgres
+    user: "${HOWL_BETA_UID:?set HOWL_BETA_UID}:${HOWL_BETA_GID:?set HOWL_BETA_GID}"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    entrypoint: ["/opt/howl/iroh-relay"]
+    command: ["--config-path", "/opt/howl/relay.toml"]
+    volumes:
+      - ${HOWL_BETA_RELAY_BINARY:?set HOWL_BETA_RELAY_BINARY}:/opt/howl/iroh-relay:ro
+      - ${HOWL_BETA_RELAY_CONFIG:?set HOWL_BETA_RELAY_CONFIG}:/opt/howl/relay.toml:ro
+
+  gateway:
+    image: docker.io/library/nginx:1.28-alpine@sha256:a8b39bd9cf0f83869a2162827a0caf6137ddf759d50a171451b335cecc87d236
+    network_mode: service:postgres
+    depends_on: [api, relay]
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
