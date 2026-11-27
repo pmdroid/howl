@@ -134,7 +134,7 @@ async fn workflow_command(args: &[OsString]) -> io::Result<()> {
                 .ok()
                 .filter(|generation| *generation > 0)
                 .ok_or_else(|| invalid_input("grant generation must be a positive integer"))?;
-            node::grant_wake(state, channel, sender, target, generation)?;
+            node::grant_wake(state, channel, sender, target, generation).await?;
             println!("Wake grant installed for {}.", hex::encode(target));
         }
         [command, state, channel, peer, route, target, lifetime] if command == "wake" => {
@@ -151,9 +151,9 @@ async fn workflow_command(args: &[OsString]) -> io::Result<()> {
                 })?;
             let mut text = String::new();
             io::stdin()
-                .take((node::CHAT_LIMIT + 1) as u64)
+                .take((node::WAKE_LIMIT + 1) as u64)
                 .read_to_string(&mut text)?;
-            if text.len() > node::CHAT_LIMIT {
+            if text.len() > node::WAKE_LIMIT {
                 return Err(invalid_input("wake text is too large"));
             }
             let receipt = node::send_wake(
