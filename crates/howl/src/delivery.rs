@@ -18,6 +18,8 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
+use crate::discovery::RouteHint;
+
 pub type Id = [u8; 32];
 
 const MAX_FRAME: usize = 77_112;
@@ -250,6 +252,28 @@ impl DeliveryStore {
         tx.commit()?;
 
         Ok(Self { connection, local })
+    }
+
+    pub(crate) fn import_hint(&self, hint: &RouteHint) -> Result<bool> {
+        let changed = self.connection.execute(
+            "INSERT INTO peer_hints (device, issued, hint) VALUES (?1, ?2, ?3)
+             ON CONFLICT(device) DO UPDATE SET issued = excluded.issued, hint = excluded.hint
+             WHERE peer_hints.issued < excluded.issued OR peer_hints.hint = excluded.hint",
+            params![hint.device(), hint.issued(), hint.as_bytes()],
+        )?;
+        Ok(changed > 0)
+    }
+
+    pub(crate) fn peer_hint(&self, device: &Id) -> Result<Option<RouteHint>> {
+        let bytes = self
+            .connection
+            .query_row(
+                "SELECT hint FROM peer_hints WHERE device = ?1",
+                [device],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(bytes.map(RouteHint::from_bytes))
     }
 
     pub fn presence(&mut self) -> crate::presence::Presence<'_> {
