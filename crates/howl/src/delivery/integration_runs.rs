@@ -1,7 +1,9 @@
 use std::io;
 
 use howl_envelope::AgentReply;
+use rmcp::schemars::{self, JsonSchema};
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
+use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -35,39 +37,80 @@ pub(crate) struct IntegrationRun {
     pub cancellation_requested: bool,
 }
 
+#[derive(Serialize, JsonSchema)]
+pub(crate) struct IntegrationRunSummary<'a> {
+    run: String,
+    channel: String,
+    peer: String,
+    target: String,
+    wake_message: Option<String>,
+    status: IntegrationRunStatus,
+    created_at: &'a str,
+    updated_at: &'a str,
+    cancellation_requested: bool,
+    error: Option<&'static str>,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub(crate) struct IntegrationRunDetails<'a> {
+    #[serde(flatten)]
+    summary: IntegrationRunSummary<'a>,
+    reply: Option<IntegrationRunReply<'a>>,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct IntegrationRunReply<'a> {
+    message: String,
+    text: &'a str,
+}
+
+#[derive(Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum IntegrationRunStatus {
+    Working,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
 impl IntegrationRun {
     pub(crate) fn summary(&self) -> Value {
-        let mut value = self.value();
-        if let Value::Object(fields) = &mut value {
-            fields.remove("reply");
-        }
-        value
+        json!(self.summary_fields())
     }
 
     pub(crate) fn value(&self) -> Value {
-        let (status, reply, error) = match &self.state {
-            IntegrationRunState::Working => ("working", None, None),
-            IntegrationRunState::Cancelled => ("cancelled", None, None),
-            IntegrationRunState::Completed { reply, message } => (
-                "completed",
-                Some(json!({ "text": reply, "message": hex::encode(message) })),
-                None,
-            ),
-            IntegrationRunState::Failed { reason } => ("failed", None, Some(reason)),
+        let reply = match &self.state {
+            IntegrationRunState::Completed { reply, message } => Some(IntegrationRunReply {
+                message: hex::encode(message),
+                text: reply,
+            }),
+            _ => None,
         };
-        json!({
-            "run": hex::encode(self.id),
-            "channel": hex::encode(self.channel),
-            "peer": hex::encode(self.peer),
-            "target": hex::encode(self.target),
-            "wake_message": self.message.map(hex::encode),
-            "status": status,
-            "created_at": self.created_at,
-            "updated_at": self.updated_at,
-            "cancellation_requested": self.cancellation_requested,
-            "reply": reply,
-            "error": error,
+        json!(IntegrationRunDetails {
+            summary: self.summary_fields(),
+            reply,
         })
+    }
+
+    fn summary_fields(&self) -> IntegrationRunSummary<'_> {
+        let (status, error) = match self.state {
+            IntegrationRunState::Working => (IntegrationRunStatus::Working, None),
+            IntegrationRunState::Cancelled => (IntegrationRunStatus::Cancelled, None),
+            IntegrationRunState::Completed { .. } => (IntegrationRunStatus::Completed, None),
+            IntegrationRunState::Failed { reason } => (IntegrationRunStatus::Failed, Some(reason)),
+        };
+        IntegrationRunSummary {
+            run: hex::encode(self.id),
+            channel: hex::encode(self.channel),
+            peer: hex::encode(self.peer),
+            target: hex::encode(self.target),
+            wake_message: self.message.map(hex::encode),
+            status,
+            created_at: &self.created_at,
+            updated_at: &self.updated_at,
+            cancellation_requested: self.cancellation_requested,
+            error,
+        }
     }
 }
 

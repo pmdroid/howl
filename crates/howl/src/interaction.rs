@@ -33,23 +33,46 @@ pub struct Message {
     pub role: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub integration: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub in_reply_to: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_digest: Option<String>,
 }
 
 impl From<ChannelMessage> for Message {
     fn from(item: ChannelMessage) -> Self {
-        let (text, role) = match item.body {
-            Body::Chat(text) => (text, None),
-            Body::AgentReply(reply) => (reply.text, Some(reply.role.name())),
-            Body::Wake { text, .. } => (text, Some("wake")),
-        };
-        Self {
+        let mut message = Self {
             message: hex::encode(item.message),
             sender: hex::encode(item.sender.device),
             time: item.received_at,
-            text,
-            role,
+            text: String::new(),
+            role: None,
             integration: item.integration.map(hex::encode),
-        }
+            agent: None,
+            target: None,
+            in_reply_to: None,
+            context_digest: None,
+        };
+        message.text = match item.body {
+            Body::Chat(text) => text,
+            Body::AgentReply(reply) => {
+                message.role = Some(reply.role.name());
+                message.agent = Some(hex::encode(reply.agent));
+                message.in_reply_to = Some(hex::encode(reply.in_reply_to));
+                message.context_digest = Some(hex::encode(reply.context_digest));
+                reply.text
+            }
+            Body::Wake { session, text } => {
+                message.role = Some("wake");
+                message.target = Some(hex::encode(session));
+                text
+            }
+        };
+        message
     }
 }
 
