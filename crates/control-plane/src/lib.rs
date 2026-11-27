@@ -13,11 +13,13 @@ use serde::{Deserialize, Serialize};
 use tokio_postgres::Row;
 use zeroize::Zeroizing;
 
+mod enrollment;
 mod github;
 mod login;
 mod proof;
 mod sessions;
 
+pub use enrollment::{EnrollmentPin, TrustedDevice, pin_enrollment};
 pub use github::GitHub;
 pub use proof::{Id, Proof, credential_digest, signing_bytes};
 pub use sessions::{Credentials, PendingSession};
@@ -82,6 +84,7 @@ impl ControlPlane {
     pub fn router(self: Arc<Self>) -> Router {
         Router::new()
             .route("/healthz", get(health))
+            .merge(enrollment::routes())
             .route("/v1/login/device", post(begin_login))
             .route("/v1/login/device/{id}/poll", post(poll_login))
             .route("/v1/auth/challenge", post(challenge))
@@ -100,6 +103,8 @@ pub async fn migrate(pool: &Pool) -> Result<()> {
     tx.query_one("SELECT pg_advisory_xact_lock(4983033826038031201)", &[])
         .await?;
     tx.batch_execute(include_str!("../migrations/001_auth.sql"))
+        .await?;
+    tx.batch_execute(include_str!("../migrations/002_enrollment.sql"))
         .await?;
     tx.commit().await?;
     Ok(())
@@ -188,10 +193,7 @@ async fn session(
     headers: HeaderMap,
 ) -> Result<Json<PendingSession>> {
     let token = bearer(&headers)?;
-    let proof = Proof {
-        nonce: header_value(&headers, "howl-nonce")?.into(),
-        signature: header_value(&headers, "howl-signature")?.into(),
-    };
+    let proof = request_proof(&headers)?;
     control
         .authorize("session", token, &proof, b"")
         .await
@@ -220,6 +222,13 @@ fn bearer(headers: &HeaderMap) -> Result<&str> {
         .strip_prefix("Bearer ")
         .filter(|token| token.len() == 64)
         .ok_or(Error::Unauthorized)
+}
+
+fn request_proof(headers: &HeaderMap) -> Result<Proof> {
+    Ok(Proof {
+        nonce: header_value(headers, "howl-nonce")?.into(),
+        signature: header_value(headers, "howl-signature")?.into(),
+    })
 }
 
 fn header_value<'a>(headers: &'a HeaderMap, name: &'static str) -> Result<&'a str> {
