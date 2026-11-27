@@ -1285,6 +1285,7 @@ version = "0.1.0"
 dependencies = [
  "aes-gcm",
  "agent-client-protocol",
+ "axum",
  "base64 0.22.1",
  "curve25519-dalek 5.0.0",
  "ed25519-dalek 3.0.0",
@@ -1292,7 +1293,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.4.3",
  "hex",
- "hmac",
+ "hmac 0.12.1",
  "howl-envelope",
  "hpke",
  "iroh",
