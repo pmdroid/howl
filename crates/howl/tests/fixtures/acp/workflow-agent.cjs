@@ -1,4 +1,5 @@
 const assert = require("node:assert/strict");
+const { randomUUID } = require("node:crypto");
 const { existsSync, readFileSync } = require("node:fs");
 const { createInterface } = require("node:readline");
 
@@ -17,7 +18,7 @@ const turns = {
   },
 };
 assert(selected[agent]);
-const sessionId = agent + "-fixture";
+const sessionId = randomUUID();
 
 function send(message) {
   process.stdout.write(JSON.stringify({ jsonrpc: "2.0", ...message }) + "\n");
@@ -70,4 +71,4 @@ async function run() {
   }
 }
 
-run().catch(() => { process.exitCode = 1; });
+run().catch(() => process.exit(1));
