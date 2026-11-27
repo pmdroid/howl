@@ -671,7 +671,7 @@ fn recipient(cert: &PeerCertificate) -> Recipient {
     }
 }
 
-fn local_stream(channel: Id, certificate: &PeerCertificate) -> Stream {
+pub(crate) fn local_stream(channel: Id, certificate: &PeerCertificate) -> Stream {
     let mut hash = Sha256::new();
     hash.update(b"howl/key/v1/device-signing\0");
     hash.update(certificate.signing_public());
