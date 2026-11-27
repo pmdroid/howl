@@ -64,12 +64,13 @@ pub(super) enum Command {
         peer: String,
         route: String,
         text: String,
-        target: String,
+        target: Option<String>,
         lifetime: u16,
     },
     Grant {
         channel: String,
         peer: String,
+        #[serde(default)]
         role: Role,
         generation: u64,
     },
@@ -80,10 +81,11 @@ pub(super) enum Command {
     },
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub(super) enum Role {
     Architect,
+    #[default]
     Reviewer,
 }
 
@@ -133,12 +135,18 @@ async fn execute(web: Arc<Web>, input: Command) -> io::Result<Value> {
             target,
             lifetime,
         } => {
+            let peer = id(&peer)?;
+            let target = target
+                .as_deref()
+                .map(id)
+                .transpose()?
+                .unwrap_or_else(|| AgentRole::default().agent_id(&peer));
             interaction
                 .wake(Wake {
                     channel: id(&channel)?,
-                    peer: id(&peer)?,
+                    peer,
                     route: &route,
-                    target: id(&target)?,
+                    target,
                     lifetime,
                     text: &text,
                 })
@@ -293,14 +301,12 @@ fn overview(state: &Path, identity: &LocalIdentity) -> io::Result<Value> {
     }
     channels.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
     peers.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
-    let agents = [AgentRole::Architect, AgentRole::Reviewer].map(
-        |role| json!({ "role": role.name(), "id": hex::encode(role.agent_id(local.device_id())) }),
-    );
+    let agent = AgentRole::default().agent_id(local.device_id());
     Ok(json!({
         "local": device_view(&local),
         "channels": channels,
         "peers": peers,
-        "agents": agents,
+        "agents": [{ "id": hex::encode(agent) }],
     }))
 }
 

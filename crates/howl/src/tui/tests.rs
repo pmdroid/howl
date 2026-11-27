@@ -15,7 +15,7 @@ fn event(cursor: u64, text: &str) -> Event {
             sender: hex::encode(PEER),
             time: 4,
             text: text.into(),
-            role: Some("reviewer"),
+            role: Some("agent"),
             integration: None,
             agent: Some(hex::encode([5u8; 32])),
             target: None,
@@ -36,7 +36,7 @@ fn app() -> App {
 }
 
 #[test]
-fn wake_requires_a_selected_peer_and_an_explicit_role_mention() {
+fn legacy_mentions_preserve_existing_targets_and_escape_as_chat() {
     let mut app = app();
     app.focus = Focus::Compose;
     app.insert("@reviewer inspect the changes");
@@ -110,7 +110,6 @@ fn cursor_deduplicates_reconnect_and_permission_loss_clears_the_view() {
                 gap: false,
                 more: false,
             }),
-            agents: None,
             workflows: None,
         }),
         delivery: None,
@@ -325,7 +324,7 @@ fn mouse_confirmation_requires_the_confirm_button() {
 }
 
 #[test]
-fn completes_peer_and_channel_recipients_and_preserves_role_wakes() {
+fn completes_agent_names_for_tasks_and_channel_names_for_chat() {
     let mut app = App::new();
     let channel = [2; 32];
     let other_channel = [3; 32];
@@ -347,18 +346,26 @@ fn completes_peer_and_channel_recipients_and_preserves_role_wakes() {
     app.draft = "@cl".into();
     assert!(app.complete());
     assert_eq!(app.draft, "@claude-code ");
-    app.draft.push_str("Hello");
+    assert!(app.submit().is_err());
+    app.draft.push_str("Review the test");
+    assert!(
+        matches!(app.submit().unwrap(), Some(Action::Wake { peer: actual, target, text, .. })
+        if actual == peer && target == AgentRole::default().agent_id(&peer) && text == "Review the test")
+    );
+    app.draft = "Hello".into();
     assert!(
         matches!(app.submit().unwrap(), Some(Action::Direct { peer: actual, text, .. })
         if actual == peer && text == "Hello")
     );
-    app.draft = "@claude-code @rev".into();
-    assert!(app.complete());
-    app.draft.push_str("Review the test");
-    assert!(
-        matches!(app.submit().unwrap(), Some(Action::Wake { peer: actual, text, .. })
-        if actual == peer && text == "Review the test")
-    );
+    let second = [5; 32];
+    app.channels[0].peers.push(second);
+    app.peer_labels
+        .insert(hex::encode(second), "Claude Code".into());
+    app.peer = None;
+    app.draft = "@claude-code Review the test".into();
+    assert!(app.submit().is_err());
+    app.peer = Some(second);
+    assert!(matches!(app.submit().unwrap(), Some(Action::Wake { peer, .. }) if peer == second));
     app.draft = "#03".into();
     assert!(app.complete());
     app.draft.push_str("Hello channel");

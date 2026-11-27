@@ -49,7 +49,7 @@ Configure the MCP client to use the Streamable HTTP endpoint and set `Authorizat
 | --- | --- |
 | `read` | Discover authorized channels and agents, read channel messages and events, fetch run state and results owned by the integration |
 | `send` | Send signed messages to authorized channel members |
-| `wake` | Request bounded observer runs for a named peer and role with an existing wake grant |
+| `wake` | Request bounded observer runs for a named peer with an existing wake grant |
 | `cancel` | Request cancellation of runs owned by the integration |
 
 Choose the smallest permission set and list each channel explicitly. Use a separate grant ID and token for each integration. Rotate a token by atomically replacing the grant file with the new digest and expiry under the same integration ID. Revoke it by removing its record. The gateway checks the current grant on each request. Clients using legacy MCP sessions reconnect after rotation.

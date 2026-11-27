@@ -120,7 +120,6 @@ async fn delivered(state: &Path, channel: Id, receipt: &str, recipient: Id) -> I
 
 struct ExpectedReply<'a> {
     sender: Id,
-    role: AgentRole,
     agent: Id,
     message: Id,
     wake: Id,
@@ -130,9 +129,8 @@ struct ExpectedReply<'a> {
 fn assert_received(state: &Path, channel: Id, reply: ExpectedReply<'_>) {
     let inbox = stdout(mesh_cli(&["read"], state, &[&hex::encode(channel)]));
     let source = format!(
-        "agent {} {} {} message={} reply-to={} context=",
+        "agent {} {} message={} reply-to={} context=",
         hex::encode(reply.sender),
-        reply.role.name(),
         hex::encode(reply.agent),
         hex::encode(reply.message),
         hex::encode(reply.wake)
@@ -433,7 +431,6 @@ async fn exercise_workflow(input: TestWorkflow<'_>, harness: impl Fn(&str) -> Ha
         channel,
         ExpectedReply {
             sender: alice_device,
-            role: AgentRole::Architect,
             agent: architect,
             message: draft_id,
             wake,
@@ -501,7 +498,6 @@ async fn exercise_workflow(input: TestWorkflow<'_>, harness: impl Fn(&str) -> Ha
         channel,
         ExpectedReply {
             sender: bob_device,
-            role: AgentRole::Reviewer,
             agent: reviewer,
             message: review_id,
             wake,
@@ -556,7 +552,6 @@ async fn exercise_workflow(input: TestWorkflow<'_>, harness: impl Fn(&str) -> Ha
         channel,
         ExpectedReply {
             sender: alice_device,
-            role: AgentRole::Architect,
             agent: architect,
             message: final_id,
             wake,

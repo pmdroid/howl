@@ -64,10 +64,11 @@ impl Intent {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[repr(u8)]
 pub enum AgentRole {
     Architect = 1,
+    #[default]
     Reviewer = 2,
 }
 
@@ -78,6 +79,12 @@ impl AgentRole {
         hash.update(device);
         hash.update([self as u8]);
         hash.finalize().into()
+    }
+
+    pub fn matches_agent_id(device: &Id, target: &Id) -> bool {
+        [Self::Architect, Self::Reviewer]
+            .into_iter()
+            .any(|role| role.agent_id(device) == *target)
     }
 
     pub const fn name(self) -> &'static str {

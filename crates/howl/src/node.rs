@@ -389,8 +389,7 @@ pub fn read(state: &Path, id: Id) -> io::Result<()> {
         match item.body {
             Body::Chat(text) => println!("{sender} {} {text:?}", item.received_at),
             Body::AgentReply(reply) => println!(
-                "agent {sender} {} {} message={} reply-to={} context={} {} {:?}",
-                reply.role.name(),
+                "agent {sender} {} message={} reply-to={} context={} {} {:?}",
                 hex::encode(reply.agent),
                 hex::encode(item.message),
                 hex::encode(reply.in_reply_to),

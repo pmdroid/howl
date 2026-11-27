@@ -307,9 +307,28 @@ async fn modern_tasks_and_tools_only_clients_share_a_run_after_gateway_restart()
             .is_some(),
         "{discovery}"
     );
+    let agents = wire
+        .modern(
+            PRIMARY,
+            false,
+            "tools/call",
+            json!({
+                "name": "list_agents",
+                "arguments": {"channel": hex::encode(channel)}
+            }),
+        )
+        .await;
+    let discovered = &agents["result"]["structuredContent"]["agents"];
+    assert_eq!(
+        discovered,
+        &json!([{
+            "id": hex::encode(AgentRole::Reviewer.agent_id(&device)),
+            "device": hex::encode(device),
+            "availability": "unknown"
+        }])
+    );
     let wake = json!({"name": "wake", "arguments": {
         "channel": hex::encode(channel), "peer": hex::encode(device),
-        "target": hex::encode(AgentRole::Reviewer.agent_id(&device)),
         "key": "one-discussion", "lifetime": 90, "text": "review the plan",
     }});
     let native = wire.modern(PRIMARY, true, "tools/call", wake.clone()).await;
@@ -321,7 +340,9 @@ async fn modern_tasks_and_tools_only_clients_share_a_run_after_gateway_restart()
     let run = &fallback["result"]["structuredContent"];
     assert_eq!(run["run"], id, "{fallback}");
     assert!(run["wake_message"].is_string());
-    let legacy = wire.legacy_wake(wake).await;
+    let mut explicit = wake;
+    explicit["arguments"]["target"] = json!(hex::encode(AgentRole::Reviewer.agent_id(&device)));
+    let legacy = wire.legacy_wake(explicit).await;
     assert_eq!(legacy["result"]["structuredContent"]["run"], id, "{legacy}");
     let task = json!({"taskId": id});
     let status = wire.modern(PRIMARY, true, "tasks/get", task.clone()).await;

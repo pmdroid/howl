@@ -32,7 +32,6 @@ pub struct LocalDevice {
 pub struct AgentAddress {
     pub id: String,
     pub device: String,
-    pub role: &'static str,
     pub availability: &'static str,
 }
 
@@ -72,7 +71,7 @@ impl From<ChannelMessage> for Message {
         message.text = match item.body {
             Body::Chat(text) => text,
             Body::AgentReply(reply) => {
-                message.role = Some(reply.role.name());
+                message.role = Some("agent");
                 message.agent = Some(hex::encode(reply.agent));
                 message.in_reply_to = Some(hex::encode(reply.in_reply_to));
                 message.context_digest = Some(hex::encode(reply.context_digest));
@@ -228,16 +227,15 @@ impl<'a> LocalInteraction<'a> {
 
     pub fn agents(&self, channel: Id) -> io::Result<Vec<AgentAddress>> {
         let channel = self.authorize(channel, ChannelPermission::Receive)?;
+        let local = self.identity()?.certificate();
         Ok(channel
             .members()
             .iter()
-            .flat_map(|peer| {
-                [AgentRole::Architect, AgentRole::Reviewer].map(|role| AgentAddress {
-                    id: hex::encode(role.agent_id(peer.device_id())),
-                    device: hex::encode(peer.device_id()),
-                    role: role.name(),
-                    availability: "unknown",
-                })
+            .filter(|peer| peer.device_id() != local.device_id())
+            .map(|peer| AgentAddress {
+                id: hex::encode(AgentRole::default().agent_id(peer.device_id())),
+                device: hex::encode(peer.device_id()),
+                availability: "unknown",
             })
             .collect())
     }

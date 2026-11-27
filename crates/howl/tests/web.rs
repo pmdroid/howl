@@ -245,9 +245,11 @@ async fn paired_web_sessions_send_search_inspect_and_wake_through_two_nodes() {
         .iter()
         .find_map(|line| line.strip_prefix("Listening "))
         .unwrap();
-    let grant = bob.api(json!({
-        "action": "grant", "channel": channel, "peer": alice_id, "role": "reviewer", "generation": 1,
-    })).await;
+    let grant = bob
+        .api(json!({
+            "action": "grant", "channel": channel, "peer": alice_id, "generation": 1,
+        }))
+        .await;
 
     let text = "Read-only review <script>literal</script>";
     let sent = alice
@@ -258,7 +260,7 @@ async fn paired_web_sessions_send_search_inspect_and_wake_through_two_nodes() {
     let wake = alice
         .api(json!({
             "action": "wake", "channel": channel, "peer": bob_id, "route": route,
-            "text": "Review this plan", "target": grant["target"], "lifetime": 120,
+            "text": "Review this plan", "lifetime": 120,
         }))
         .await;
     tokio::time::timeout(WAIT, async {
