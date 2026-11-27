@@ -115,6 +115,7 @@ enum EnqueueTime<'a> {
 
 enum AdmissionTime<'a> {
     Known(u64),
+    MailboxHistory(u64),
     NetworkWake(&'a dyn Fn() -> io::Result<u64>),
 }
 
@@ -675,6 +676,23 @@ impl DeliveryStore {
         )
     }
 
+    pub(crate) fn accept_mailbox_history(
+        &mut self,
+        frame: Frame,
+        bytes: &[u8],
+        payload: Payload<'_>,
+        now: u64,
+        local_signer: &SigningKey,
+    ) -> Result<Receipt> {
+        self.accept_payload(
+            frame,
+            bytes,
+            payload,
+            AdmissionTime::MailboxHistory(now),
+            local_signer,
+        )
+    }
+
     fn accept_payload(
         &mut self,
         frame: Frame,
@@ -691,7 +709,12 @@ impl DeliveryStore {
                 (1, None, body, None)
             }
             Payload::Wake { target, text } if frame.expires_at != 0 && text.len() <= 65_504 => {
-                (2, Some(target), text, None)
+                let kind = if matches!(time, AdmissionTime::MailboxHistory(_)) {
+                    4
+                } else {
+                    2
+                };
+                (kind, Some(target), text, None)
             }
             Payload::AgentReply(reply)
                 if frame.expires_at == 0
@@ -730,6 +753,7 @@ impl DeliveryStore {
                 }
                 now
             }
+            AdmissionTime::MailboxHistory(now) => now,
             AdmissionTime::NetworkWake(clock) => {
                 let target = target.ok_or(Error::InvalidFrame)?;
                 let now = clock()?;
@@ -814,7 +838,7 @@ impl DeliveryStore {
                         reply.context_digest
                     ],
                 )?;
-            } else {
+            } else if kind == 2 {
                 tx.execute(
                     "INSERT INTO wake_queue (cursor, generation, state)
                      SELECT ?1, generation, 0 FROM wake_targets WHERE channel = ?2 AND target = ?3 AND status = 1",
@@ -899,7 +923,7 @@ impl DeliveryStore {
         )?;
         tx.execute(
             "UPDATE inbox SET body = NULL WHERE substr(stream, 1, 32) = ?1
-             AND ((kind IN (1, 3) AND received < ?2) OR (kind = 2 AND (epoch < ?3 OR expires <= ?4)))",
+             AND ((kind IN (1, 3, 4) AND received < ?2) OR (kind = 2 AND (epoch < ?3 OR expires <= ?4)))",
             params![channel, old_chat, epoch, now],
         )?;
         tx.execute(

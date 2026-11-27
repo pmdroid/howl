@@ -297,6 +297,23 @@ pub fn open(
     policy: &ReceivePolicy<'_>,
     receiver: &RecipientSecret,
 ) -> Result<OpenedEnvelope, Error> {
+    open_envelope(frame, policy, receiver, true)
+}
+
+pub fn open_history(
+    frame: &[u8],
+    policy: &ReceivePolicy<'_>,
+    receiver: &RecipientSecret,
+) -> Result<OpenedEnvelope, Error> {
+    open_envelope(frame, policy, receiver, false)
+}
+
+fn open_envelope(
+    frame: &[u8],
+    policy: &ReceivePolicy<'_>,
+    receiver: &RecipientSecret,
+    enforce_wake_expiry: bool,
+) -> Result<OpenedEnvelope, Error> {
     let decoded = wire::parse(frame)?;
     let metadata = decoded.metadata;
     let routing = metadata.routing;
@@ -312,7 +329,8 @@ pub fn open(
     {
         return Err(Error::Unauthorized);
     }
-    if metadata.intent == Intent::Wake
+    if enforce_wake_expiry
+        && metadata.intent == Intent::Wake
         && (policy.now < routing.created_at.saturating_sub(30) || policy.now >= routing.expires_at)
     {
         return Err(Error::Stale);

@@ -365,3 +365,58 @@ fn read_claim(row: &Row<'_>, execution: Id) -> rusqlite::Result<WakeClaim> {
         expires_at: u64::from_be_bytes(row.get(3)?),
     })
 }
+
+#[derive(serde::Serialize)]
+pub(crate) struct WorkflowStatus {
+    message: String,
+    target: String,
+    state: &'static str,
+    root: Option<String>,
+    paused: bool,
+}
+
+impl DeliveryStore {
+    pub(crate) fn workflow_status(&self, channel: Id, now: u64) -> Result<Vec<WorkflowStatus>> {
+        let mut statement = self.connection.prepare(
+            "SELECT i.message, i.target, w.state, r.root, coalesce(r.paused, 0), i.expires
+             FROM wake_queue w JOIN inbox i ON i.id = w.cursor
+             LEFT JOIN budget_wakes a ON a.execution = w.execution
+             LEFT JOIN budget_turns t ON t.id = a.turn
+             LEFT JOIN budget_roots r ON r.root = t.root
+             WHERE substr(i.stream, 1, 32) = ?1 ORDER BY w.cursor DESC LIMIT 100",
+        )?;
+        Ok(statement
+            .query_map([channel], |row| {
+                let state = match row.get::<_, i64>(2)? {
+                    0..=2 if u64::from_be_bytes(row.get(5)?) <= now => "expired",
+                    0 => "pending",
+                    1 => "claimed",
+                    2 => "running",
+                    3 => "finished",
+                    4 => "cancelled",
+                    5 => "uncertain",
+                    _ => return Err(rusqlite::Error::InvalidQuery),
+                };
+                Ok(WorkflowStatus {
+                    message: hex::encode(row.get::<_, Id>(0)?),
+                    target: hex::encode(row.get::<_, Id>(1)?),
+                    state,
+                    root: row.get::<_, Option<Id>>(3)?.map(hex::encode),
+                    paused: row.get(4)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    pub(crate) fn has_workflow_root(&self, channel: Id, root: Id) -> Result<bool> {
+        Ok(self.connection.query_row(
+            "SELECT EXISTS (SELECT 1 FROM budget_turns t
+             JOIN budget_wakes a ON a.turn = t.id
+             JOIN wake_queue w ON w.execution = a.execution
+             JOIN inbox i ON i.id = w.cursor
+             WHERE t.root = ?2 AND substr(i.stream, 1, 32) = ?1)",
+            params![channel, root],
+            |row| row.get(0),
+        )?)
+    }
+}
