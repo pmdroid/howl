@@ -18,6 +18,7 @@ mod enrollment;
 mod github;
 mod login;
 pub mod mailbox;
+mod mailbox_http;
 mod proof;
 mod sessions;
 
@@ -88,6 +89,7 @@ impl ControlPlane {
             .route("/healthz", get(health))
             .merge(enrollment::routes())
             .merge(discovery::routes())
+            .merge(mailbox_http::routes())
             .route("/v1/login/device", post(begin_login))
             .route("/v1/login/device/{id}/poll", post(poll_login))
             .route("/v1/auth/challenge", post(challenge))
@@ -109,6 +111,9 @@ pub async fn migrate(pool: &Pool) -> Result<()> {
         .await?;
     tx.batch_execute(include_str!("../migrations/002_enrollment.sql"))
         .await?;
+    mailbox::migrate_in(&tx)
+        .await
+        .map_err(|_| Error::Internal)?;
     tx.batch_execute(include_str!("../migrations/004_discovery.sql"))
         .await?;
     tx.commit().await?;
