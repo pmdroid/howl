@@ -76,6 +76,8 @@ async fn run() -> Result<()> {
     let audience = configured_id("HOWL_CONTROL_AUDIENCE")?;
     let state_key = configured_id("HOWL_CONTROL_STATE_KEY")?;
     let control = Arc::new(ControlPlane::new(pool, github, *audience, state_key)?);
+    let housekeeping = Arc::clone(&control);
+    tokio::spawn(async move { housekeeping.run_mailbox_maintenance().await });
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .map_err(|_| Error::Configuration)?;
