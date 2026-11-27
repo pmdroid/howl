@@ -5,6 +5,7 @@ pub use authority::{Authority, AuthorityHead, AuthorityRecord, Id, Import};
 pub use store::AuthorityStore;
 mod membership;
 mod pairing;
+pub(crate) mod profile;
 mod recovery;
 mod roster;
 mod roster_store;

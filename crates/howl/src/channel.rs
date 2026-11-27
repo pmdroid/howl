@@ -3,7 +3,10 @@ use std::{io, path::Path};
 use howl_envelope::MAX_RECIPIENTS as MAX_MEMBERS;
 use sha2::{Digest, Sha256};
 
-use crate::identity::{LocalIdentity, PeerCertificate, PeerTrust, StateDirectory};
+use crate::{
+    enrollment::{ChannelPermission, Roster, RosterStore, profile::Profile},
+    identity::{LocalIdentity, PeerCertificate, PeerTrust, StateDirectory},
+};
 
 const DOMAIN: &[u8] = b"howl/manual-channel/v1\0";
 const MEMBER_LEN: usize = 64;
@@ -15,6 +18,7 @@ pub struct Channel {
     id: [u8; 32],
     members: Vec<PeerCertificate>,
     manifest: Vec<u8>,
+    roster: Option<Roster>,
 }
 
 impl Channel {
@@ -56,6 +60,7 @@ impl Channel {
             id,
             members,
             manifest,
+            roster: None,
         };
         channel.persist(state)?;
         Ok(channel)
@@ -68,6 +73,9 @@ impl Channel {
     }
 
     pub fn load(state: &Path, local: &LocalIdentity, id: &[u8; 32]) -> io::Result<Self> {
+        if let Some(profile) = Profile::load(state, &local.certificate())? {
+            return Self::load_enrolled(state, local, id, profile);
+        }
         let manifest =
             StateDirectory::open(state)?.read_bounded(&filename(id), MAX_MANIFEST_LEN as u64)?;
         let channel = Self::verify(local, &PeerTrust::open(state)?, &manifest)?;
@@ -75,6 +83,97 @@ impl Channel {
             return Err(invalid("stored channel ID does not match"));
         }
         Ok(channel)
+    }
+
+    pub(crate) fn known(state: &Path, local: &LocalIdentity, id: &[u8; 32]) -> io::Result<()> {
+        if Profile::account(state)?.is_some() {
+            if RosterStore::open(state, *id)?.has_history()? {
+                return Ok(());
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "unknown signed channel",
+            ));
+        }
+        Self::load(state, local, id).map(|_| ())
+    }
+
+    fn load_enrolled(
+        state: &Path,
+        identity: &LocalIdentity,
+        id: &[u8; 32],
+        profile: Profile,
+    ) -> io::Result<Self> {
+        let mut history = RosterStore::open(state, *id)?.load(&profile.authority)?;
+        history.learn_designation(&profile.designation);
+        let roster = history.active(&profile.designation)?.clone();
+        let local = identity.certificate();
+        let mut members = Vec::new();
+        for member in roster.members() {
+            if member.address.account != profile.local.account {
+                return Err(denied("channel member is outside the enrolled account"));
+            }
+            let (signed, peer) = if member.address.device == profile.local.device {
+                (profile.local.clone(), local.clone())
+            } else {
+                match profile.peer(member.address.device) {
+                    Ok(peer) => peer,
+                    Err(error)
+                        if error.kind() == io::ErrorKind::InvalidData
+                            && profile.designation.revoked_through(member.address.device) > 0 =>
+                    {
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
+            };
+            if signed.digest != member.certificate {
+                return Err(denied(
+                    "channel member certificate does not match the signed roster",
+                ));
+            }
+            if [
+                ChannelPermission::Receive,
+                ChannelPermission::Send,
+                ChannelPermission::Wake,
+            ]
+            .into_iter()
+            .any(|permission| {
+                history
+                    .authorize(&profile.designation, &signed, permission)
+                    .is_ok()
+            }) {
+                members.push(peer);
+            }
+        }
+        if !members
+            .iter()
+            .any(|member| member.device_id() == local.device_id())
+        {
+            return Err(denied("local device is outside the active signed roster"));
+        }
+        Ok(Self {
+            id: *id,
+            members,
+            manifest: Vec::new(),
+            roster: Some(roster),
+        })
+    }
+
+    pub fn epoch(&self) -> u64 {
+        self.roster.as_ref().map_or(1, Roster::epoch)
+    }
+
+    pub fn allows(&self, device: &[u8; 32], permission: ChannelPermission) -> bool {
+        self.members
+            .iter()
+            .any(|member| member.device_id() == device)
+            && self.roster.as_ref().is_none_or(|roster| {
+                roster
+                    .members()
+                    .iter()
+                    .any(|member| member.address.device == *device && member.allows(permission))
+            })
     }
 
     pub fn id(&self) -> &[u8; 32] {
@@ -148,6 +247,7 @@ impl Channel {
             id,
             members,
             manifest: manifest.to_vec(),
+            roster: None,
         })
     }
 

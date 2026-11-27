@@ -252,12 +252,15 @@ impl RosterChain {
             .or_insert(floor.sequence);
     }
 
-    pub fn active(&self, current: &Designation) -> io::Result<&Roster> {
+    pub fn latest(&self) -> io::Result<Option<&Roster>> {
         if !self.conflicts.is_empty() {
             return Err(invalid("roster has a verified fork"));
         }
-        self.head
-            .and_then(|head| self.accepted.get(&head))
+        Ok(self.head.and_then(|head| self.accepted.get(&head)))
+    }
+
+    pub fn active(&self, current: &Designation) -> io::Result<&Roster> {
+        self.latest()?
             .filter(|roster| roster.designation == current.digest() && !roster.paused)
             .ok_or_else(|| invalid("no active roster matches the current designation"))
     }

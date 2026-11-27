@@ -33,6 +33,14 @@ impl RosterStore {
         })
     }
 
+    pub fn has_history(&self) -> io::Result<bool> {
+        match self.state.read_bounded(&self.name(0), MAX_ENTRY as u64) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
     pub fn load(&self, authority: &Authority) -> io::Result<RosterChain> {
         Ok(self.history(authority)?.chain)
     }
