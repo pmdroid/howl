@@ -1,7 +1,7 @@
 use howl_envelope::{AgentReply, AgentRole, Body, inspect_single_recipient_unverified};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
-use super::{DeliveryStore, Device, Error, Id, Result};
+use super::{DeliveryStore, Device, Error, Id, Result, WakeClaim};
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct ChannelMessage {
@@ -37,6 +37,33 @@ const MESSAGES: &str = "
     WHERE substr(i.stream, 1, 32) = ?1 AND i.body IS NOT NULL";
 
 impl DeliveryStore {
+    pub(crate) fn observer_history(
+        &self,
+        claim: &WakeClaim,
+        scope: Id,
+    ) -> Result<Vec<(String, String)>> {
+        let mut statement = self.connection.prepare(
+            "SELECT t.instruction, r.body FROM conversation_turns t
+             JOIN inbox w ON w.id = t.wake_cursor
+             JOIN inbox r ON r.id = t.reply_cursor
+             JOIN wake_queue q ON q.cursor = w.id
+             JOIN inbox current_wake ON current_wake.id = ?1
+             JOIN wake_queue current_queue ON current_queue.cursor = current_wake.id
+             LEFT JOIN integration_events origin ON origin.cursor = w.id
+             LEFT JOIN integration_events current_origin ON current_origin.cursor = current_wake.id
+             WHERE t.scope = ?2 AND r.body IS NOT NULL
+               AND w.stream = current_wake.stream AND w.target = current_wake.target
+               AND w.epoch = current_wake.epoch AND q.generation = current_queue.generation
+               AND origin.actor IS current_origin.actor
+             ORDER BY t.reply_cursor DESC LIMIT 6",
+        )?;
+        Ok(statement
+            .query_map(params![claim.cursor, scope], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
     pub fn channel_history(&self, channel: Id, limit: usize) -> Result<Vec<ChannelMessage>> {
         let mut statement = self.connection.prepare(&format!(
             "SELECT {MESSAGE_FIELDS} {MESSAGES} AND i.kind IN (1, 3, 4) AND e.outbound IS NOT 1
