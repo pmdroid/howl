@@ -218,3 +218,97 @@ fn enrollment_transfers_separate_artifacts_and_checks_all_device_proofs() {
         fs::read(operator_exchange.join("enrollment-certificate")).unwrap(),
     );
 }
+
+#[test]
+fn offline_export_recovers_authority_after_loss_of_the_online_root() {
+    let fixture = tempfile::tempdir().unwrap();
+    let operator = fixture.path().join("online");
+    let offline = fixture.path().join("offline");
+    let package = fixture.path().join("package");
+    let unlock = fixture.path().join("unlock");
+    let damaged_unlock = fixture.path().join("damaged-unlock");
+    let downloaded_package = fixture.path().join("downloaded-package");
+    let recovered = fixture.path().join("recovered");
+    let next_offline = fixture.path().join("next-offline");
+    let init = success(command(&[
+        "init".as_ref(),
+        operator.as_os_str(),
+        offline.as_os_str(),
+    ]));
+    let account = line(&init, "Account ");
+    let head = line(&init, "Authority ");
+    let prior = AuthorityStore::open(&operator).unwrap().current().unwrap();
+    let export = |unlock: &Path| {
+        command(&[
+            "recover-export".as_ref(),
+            operator.as_os_str(),
+            offline.as_os_str(),
+            package.as_os_str(),
+            unlock.as_os_str(),
+        ])
+    };
+    failed(export(&package));
+    let first = success(export(&unlock));
+    let public = fs::read(package.join("recovery-package")).unwrap();
+    let key = fs::read(unlock.join("recovery-unlock")).unwrap();
+    assert!(public.len() > 32);
+    assert_eq!(key.len(), 32);
+    assert!(!first.contains(&hex::encode(&key)));
+    assert!(!package.join("recovery-unlock").exists());
+    assert_eq!(
+        fs::metadata(unlock.join("recovery-unlock"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    assert_eq!(success(export(&unlock)), first);
+    assert_eq!(fs::read(package.join("recovery-package")).unwrap(), public);
+    assert_eq!(fs::read(unlock.join("recovery-unlock")).unwrap(), key);
+
+    artifact(&damaged_unlock, &unlock, &["recovery-unlock"]);
+    let mut wrong_key = key;
+    wrong_key[0] ^= 1;
+    fs::write(damaged_unlock.join("recovery-unlock"), wrong_key).unwrap();
+    artifact(
+        &downloaded_package,
+        &package,
+        &["authority-pin", "recovery-package"],
+    );
+    let mut tampered = public.clone();
+    *tampered.last_mut().unwrap() ^= 1;
+    fs::write(downloaded_package.join("recovery-package"), tampered).unwrap();
+
+    fs::remove_dir_all(&operator).unwrap();
+    fs::remove_dir_all(&offline).unwrap();
+
+    let recover = |package: &Path, unlock: &Path, head: &OsStr| {
+        command(&[
+            "recover".as_ref(),
+            recovered.as_os_str(),
+            package.as_os_str(),
+            unlock.as_os_str(),
+            next_offline.as_os_str(),
+            account,
+            head,
+        ])
+    };
+    failed(recover(&package, &damaged_unlock, head));
+    failed(recover(&downloaded_package, &unlock, head));
+    failed(recover(&package, &unlock, "00".repeat(32).as_ref()));
+    assert!(!recovered.join("authority-pin").exists());
+
+    fs::write(downloaded_package.join("recovery-package"), public).unwrap();
+    let result = success(recover(&downloaded_package, &unlock, head));
+    assert_eq!(line(&result, "Account "), account);
+    assert_ne!(line(&result, "Authority "), head);
+    let authority = AuthorityStore::open(&recovered).unwrap().load().unwrap();
+    let successor = authority.head().unwrap();
+    assert_eq!(authority.records().len(), 2);
+    assert_eq!(successor.account, prior.account);
+    assert_eq!(successor.generation, prior.generation + 1);
+    assert_ne!(successor.root, prior.root);
+    assert_ne!(successor.recovery, prior.recovery);
+    assert_eq!(success(recover(&downloaded_package, &unlock, head)), result);
+}
