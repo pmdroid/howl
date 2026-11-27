@@ -6,10 +6,10 @@ use crate::identity::{PeerCertificate, PeerTrust, StateDirectory};
 
 use super::{
     Authority, AuthorityStore, Designation, DeviceCertificate, Id, Roster, RosterMember,
-    RosterStore, cli::operator_signer,
+    RosterStore,
+    cli::{operator_signer, peer_records, profile_records},
 };
 
-const DESIGNATION_FILE: &str = "enrollment-designation";
 const CERTIFICATE_FILE: &str = "enrollment-certificate";
 
 pub(crate) struct Profile {
@@ -24,14 +24,11 @@ pub(crate) struct Profile {
 impl Profile {
     pub(crate) fn load(path: &Path, local: &PeerCertificate) -> io::Result<Option<Self>> {
         let state = StateDirectory::open(path)?;
-        let Some(certificate) = local_certificate(&state)? else {
+        let Some((designation, certificate)) = profile_records(&state)? else {
             return Ok(None);
         };
         let authority = AuthorityStore::open(path)?.load()?;
-        let designation = Designation::verify(
-            &state.read_bounded(DESIGNATION_FILE, 165_000)?,
-            authority.head()?,
-        )?;
+        let designation = Designation::verify(&designation, authority.head()?)?;
         let local = verify_device(&certificate, &designation, local)?;
         let trust = PeerTrust::open(path)?;
         Ok(Some(Self {
@@ -108,9 +105,12 @@ impl Profile {
 
     pub(crate) fn peer(&self, device: Id) -> io::Result<(DeviceCertificate, PeerCertificate)> {
         let peer = self.trust.pinned(&device)?;
-        let contents = self
-            .state
-            .read_bounded(&format!("enrollment-peer-{}", hex::encode(device)), 512)?;
+        let (_, contents) = peer_records(&self.state, device)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "enrolled peer certificate is missing",
+            )
+        })?;
         Ok((verify_device(&contents, &self.designation, &peer)?, peer))
     }
 }
