@@ -4,7 +4,9 @@ use howl_envelope::MAX_RECIPIENTS as MAX_MEMBERS;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    enrollment::{ChannelPermission, Roster, RosterStore, profile::Profile},
+    enrollment::{
+        ChannelPermission, Import, Roster, RosterStore, profile::Profile, roster::MAX_ROSTER_LEN,
+    },
     identity::{LocalIdentity, PeerCertificate, PeerTrust, StateDirectory},
 };
 
@@ -12,7 +14,7 @@ const DOMAIN: &[u8] = b"howl/manual-channel/v1\0";
 const MEMBER_LEN: usize = 64;
 const SIGNATURE_LEN: usize = 64;
 const HEADER_LEN: usize = DOMAIN.len() + 32 + 32 + 1;
-pub const MAX_MANIFEST_LEN: usize = HEADER_LEN + MAX_MEMBERS * MEMBER_LEN + SIGNATURE_LEN;
+pub const MAX_MANIFEST_LEN: usize = MAX_ROSTER_LEN;
 
 pub struct Channel {
     id: [u8; 32],
@@ -26,8 +28,18 @@ impl Channel {
         if peer_ids.len() >= MAX_MEMBERS {
             return Err(invalid("too many channel members"));
         }
-        let trust = PeerTrust::open(state)?;
         let local_certificate = local.certificate();
+        if let Some(profile) = Profile::load(state, &local_certificate)? {
+            let mut id = [0; 32];
+            getrandom::fill(&mut id).map_err(io::Error::other)?;
+            let members = std::iter::once(local_certificate.device_id())
+                .chain(peer_ids)
+                .map(|device| profile.member(*device, 7))
+                .collect::<io::Result<Vec<_>>>()?;
+            profile.issue(&RosterStore::open(state, id)?, id, false, members)?;
+            return Self::load_enrolled(state, local, &id, profile);
+        }
+        let trust = PeerTrust::open(state)?;
         let mut members = Vec::with_capacity(peer_ids.len() + 1);
         members.push(local_certificate.clone());
         for device in peer_ids {
@@ -67,6 +79,19 @@ impl Channel {
     }
 
     pub fn join(state: &Path, local: &LocalIdentity, manifest: &[u8]) -> io::Result<Self> {
+        if let Some(profile) = Profile::load(state, &local.certificate())? {
+            let roster = Roster::verify(manifest, &profile.designation)?;
+            let id = roster.channel();
+            let status = RosterStore::open(state, id)?.apply(
+                &profile.authority,
+                &profile.designation,
+                manifest,
+            )?;
+            if status == Import::Fork {
+                return Err(denied("verified roster fork recorded"));
+            }
+            return Self::load_enrolled(state, local, &id, profile);
+        }
         let channel = Self::verify(local, &PeerTrust::open(state)?, manifest)?;
         channel.persist(state)?;
         Ok(channel)
@@ -155,7 +180,7 @@ impl Channel {
         Ok(Self {
             id: *id,
             members,
-            manifest: Vec::new(),
+            manifest: roster.as_bytes().to_vec(),
             roster: Some(roster),
         })
     }

@@ -1,8 +1,13 @@
 use std::{io, path::Path};
 
+use howl_envelope::DeviceAddress;
+
 use crate::identity::{PeerCertificate, PeerTrust, StateDirectory};
 
-use super::{Authority, AuthorityStore, Designation, DeviceCertificate, Id};
+use super::{
+    Authority, AuthorityStore, Designation, DeviceCertificate, Id, Roster, RosterMember,
+    RosterStore, cli::operator_signer,
+};
 
 const DESIGNATION_FILE: &str = "enrollment-designation";
 const CERTIFICATE_FILE: &str = "enrollment-certificate";
@@ -43,6 +48,44 @@ impl Profile {
             return Ok(None);
         }
         Ok(Some(AuthorityStore::open(path)?.load()?.account()))
+    }
+
+    pub(crate) fn member(&self, device: Id, permissions: u8) -> io::Result<RosterMember> {
+        let certificate = if device == self.local.device {
+            self.local.clone()
+        } else {
+            self.peer(device)?.0
+        };
+        Ok(RosterMember {
+            address: DeviceAddress {
+                account: certificate.account,
+                device,
+            },
+            certificate: certificate.digest,
+            permissions,
+        })
+    }
+
+    pub(crate) fn issue(
+        &self,
+        store: &RosterStore,
+        channel: Id,
+        paused: bool,
+        mut members: Vec<RosterMember>,
+    ) -> io::Result<Roster> {
+        members.sort_unstable_by_key(|member| member.address);
+        let signer = operator_signer(&self.state)?;
+        let history = store.load(&self.authority)?;
+        let roster = Roster::issue(
+            &self.designation,
+            &signer,
+            channel,
+            history.latest()?,
+            paused,
+            &members,
+        )?;
+        store.apply(&self.authority, &self.designation, roster.as_bytes())?;
+        Ok(roster)
     }
 
     pub(crate) fn peer(&self, device: Id) -> io::Result<(DeviceCertificate, PeerCertificate)> {

@@ -1,12 +1,10 @@
 use std::{ffi::OsString, io, path::Path};
 
-use howl_envelope::DeviceAddress;
-
 use crate::identity::{LocalIdentity, StateDirectory};
 
 use super::{
-    Floor, Id, Import, Roster, RosterMember, RosterStore, authority::invalid, cli::operator_signer,
-    pairing::random, profile::Profile, revoke,
+    Floor, Id, Import, RosterStore, authority::invalid, cli::operator_signer, pairing::random,
+    profile::Profile, revoke,
 };
 
 pub fn run(args: &[OsString]) -> io::Result<()> {
@@ -32,7 +30,7 @@ pub fn run(args: &[OsString]) -> io::Result<()> {
                 Some("paused") => true,
                 _ => return Err(invalid("expected active or paused roster")),
             };
-            let mut members = named
+            let members = named
                 .iter()
                 .map(|member| {
                     let (device, permissions) = member
@@ -41,33 +39,10 @@ pub fn run(args: &[OsString]) -> io::Result<()> {
                         .ok_or_else(|| invalid("expected a device ID and permission mask"))?;
                     let device = id(device.as_bytes())?;
                     let permissions = permissions.parse::<u8>().map_err(io::Error::other)?;
-                    let certificate = if device == profile.local.device {
-                        profile.local.clone()
-                    } else {
-                        profile.peer(device)?.0
-                    };
-                    Ok(RosterMember {
-                        address: DeviceAddress {
-                            account: certificate.account,
-                            device,
-                        },
-                        certificate: certificate.digest,
-                        permissions,
-                    })
+                    profile.member(device, permissions)
                 })
                 .collect::<io::Result<Vec<_>>>()?;
-            members.sort_unstable_by_key(|member| member.address);
-            let signer = operator_signer(&StateDirectory::open(state)?)?;
-            let history = store.load(&profile.authority)?;
-            let roster = Roster::issue(
-                &profile.designation,
-                &signer,
-                channel,
-                history.latest()?,
-                paused,
-                &members,
-            )?;
-            store.apply(&profile.authority, &profile.designation, roster.as_bytes())?;
+            let roster = profile.issue(&store, channel, paused, members)?;
             Some(roster.as_bytes().to_vec())
         }
         (Some("apply"), [record]) => {

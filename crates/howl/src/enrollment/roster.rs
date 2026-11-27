@@ -13,6 +13,7 @@ const ROSTER: &[u8] = b"howl/identity/v1/roster\0";
 const HEADER: usize = 139;
 const MEMBER: usize = 97;
 const ZERO: Id = [0; 32];
+pub(crate) const MAX_ROSTER_LEN: usize = ROSTER.len() + HEADER + MAX_RECIPIENTS * MEMBER + 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ChannelPermission {
@@ -152,6 +153,10 @@ impl Roster {
 
     pub fn digest(&self) -> Id {
         self.digest
+    }
+
+    pub fn channel(&self) -> Id {
+        self.channel
     }
 
     pub fn epoch(&self) -> u64 {
