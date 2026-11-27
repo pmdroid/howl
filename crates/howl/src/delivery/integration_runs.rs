@@ -450,7 +450,7 @@ mod tests {
                 expires_at: NOW + u64::from(request.lifetime),
             },
             &message,
-            PEER,
+            &[PEER],
             Body::Wake {
                 session: request.target,
                 text: request.text,

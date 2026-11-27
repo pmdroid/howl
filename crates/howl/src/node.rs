@@ -212,7 +212,7 @@ pub async fn send(
 pub(crate) async fn send_integration_chat(
     state: &Path,
     channel: Id,
-    peer: Id,
+    peer: Option<Id>,
     owner: &str,
     text: &str,
 ) -> io::Result<String> {
@@ -224,7 +224,11 @@ pub(crate) async fn send_integration_chat(
     body.push(owner.len() as u8);
     body.extend_from_slice(owner.as_bytes());
     body.extend_from_slice(text.as_bytes());
-    request_message(state, channel, peer, "-", b'I', &body).await
+    let (command, peer) = match peer {
+        Some(peer) => (b'I', peer),
+        None => (b'P', [0; 32]),
+    };
+    request_message(state, channel, peer, "-", command, &body).await
 }
 
 pub async fn send_wake(
@@ -436,10 +440,14 @@ fn queue(
         .split_at_checked(usize::from(*route_length))
         .ok_or_else(|| invalid("invalid peer route"))?;
     let route = parse_route(route)?;
-    if matches!(*command, b'I' | b'T') && route.is_some() {
+    if matches!(*command, b'I' | b'P' | b'T') && route.is_some() {
         return Err(invalid("integration operations require a signed route"));
     }
-    if route.is_none() && !has_relay {
+    let post = *command == b'P';
+    if post && *peer != [0; 32] {
+        return Err(invalid("channel posts do not specify a peer"));
+    }
+    if !post && route.is_none() && !has_relay {
         let peer = PeerTrust::open(state)?.pinned(peer)?;
         if cached_address(delivery, &peer)?.is_none() {
             return Err(invalid(
@@ -449,13 +457,13 @@ fn queue(
     }
     let address = Destination {
         channel: *channel,
-        peer: *peer,
+        peer: (!post).then_some(*peer),
         route,
         integration: None,
     };
     match command {
-        b'S' | b'I' => {
-            let (integration, body) = if *command == b'I' {
+        b'S' | b'I' | b'P' => {
+            let (integration, body) = if matches!(*command, b'I' | b'P') {
                 let ([length], body) = body
                     .split_first_chunk()
                     .ok_or_else(|| invalid("missing integration owner"))?;
@@ -581,7 +589,7 @@ fn enable_grant(
 
 struct Destination {
     channel: Id,
-    peer: Id,
+    peer: Option<Id>,
     route: Option<SocketAddr>,
     integration: Option<IntegrationSource>,
 }
@@ -614,7 +622,7 @@ pub fn queue_agent_reply(
         delivery,
         Destination {
             channel,
-            peer: recipient,
+            peer: Some(recipient),
             route: parse_route(route.as_bytes())?,
             integration: None,
         },
@@ -650,7 +658,25 @@ fn queue_frame(
             "local device lacks the required signed channel permission",
         ));
     }
-    let target = channel_peer(&roster, &local, &peer, ChannelPermission::Receive)?;
+    let peers = match peer {
+        Some(peer) => vec![channel_peer(
+            &roster,
+            &local,
+            &peer,
+            ChannelPermission::Receive,
+        )?],
+        None => roster
+            .members()
+            .iter()
+            .filter(|peer| {
+                peer.device_id() != local.device_id()
+                    && roster.allows(peer.device_id(), ChannelPermission::Receive)
+            })
+            .collect(),
+    };
+    if peers.is_empty() {
+        return Err(forbidden("channel has no other signed recipients"));
+    }
     let integration = match integration {
         None => None,
         Some(IntegrationSource::Chat(actor)) => Some(IntegrationDelivery {
@@ -704,7 +730,16 @@ fn queue_frame(
         created_at: now,
         expires_at,
     };
-    let recipients = [recipient(device_for(state, target)?, target)];
+    let devices = peers
+        .iter()
+        .map(|peer| device_for(state, peer))
+        .collect::<io::Result<Vec<_>>>()?;
+    let recipients = devices
+        .iter()
+        .copied()
+        .zip(peers)
+        .map(|(device, peer)| recipient(device, peer))
+        .collect::<Vec<_>>();
     let sealed = match integration {
         Some(attribution) => howl_envelope::seal_integration(
             routing,
@@ -718,14 +753,14 @@ fn queue_frame(
     .map_err(io::Error::other)?;
     let metadata = howl_envelope::inspect_unverified(&sealed).map_err(io::Error::other)?;
     let outbound = frame(metadata);
-    let target = device_for(state, target)?;
     if let Some(attribution) = integration {
         let message = delivery
-            .enqueue_integration(outbound, &sealed, target, body, now, attribution)
+            .enqueue_integration(outbound, &sealed, &devices, body, now, attribution)
             .map_err(integration_error)?;
         return Ok(format!("queued {}", hex::encode(message)));
     }
     let route = route.map_or("-".to_owned(), |address| address.to_string());
+    let target = devices[0];
     match approved {
         Some(approved) => {
             delivery.enqueue_agent_reply(outbound, &sealed, target, &route, unix_time, approved)
@@ -1126,6 +1161,58 @@ mod integration_tests {
     use howl_envelope::{AgentRole, Intent};
 
     use super::*;
+
+    #[test]
+    fn integration_channel_post_uses_one_envelope_for_the_signed_roster() {
+        let temp = tempfile::tempdir().unwrap();
+        let gateway = temp.path().join("gateway");
+        let sender = LocalIdentity::load_or_create(&gateway).unwrap();
+        let peers = ["first", "second"].map(|name| {
+            let identity = LocalIdentity::load_or_create(&temp.path().join(name)).unwrap();
+            let peer = identity.certificate();
+            PeerTrust::open(&gateway)
+                .unwrap()
+                .pin(&peer, &peer.fingerprint())
+                .unwrap();
+            peer
+        });
+        let channel = Channel::create(
+            &gateway,
+            &sender,
+            &peers.each_ref().map(|peer| *peer.device_id()),
+        )
+        .unwrap();
+        let channel = *channel.id();
+        let mut outbox = run_delivery(&gateway).unwrap();
+        let mut request = vec![b'P'];
+        request.extend(channel);
+        request.extend([0; 32]);
+        request.extend(b"\x01-\x06sourcechannel discussion");
+        let receipt = queue(&gateway, &sender, &mut outbox, false, &request).unwrap();
+        let frames = outbox
+            .claim_due(Some(channel), unix_time().unwrap(), 10)
+            .unwrap();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].frame, frames[1].frame);
+        assert_ne!(frames[0].recipient, frames[1].recipient);
+        let metadata = howl_envelope::inspect_unverified(&frames[0].frame).unwrap();
+        assert_eq!(
+            receipt,
+            format!("queued {}", hex::encode(metadata.message_id))
+        );
+        let events = outbox.channel_events(channel, 0, 10).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].recipient, None);
+        let local = device_for(&gateway, &sender.certificate()).unwrap();
+        for attempt in frames {
+            assert!(
+                outbox
+                    .direct_events(channel, local, attempt.recipient, 0, 10)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
 
     #[test]
     fn integration_chat_and_run_sign_the_same_owner_across_the_wire() {
