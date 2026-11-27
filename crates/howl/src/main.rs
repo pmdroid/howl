@@ -16,7 +16,7 @@ use howl::{
     managed_acp::{Harness, HostClaude, HostCodex, HostGrok},
     node,
     observer::{ObserverProvider, Snapshot},
-    web,
+    remote_mcp, serve_gateway, web,
     workflow::{self, RunTurn},
 };
 use howl_envelope::AgentRole;
@@ -171,6 +171,23 @@ async fn main() -> ExitCode {
         [group, command @ ..] if group == "enrollment" => howl::enrollment::cli::run(command),
         [group, command @ ..] if group == "workflow" => workflow_command(command).await,
         [group, command @ ..] if group == "roster" => howl::enrollment::roster_cli::run(command),
+        [group, action, state, grants, listen @ ..]
+            if group == "mcp" && action == "serve" && listen.len() <= 1 =>
+        {
+            match listen.first().map(|value| required_text(value)).transpose() {
+                Ok(listen) => {
+                    match tokio::net::TcpListener::bind(listen.unwrap_or(remote_mcp::DEFAULT_BIND))
+                        .await
+                    {
+                        Ok(listener) => {
+                            serve_gateway(Path::new(state), Path::new(grants), listener).await
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+                Err(error) => Err(error),
+            }
+        }
         [command, state, channel, peer, route] if command == "send" => {
             let (Ok(channel), Ok(peer), Some(route)) =
                 (parse_id(channel), parse_id(peer), route.to_str())

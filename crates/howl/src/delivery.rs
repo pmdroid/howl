@@ -1,4 +1,5 @@
 mod budget;
+mod integration_runs;
 mod mailbox_outbox;
 mod messages;
 #[cfg(test)]
@@ -7,6 +8,10 @@ mod wake;
 pub use budget::{
     ApprovedWake, BudgetError, BudgetLimit, BudgetLimits, ConversationBudget, HumanAction,
     HumanCommand, Turn, WakeApproval, WakeOutcome, WakeTurnError,
+};
+pub(crate) use integration_runs::{
+    Dispatch as IntegrationDispatch, IntegrationDelivery, IntegrationRun, IntegrationRunState,
+    NewIntegrationRun, run_fingerprint, valid_integration_owner,
 };
 pub(crate) use mailbox_outbox::MAILBOX_OUTBOX_BATCH;
 pub use messages::{ChannelEvent, ChannelMessage};
@@ -109,13 +114,14 @@ pub struct ApprovedAgentReply<Text> {
 
 enum EnqueueTime<'a> {
     Ordinary(u64),
+    Integration(u64, IntegrationDelivery),
     Approved {
         approval: ApprovedAgentReply<&'a str>,
         clock: &'a dyn Fn() -> io::Result<u64>,
     },
 }
 
-enum AdmissionTime<'a> {
+pub(crate) enum AdmissionTime<'a> {
     Known(u64),
     MailboxHistory(u64),
     NetworkWake(&'a dyn Fn() -> io::Result<u64>),
@@ -239,6 +245,7 @@ impl DeliveryStore {
 
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute_batch(include_str!("delivery.sql"))?;
+        tx.execute_batch(include_str!("delivery/integration_runs.sql"))?;
         tx.execute_batch(include_str!("presence.sql"))?;
         tx.execute_batch(include_str!("delivery/budget.sql"))?;
         tx.execute(
@@ -340,6 +347,7 @@ impl DeliveryStore {
             None,
             None,
         )
+        .map(|_| ())
     }
 
     pub fn enqueue_routed(
@@ -373,6 +381,26 @@ impl DeliveryStore {
             Some(route),
             body,
         )
+        .map(|_| ())
+    }
+
+    pub(crate) fn enqueue_integration(
+        &mut self,
+        frame: Frame,
+        bytes: &[u8],
+        recipient: Device,
+        body: Body<&str>,
+        now: u64,
+        attribution: IntegrationDelivery,
+    ) -> Result<Id> {
+        self.enqueue_frames(
+            frame,
+            bytes,
+            &[recipient],
+            EnqueueTime::Integration(now, attribution),
+            None,
+            Some(body),
+        )
     }
 
     pub(crate) fn enqueue_agent_reply(
@@ -398,6 +426,7 @@ impl DeliveryStore {
             Some(route),
             Some(Body::AgentReply(approved.reply)),
         )
+        .map(|_| ())
     }
 
     fn enqueue_frames(
@@ -408,12 +437,12 @@ impl DeliveryStore {
         time: EnqueueTime<'_>,
         route: Option<&str>,
         body: Option<Body<&str>>,
-    ) -> Result<()> {
+    ) -> Result<Id> {
         frame.validate(bytes)?;
         if frame.stream.sender != self.local {
             return Err(Error::Device);
         }
-        if let EnqueueTime::Ordinary(now) = &time
+        if let EnqueueTime::Ordinary(now) | EnqueueTime::Integration(now, _) = &time
             && frame.expires_at != 0
             && *now >= frame.expires_at
         {
@@ -432,12 +461,21 @@ impl DeliveryStore {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_epoch(&tx, frame)?;
-        let (now, approved) = match time {
-            EnqueueTime::Ordinary(now) => (now, None),
+        let (now, approved, integration) = match time {
+            EnqueueTime::Ordinary(now) => (now, None, None),
+            EnqueueTime::Integration(now, attribution) => {
+                if let Some(dispatch) = attribution.dispatch
+                    && let (_, Some(message)) =
+                        integration_runs::dispatch_status(&tx, dispatch, now)?
+                {
+                    return Ok(message);
+                }
+                (now, None, Some(attribution))
+            }
             EnqueueTime::Approved { approval, clock } => {
                 let now = clock()?;
                 wake::record_wake_time(&tx, now)?;
-                (now, Some(approval))
+                (now, Some(approval), None)
             }
         };
         let reply_cursor = match approved {
@@ -534,10 +572,16 @@ impl DeliveryStore {
         if changed != 0
             && let Some(body) = body
         {
-            messages::record_outbound(&tx, row, recipients[0], now, body)?;
+            let cursor = messages::record_outbound(&tx, row, recipients[0], now, body)?;
+            if let Some(integration) = integration {
+                messages::record_integration(&tx, cursor, integration.actor)?;
+            }
+        }
+        if let Some(dispatch) = integration.and_then(|attribution| attribution.dispatch) {
+            integration_runs::link_dispatch(&tx, dispatch, frame, row, now)?;
         }
         tx.commit()?;
-        Ok(())
+        Ok(frame.message)
     }
 
     pub fn claim_due(
@@ -687,10 +731,12 @@ impl DeliveryStore {
             bytes,
             payload,
             AdmissionTime::Known(now),
+            None,
             local_signer,
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn accept_network_wake(
         &mut self,
         frame: Frame,
@@ -704,33 +750,18 @@ impl DeliveryStore {
             bytes,
             payload,
             AdmissionTime::NetworkWake(&fresh_clock),
+            None,
             local_signer,
         )
     }
 
-    pub(crate) fn accept_mailbox_history(
-        &mut self,
-        frame: Frame,
-        bytes: &[u8],
-        payload: Payload<'_>,
-        now: u64,
-        local_signer: &SigningKey,
-    ) -> Result<Receipt> {
-        self.accept_payload(
-            frame,
-            bytes,
-            payload,
-            AdmissionTime::MailboxHistory(now),
-            local_signer,
-        )
-    }
-
-    fn accept_payload(
+    pub(crate) fn accept_payload(
         &mut self,
         frame: Frame,
         bytes: &[u8],
         payload: Payload<'_>,
         time: AdmissionTime<'_>,
+        integration: Option<Id>,
         local_signer: &SigningKey,
     ) -> Result<Receipt> {
         frame.validate(bytes)?;
@@ -854,8 +885,9 @@ impl DeliveryStore {
                 ],
             )?;
             let cursor = tx.last_insert_rowid();
-            if kind != 2 {
-                messages::record_inbound_recipient(&tx, cursor, bytes, self.local)?;
+            messages::record_inbound_recipient(&tx, cursor, bytes, self.local)?;
+            if let Some(integration) = integration {
+                messages::record_integration(&tx, cursor, integration)?;
             }
             if kind == 1 {
                 tx.execute(
@@ -864,6 +896,7 @@ impl DeliveryStore {
                 )?;
             } else if let Some(reply) = agent_reply {
                 messages::record_agent_reply(&tx, cursor, reply)?;
+                integration_runs::record_reply(&tx, frame, reply, now)?;
             } else if kind == 2 {
                 tx.execute(
                     "INSERT INTO wake_queue (cursor, generation, state)

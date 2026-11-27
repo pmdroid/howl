@@ -5,7 +5,7 @@ use serde::Serialize;
 
 use crate::{
     channel::Channel,
-    delivery::{ChannelEvent, ChannelMessage, DeliveryStore},
+    delivery::{ChannelEvent, ChannelMessage, DeliveryStore, Device},
     enrollment::{ChannelPermission, profile::Profile},
     identity::LocalIdentity,
     node, workflow,
@@ -30,6 +30,8 @@ pub struct Message {
     pub time: u64,
     pub text: String,
     pub role: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub integration: Option<String>,
 }
 
 impl From<ChannelMessage> for Message {
@@ -45,6 +47,7 @@ impl From<ChannelMessage> for Message {
             time: item.received_at,
             text,
             role,
+            integration: item.integration.map(hex::encode),
         }
     }
 }
@@ -56,6 +59,14 @@ pub struct Event {
     pub recipient: Option<String>,
     #[serde(flatten)]
     pub message: Message,
+}
+
+#[derive(Serialize)]
+pub(crate) struct EventPage {
+    pub events: Vec<Event>,
+    pub cursor: u64,
+    pub gap: bool,
+    pub more: bool,
 }
 
 impl From<ChannelEvent> for Event {
@@ -162,26 +173,39 @@ impl<'a> LocalInteraction<'a> {
         after: u64,
         limit: usize,
     ) -> io::Result<Vec<Event>> {
-        let roster = self.authorize(channel, ChannelPermission::Receive)?;
-        let peer = roster
-            .members()
-            .iter()
-            .find(|candidate| candidate.device_id() == &peer)
-            .ok_or_else(|| denied("peer is outside the signed channel"))?;
-        let (delivery, stream) = self.history_delivery(channel)?;
-        let peer = node::device_for(self.state, peer)?;
-        if peer == stream.sender {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "direct peer must be a different device",
-            ));
-        }
+        let (delivery, local, peer) = self.direct_delivery(channel, peer)?;
         Ok(delivery
-            .direct_events(channel, stream.sender, peer, after, limit)
+            .direct_events(channel, local, peer, after, limit)
             .map_err(io::Error::other)?
             .into_iter()
             .map(Event::from)
             .collect())
+    }
+
+    pub(crate) fn event_page(
+        &self,
+        channel: Id,
+        peer: Option<Id>,
+        after: u64,
+        limit: usize,
+    ) -> io::Result<EventPage> {
+        self.require_enrolled()?;
+        let (delivery, direct) = if let Some(peer) = peer {
+            let (delivery, local, peer) = self.direct_delivery(channel, peer)?;
+            (delivery, Some((local, peer)))
+        } else {
+            self.authorize(channel, ChannelPermission::Receive)?;
+            (self.history_delivery(channel)?.0, None)
+        };
+        let page = delivery
+            .event_page(channel, direct, after, limit)
+            .map_err(io::Error::other)?;
+        Ok(EventPage {
+            events: page.events.into_iter().map(Event::from).collect(),
+            cursor: page.cursor,
+            gap: page.gap,
+            more: page.more,
+        })
     }
 
     pub fn status(&self, channel: Id) -> io::Result<serde_json::Value> {
@@ -240,6 +264,28 @@ impl<'a> LocalInteraction<'a> {
 
     fn identity(&self) -> io::Result<LocalIdentity> {
         LocalIdentity::load_or_create(self.state)
+    }
+
+    fn direct_delivery(
+        &self,
+        channel: Id,
+        peer: Id,
+    ) -> io::Result<(DeliveryStore, Device, Device)> {
+        let roster = self.authorize(channel, ChannelPermission::Receive)?;
+        let peer = roster
+            .members()
+            .iter()
+            .find(|candidate| candidate.device_id() == &peer)
+            .ok_or_else(|| denied("peer is outside the signed channel"))?;
+        let (delivery, stream) = self.history_delivery(channel)?;
+        let peer = node::device_for(self.state, peer)?;
+        if peer == stream.sender {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "direct peer must be a different device",
+            ));
+        }
+        Ok((delivery, stream.sender, peer))
     }
 
     fn history_delivery(
