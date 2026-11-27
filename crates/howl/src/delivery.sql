@@ -58,6 +58,8 @@ CREATE TABLE IF NOT EXISTS inbox (
     UNIQUE (stream, sequence)
 ) STRICT;
 CREATE UNIQUE INDEX IF NOT EXISTS inbox_message ON inbox(substr(stream, 1, 96), message);
+CREATE INDEX IF NOT EXISTS inbox_channel_events ON inbox(substr(stream, 1, 32), id)
+    WHERE body IS NOT NULL AND kind IN (1, 3, 4);
 CREATE VIRTUAL TABLE IF NOT EXISTS chat_search USING fts5(body);
 CREATE TABLE IF NOT EXISTS conflicts (
     inbox_id INTEGER NOT NULL REFERENCES inbox(id),
@@ -94,6 +96,12 @@ CREATE TABLE IF NOT EXISTS agent_replies (
     role INTEGER NOT NULL CHECK (role IN (1, 2)),
     in_reply_to BLOB NOT NULL CHECK (length(in_reply_to) = 32),
     context_digest BLOB NOT NULL CHECK (length(context_digest) = 32)
+) STRICT;
+CREATE TABLE IF NOT EXISTS channel_event_addresses (
+    cursor INTEGER PRIMARY KEY REFERENCES inbox(id),
+    outbound INTEGER NOT NULL CHECK (outbound IN (0, 1)),
+    recipient BLOB CHECK (length(recipient) = 64),
+    CHECK (outbound = 0 OR recipient IS NOT NULL)
 ) STRICT;
 CREATE TABLE IF NOT EXISTS wake_replies (
     cursor INTEGER PRIMARY KEY REFERENCES wake_queue(cursor),

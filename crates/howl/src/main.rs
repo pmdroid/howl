@@ -11,6 +11,7 @@ use howl::{
     channel::{Channel, MAX_MANIFEST_LEN},
     control_client, discovery_client,
     identity::{LocalIdentity, PeerCertificate, PeerTrust},
+    interaction::LocalInteraction,
     mailbox_client,
     managed_acp::{Harness, HostClaude, HostCodex, HostGrok},
     node,
@@ -62,9 +63,17 @@ async fn main() -> ExitCode {
             };
             join_channel(Path::new(state), manifest)
         }
-        [group, action, state, listen, relay @ ..]
-            if group == "mesh" && action == "run" && relay.len() <= 1 =>
-        {
+        [group, action, options @ ..] if group == "mesh" && action == "run" => {
+            let (client_only, options) = match options {
+                [flag, rest @ ..] if flag == "--client-only" => (true, rest),
+                rest => (false, rest),
+            };
+            let [state, listen, relay @ ..] = options else {
+                return invalid_arguments();
+            };
+            if relay.len() > 1 {
+                return invalid_arguments();
+            }
             let Some(listen) = listen.to_str() else {
                 return invalid_arguments();
             };
@@ -77,7 +86,11 @@ async fn main() -> ExitCode {
                 }
                 None => None,
             };
-            node::run(Path::new(state), listen, relay).await
+            if client_only {
+                node::run_client(Path::new(state), listen, relay).await
+            } else {
+                node::run(Path::new(state), listen, relay).await
+            }
         }
         [group, command, action, state, recipient, cursor @ ..]
             if group == "mesh"
@@ -188,6 +201,12 @@ async fn main() -> ExitCode {
         [command, state, channel] if command == "read" => {
             parse_id(channel).and_then(|channel| node::read(Path::new(state), channel))
         }
+        [command, state, channel] if command == "agents" => parse_id(channel)
+            .and_then(|channel| LocalInteraction::new(Path::new(state)).agents(channel))
+            .and_then(print_json),
+        [command, state, channel, cursor @ ..] if command == "events" && cursor.len() <= 1 => {
+            read_events(state, channel, cursor.first())
+        }
         [command, state, channel, message] if command == "status" => {
             parse_id(channel).and_then(|channel| {
                 parse_id(message)
@@ -204,6 +223,24 @@ async fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn read_events(state: &OsStr, channel: &OsStr, cursor: Option<&OsString>) -> io::Result<()> {
+    let after = cursor
+        .map(|cursor| {
+            required_text(cursor)?
+                .parse::<u64>()
+                .map_err(|_| invalid_input("invalid event cursor"))
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let events = LocalInteraction::new(Path::new(state)).events(parse_id(channel)?, after, 100)?;
+    print_json(events)
+}
+
+fn print_json(value: impl serde::Serialize) -> io::Result<()> {
+    println!("{}", serde_json::to_string(&value)?);
+    Ok(())
 }
 
 async fn mailbox_deposit(
@@ -294,6 +331,12 @@ async fn workflow_command(args: &[OsString]) -> io::Result<()> {
         [command, state] if command == "recover" => {
             let count = workflow::recover(Path::new(state))?;
             println!("Recovered {count} interrupted workflow jobs.");
+        }
+        [command, state, channel] if command == "status" => {
+            print_json(LocalInteraction::new(Path::new(state)).status(parse_id(channel)?)?)?;
+        }
+        [command, state, channel, root] if command == "cancel" => {
+            LocalInteraction::new(Path::new(state)).cancel(parse_id(channel)?, parse_id(root)?)?;
         }
         [command, options @ ..] if command == "run" => run_workflow(options).await?,
         _ => return Err(invalid_input("invalid workflow arguments; run howl --help")),
