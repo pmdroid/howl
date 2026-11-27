@@ -19,7 +19,8 @@ fn raw_endpoint(url: &str, allow_private_ips: Vec<IpAddr>) -> EndpointConfig {
     EndpointConfig {
         name: "receiver".into(),
         url: url.into(),
-        signing_secret: hex::encode([0x42; 32]),
+        signing_secret: Some(hex::encode([0x42; 32])),
+        grok_bot_key: None,
         channels: vec![hex::encode([0x20; 32])],
         events: vec![WebhookEventKind::MessageReceived],
         enabled: true,
@@ -209,5 +210,80 @@ async fn explicit_loopback_delivery_is_signed_and_refuses_redirects() {
         }
     }
     assert_eq!(calls.lock().unwrap().len(), 1);
+    task.abort();
+}
+
+#[tokio::test]
+async fn grok_bot_posts_json_with_a_bearer_key_and_requires_ok() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let authority = listener.local_addr().unwrap();
+    let router = Router::new().route(
+        "/{status}",
+        post(
+            |axum::extract::Path(status): axum::extract::Path<u16>,
+             headers: HeaderMap,
+             body: String| async move {
+                assert_eq!(headers[header::AUTHORIZATION], "Bearer fixture-secret");
+                assert_eq!(headers[header::CONTENT_TYPE], "application/json");
+                assert_eq!(headers["webhook-id"], "evt_example");
+                assert!(!headers.contains_key("webhook-signature"));
+                assert_eq!(body, r#"{"event":"message.received"}"#);
+                StatusCode::from_u16(status).unwrap()
+            },
+        ),
+    );
+    let task = tokio::spawn(async move { axum::serve(listener, router).await });
+    let temp = tempfile::tempdir().unwrap();
+    let config = temp.path().join("endpoints.json");
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&config)
+        .unwrap();
+    let load = |file: &mut std::fs::File, endpoint: &serde_json::Value| {
+        use std::io::{Seek, Write};
+        file.set_len(0).unwrap();
+        file.rewind().unwrap();
+        write!(file, "{{\"endpoints\":[{endpoint}]}}").unwrap();
+        load_config(&config)
+    };
+    let mut raw = serde_json::json!({
+        "name": "grok-routine",
+        "url": format!("http://{authority}/200"),
+        "grok_bot_key": "fixture-secret",
+        "channels": [hex::encode([0x20; 32])],
+        "events": ["message.received"],
+        "enabled": true,
+        "allow_private_ips": [authority.ip()]
+    });
+    raw["signing_secret"] = hex::encode([0x42; 32]).into();
+    assert!(load(&mut file, &raw).is_err());
+    raw.as_object_mut().unwrap().remove("signing_secret");
+    raw["grok_bot_key"] = "fixture-secret\r\nX-Invalid: value".into();
+    assert!(load(&mut file, &raw).is_err());
+    raw["grok_bot_key"] = "fixture-secret".into();
+
+    for status in [200, 204, 401, 429, 503] {
+        raw["url"] = format!("http://{authority}/{status}").into();
+        let endpoint = load(&mut file, &raw).unwrap().pop().unwrap();
+        let pinned = pinned_destination(&endpoint, |_, _| async { unreachable!() })
+            .await
+            .ok()
+            .unwrap();
+        let outcome = send(
+            &endpoint,
+            pinned,
+            "evt_example",
+            1_700_000_000,
+            r#"{"event":"message.received"}"#,
+        )
+        .await;
+        match status {
+            200 => assert!(matches!(outcome, WebhookOutcome::Delivered)),
+            429 | 503 => assert!(matches!(outcome, WebhookOutcome::Retry)),
+            _ => assert!(matches!(outcome, WebhookOutcome::Rejected)),
+        }
+    }
     task.abort();
 }
