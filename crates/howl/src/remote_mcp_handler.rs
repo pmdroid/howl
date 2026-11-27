@@ -29,7 +29,10 @@ use tokio::net::TcpListener;
 
 use crate::remote_mcp::subscriptions::{self, EventQuery, Subscriptions};
 use crate::{
-    delivery::{IntegrationRun, IntegrationRunState, NewIntegrationRun},
+    delivery::{
+        IntegrationRun, IntegrationRunDetails, IntegrationRunState, IntegrationRunSummary,
+        NewIntegrationRun,
+    },
     enrollment::ChannelPermission,
     interaction::{AgentAddress, EventPage, LocalInteraction, Receipt},
     node,
@@ -286,6 +289,7 @@ impl GatewayTools {
 
     #[tool(
         description = "Request a bounded agent wake and return a durable run handle. Reuse the same key and arguments to retry.",
+        output_schema = rmcp::handler::server::tool::schema_for_type::<IntegrationRunSummary>(),
         annotations(
             read_only_hint = false,
             idempotent_hint = true,
@@ -345,6 +349,7 @@ impl GatewayTools {
 
     #[tool(
         description = "Read the status and final result of a run owned by this integration",
+        output_schema = rmcp::handler::server::tool::schema_for_type::<IntegrationRunDetails>(),
         annotations(
             read_only_hint = true,
             idempotent_hint = true,
@@ -363,6 +368,7 @@ impl GatewayTools {
 
     #[tool(
         description = "Request cancellation of a run owned by this integration and report its resulting state",
+        output_schema = rmcp::handler::server::tool::schema_for_type::<IntegrationRunSummary>(),
         annotations(
             read_only_hint = false,
             idempotent_hint = true,

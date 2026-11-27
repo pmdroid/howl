@@ -10,8 +10,9 @@ pub use budget::{
     HumanCommand, Turn, WakeApproval, WakeOutcome, WakeTurnError,
 };
 pub(crate) use integration_runs::{
-    Dispatch as IntegrationDispatch, IntegrationDelivery, IntegrationRun, IntegrationRunState,
-    NewIntegrationRun, run_fingerprint, valid_integration_owner,
+    Dispatch as IntegrationDispatch, IntegrationDelivery, IntegrationRun, IntegrationRunDetails,
+    IntegrationRunState, IntegrationRunSummary, NewIntegrationRun, run_fingerprint,
+    valid_integration_owner,
 };
 pub(crate) use mailbox_outbox::MAILBOX_OUTBOX_BATCH;
 pub use messages::{ChannelEvent, ChannelMessage};
