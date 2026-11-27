@@ -20,3 +20,5 @@ pub mod observer;
 pub mod presence;
 
 pub mod managed_acp;
+
+pub mod provider_broker;

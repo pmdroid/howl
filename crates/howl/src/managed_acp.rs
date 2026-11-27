@@ -32,6 +32,7 @@ use tokio::{
 use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec};
 
 use crate::observer::{ObserverProcess, ObserverProvider, Snapshot, WORKSPACE};
+use crate::provider_broker::{self, Broker, Provider};
 use journal::Journal;
 
 const REQUEST_LIMIT: Duration = Duration::from_secs(25);
@@ -43,6 +44,8 @@ const MAX_ACP_MESSAGE: usize = 256 * 1024;
 pub enum Error {
     #[error("observer launch failed")]
     Observer(#[from] crate::observer::Error),
+    #[error(transparent)]
+    Provider(#[from] provider_broker::Error),
     #[error("managed session storage or pipes failed")]
     Io(#[from] io::Error),
     #[error("invalid managed session state")]
@@ -76,6 +79,7 @@ pub struct Harness {
     image: String,
     executable: PathBuf,
     args: Vec<String>,
+    provider: Option<(Provider, String)>,
 }
 
 impl Harness {
@@ -104,7 +108,13 @@ impl Harness {
             image,
             executable: executable.into(),
             args: args.iter().map(|arg| (*arg).to_owned()).collect(),
+            provider: None,
         }
+    }
+
+    pub fn with_provider(mut self, provider: Provider, model: &str) -> Self {
+        self.provider = Some((provider, model.to_owned()));
+        self
     }
 
     fn fingerprint(&self) -> [u8; 32] {
@@ -120,6 +130,12 @@ impl Harness {
         {
             hash.update((value.len() as u64).to_be_bytes());
             hash.update(value);
+        }
+        if let Some((provider, model)) = &self.provider {
+            hash.update(b"provider");
+            hash.update([provider.tag()]);
+            hash.update((model.len() as u64).to_be_bytes());
+            hash.update(model.as_bytes());
         }
         hash.finalize().into()
     }
@@ -237,6 +253,23 @@ impl ManagedSession {
         id: String,
         restore: Option<Restore>,
     ) -> Result<Self> {
+        let broker = harness
+            .provider
+            .as_ref()
+            .map(|(provider, model)| Broker::from_environment(*provider, model))
+            .transpose()?;
+        Self::open_with_broker(root, provider, snapshot, harness, id, restore, broker).await
+    }
+
+    async fn open_with_broker(
+        root: &Path,
+        provider: &ObserverProvider,
+        snapshot: Snapshot,
+        harness: Harness,
+        id: String,
+        restore: Option<Restore>,
+        broker: Option<Broker>,
+    ) -> Result<Self> {
         if harness.name.is_empty()
             || harness.name.len() > 64
             || !harness
@@ -300,12 +333,24 @@ impl ManagedSession {
         .await
         .map_err(|_| Error::Disconnected)??;
 
+        let broker = if let Some(broker) = broker {
+            match broker.attach(&process).await {
+                Ok(task) => Some(task),
+                Err(error) => {
+                    journal.update(|state| state.phase = Phase::Interrupted)?;
+                    return Err(error.into());
+                }
+            }
+        } else {
+            None
+        };
         let status = journal.subscribe();
         let (commands, requests) = mpsc::channel(32);
         let (events, _) = broadcast::channel(64);
         let (ready, initialized) = oneshot::channel();
         tokio::spawn(supervise(
             process,
+            broker,
             journal,
             requests,
             events.clone(),
@@ -394,6 +439,7 @@ fn check_restore(mode: Restore, state: &SessionState) -> Result<()> {
 
 async fn supervise(
     mut process: ObserverProcess,
+    _broker: Option<provider_broker::BrokerTask>,
     journal: Journal,
     requests: mpsc::Receiver<Command>,
     events: broadcast::Sender<Event>,

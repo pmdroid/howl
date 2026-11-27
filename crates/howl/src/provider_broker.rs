@@ -1,0 +1,713 @@
+use std::{env, io, path::Path, process::Child, time::Duration};
+
+use base64::{Engine, engine::general_purpose::STANDARD};
+use futures_util::StreamExt;
+use reqwest::{Client, Method, redirect::Policy};
+use serde::{Deserialize, Serialize};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
+    process::{ChildStdin, ChildStdout},
+    sync::mpsc,
+    task::JoinHandle,
+    time::{sleep, timeout},
+};
+use tokio_util::codec::{FramedRead, LinesCodec};
+use zeroize::Zeroizing;
+
+use crate::observer::ObserverProcess;
+
+const REQUEST_BYTES: usize = 2 * 1024 * 1024;
+const WIRE_BYTES: usize = 6 * 1024 * 1024;
+const RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+const REQUESTS: usize = 64;
+const OUTPUT_TOKENS: u64 = 8192;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Provider {
+    OpenAi,
+    XAi,
+}
+
+impl Provider {
+    fn origin(self) -> &'static str {
+        match self {
+            Self::OpenAi => "https://api.openai.com",
+            Self::XAi => "https://api.x.ai",
+        }
+    }
+
+    fn keys(self) -> [&'static str; 2] {
+        match self {
+            Self::OpenAi => ["HOWL_OPENAI_API_KEY", "OPENAI_API_KEY"],
+            Self::XAi => ["HOWL_XAI_API_KEY", "XAI_API_KEY"],
+        }
+    }
+
+    fn allows(self, method: &str, path: &str) -> bool {
+        matches!(
+            (self, method, path),
+            (_, "GET", "/v1/models")
+                | (Self::OpenAi, "POST", "/v1/responses")
+                | (Self::XAi, "POST", "/v1/chat/completions")
+        )
+    }
+
+    pub(crate) fn tag(self) -> u8 {
+        match self {
+            Self::OpenAi => 1,
+            Self::XAi => 2,
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("set {0} in the host environment to enable this provider")]
+    MissingKey(&'static str),
+    #[error("invalid provider credential in host environment")]
+    InvalidKey,
+    #[error("invalid provider model")]
+    Model,
+    #[error("could not initialize the HTTPS provider client")]
+    Client,
+    #[error("the sandbox provider bridge failed to start")]
+    Bridge,
+    #[error("provider bridge I/O failed")]
+    Io(#[from] io::Error),
+}
+
+pub(crate) struct Broker {
+    provider: Provider,
+    client: Client,
+    key: Zeroizing<String>,
+    origin: String,
+    model: String,
+}
+
+impl Broker {
+    pub(crate) fn from_environment(provider: Provider, model: &str) -> Result<Self, Error> {
+        if model.is_empty()
+            || model.len() > 128
+            || !model.bytes().all(|byte| byte.is_ascii_graphic())
+        {
+            return Err(Error::Model);
+        }
+        let keys = provider.keys();
+        let key = keys
+            .iter()
+            .find_map(env::var_os)
+            .ok_or(Error::MissingKey(keys[0]))?;
+        let key = Zeroizing::new(key.into_string().map_err(|_| Error::InvalidKey)?);
+        if key.is_empty() || key.len() > 4096 || !key.bytes().all(|byte| byte.is_ascii_graphic()) {
+            return Err(Error::InvalidKey);
+        }
+        let client = Client::builder()
+            .https_only(true)
+            .no_proxy()
+            .redirect(Policy::none())
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(120))
+            .build()
+            .map_err(|_| Error::Client)?;
+        Ok(Broker {
+            provider,
+            client,
+            key,
+            origin: provider.origin().to_owned(),
+            model: model.to_owned(),
+        })
+    }
+
+    pub(crate) async fn attach(self, observer: &ObserverProcess) -> Result<BrokerTask, Error> {
+        timeout(Duration::from_secs(10), self.attach_when_running(observer))
+            .await
+            .map_err(|_| Error::Bridge)?
+    }
+
+    async fn attach_when_running(self, observer: &ObserverProcess) -> Result<BrokerTask, Error> {
+        loop {
+            let child = observer
+                .start_broker(
+                    Path::new("/usr/local/bin/node"),
+                    &["-e", include_str!("provider_bridge.cjs")],
+                )
+                .map_err(|_| Error::Bridge)?;
+            let mut task = BrokerTask { child, job: None };
+            let stdin = ChildStdin::from_std(task.child.stdin.take().ok_or(Error::Bridge)?)?;
+            let stdout = ChildStdout::from_std(task.child.stdout.take().ok_or(Error::Bridge)?)?;
+            let mut reader = FramedRead::new(stdout, LinesCodec::new_with_max_length(WIRE_BYTES));
+            match reader.next().await {
+                Some(Ok(value)) if value == "ready" => {
+                    task.job = Some(tokio::spawn(self.serve(reader, stdin)));
+                    return Ok(task);
+                }
+                None => {
+                    drop(task);
+                    sleep(Duration::from_millis(100)).await;
+                }
+                _ => return Err(Error::Bridge),
+            }
+        }
+    }
+
+    async fn serve(
+        self,
+        requests: FramedRead<impl AsyncRead + Unpin, LinesCodec>,
+        mut response: impl AsyncWrite + Unpin,
+    ) -> io::Result<()> {
+        let (frames, mut output) = mpsc::channel::<Vec<u8>>(2);
+        tokio::try_join!(self.serve_requests(requests, frames), async {
+            while let Some(frame) = output.recv().await {
+                response.write_all(&frame).await?;
+                response.flush().await?;
+            }
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    async fn serve_requests(
+        self,
+        mut requests: FramedRead<impl AsyncRead + Unpin, LinesCodec>,
+        output: mpsc::Sender<Vec<u8>>,
+    ) -> io::Result<()> {
+        let mut remaining = REQUESTS;
+        while let Some(frame) = receive(&mut requests).await? {
+            let Frame::Request(request) = frame else {
+                continue;
+            };
+            if remaining == 0 {
+                return send_error(&output, 429, "provider request budget exhausted").await;
+            }
+            remaining -= 1;
+            let id = request.id;
+            let cancelled = tokio::select! {
+                biased;
+                result = self.exchange(request, &output) => {
+                    result?;
+                    false
+                }
+                result = wait_for_cancel(&mut requests, id) => {
+                    if !result? {
+                        return Ok(());
+                    }
+                    true
+                }
+            };
+            if cancelled {
+                send_frame(&output, &End { end: true }).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn exchange(&self, request: Request, response: &mpsc::Sender<Vec<u8>>) -> io::Result<()> {
+        if !self.provider.allows(&request.method, &request.path)
+            || request.body.len() > REQUEST_BYTES
+        {
+            return send_error(response, 403, "provider request denied").await;
+        }
+        let url = format!("{}{}", self.origin, request.path);
+        let upstream = match request.method.as_str() {
+            "GET" if request.body.is_empty() => self.client.request(Method::GET, url),
+            "POST" => {
+                let Some(payload) = allowed_payload(&request.body, &self.model, self.provider)
+                else {
+                    return send_error(response, 403, "provider request denied").await;
+                };
+                self.client
+                    .request(Method::POST, url)
+                    .header("content-type", "application/json")
+                    .body(payload)
+            }
+            _ => return send_error(response, 403, "provider request denied").await,
+        }
+        .bearer_auth(&*self.key);
+        let Ok(upstream) = upstream.send().await else {
+            return send_error(response, 502, "provider unavailable").await;
+        };
+        let status = upstream.status();
+        if !status.is_success() {
+            let status = if status.is_client_error() || status.is_server_error() {
+                status.as_u16()
+            } else {
+                502
+            };
+            return send_error(response, status, "provider rejected the request").await;
+        }
+        let content_type = match upstream
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+        {
+            Some(value) if value.split(';').next() == Some("text/event-stream") => {
+                "text/event-stream"
+            }
+            _ => "application/json",
+        };
+        send_frame(
+            response,
+            &Reply {
+                status: status.as_u16(),
+                content_type,
+            },
+        )
+        .await?;
+        let mut total = 0;
+        let mut body = upstream.bytes_stream();
+        while let Some(chunk) = body.next().await {
+            let bytes = chunk.map_err(|_| io::Error::other("provider stream interrupted"))?;
+            total += bytes.len();
+            if total > RESPONSE_BYTES {
+                return Err(io::Error::other("provider response exceeds limit"));
+            }
+            for chunk in bytes.chunks(16 * 1024) {
+                send_frame(
+                    response,
+                    &Chunk {
+                        chunk: STANDARD.encode(chunk),
+                    },
+                )
+                .await?;
+            }
+        }
+        send_frame(response, &End { end: true }).await
+    }
+}
+
+fn allowed_payload(body: &str, model: &str, provider: Provider) -> Option<String> {
+    let Ok(serde_json::Value::Object(mut request)) = serde_json::from_str(body) else {
+        return None;
+    };
+    request.remove("client_metadata");
+    if request.get("model").and_then(serde_json::Value::as_str) != Some(model)
+        || !request.keys().all(|key| allowed_field(provider, key))
+        || request
+            .get("store")
+            .is_some_and(|value| value != false && !value.is_null())
+        || ["input", "messages"]
+            .iter()
+            .any(|key| request.get(*key).is_some_and(has_remote_input))
+        || request.get("tools").is_some_and(|tools| {
+            !tools
+                .as_array()
+                .is_some_and(|tools| tools.iter().all(allowed_tool))
+        })
+    {
+        return None;
+    }
+    request.remove("service_tier");
+    let output_field = match provider {
+        Provider::OpenAi => {
+            request.insert("store".to_owned(), false.into());
+            "max_output_tokens"
+        }
+        Provider::XAi => {
+            request.insert("n".to_owned(), 1.into());
+            if let Some(value) = request.remove("max_completion_tokens") {
+                request.entry("max_tokens").or_insert(value);
+            }
+            "max_tokens"
+        }
+    };
+    let output_tokens = request
+        .get(output_field)
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(OUTPUT_TOKENS)
+        .min(OUTPUT_TOKENS);
+    request.insert(output_field.to_owned(), output_tokens.into());
+    Some(serde_json::Value::Object(request).to_string())
+}
+
+fn allowed_field(provider: Provider, field: &str) -> bool {
+    matches!(
+        field,
+        "model"
+            | "stream"
+            | "tools"
+            | "tool_choice"
+            | "parallel_tool_calls"
+            | "temperature"
+            | "top_p"
+            | "service_tier"
+    ) || match provider {
+        Provider::OpenAi => matches!(
+            field,
+            "input"
+                | "instructions"
+                | "store"
+                | "reasoning"
+                | "text"
+                | "include"
+                | "max_output_tokens"
+                | "metadata"
+                | "prompt_cache_key"
+                | "prompt_cache_retention"
+                | "safety_identifier"
+                | "truncation"
+                | "stream_options"
+        ),
+        Provider::XAi => matches!(
+            field,
+            "messages"
+                | "n"
+                | "max_tokens"
+                | "max_completion_tokens"
+                | "reasoning_effort"
+                | "response_format"
+                | "stream_options"
+                | "stop"
+                | "presence_penalty"
+                | "frequency_penalty"
+                | "seed"
+                | "logprobs"
+                | "top_logprobs"
+                | "user"
+        ),
+    }
+}
+
+fn has_remote_input(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Array(items) => items.iter().any(has_remote_input),
+        serde_json::Value::Object(fields) => {
+            matches!(
+                fields.get("type").and_then(serde_json::Value::as_str),
+                Some(
+                    "item_reference"
+                        | "input_file"
+                        | "input_image"
+                        | "image_url"
+                        | "input_audio"
+                        | "file"
+                )
+            ) || ["file_id", "file_url", "image_url"]
+                .iter()
+                .any(|key| fields.contains_key(*key))
+                || fields.values().any(has_remote_input)
+        }
+        _ => false,
+    }
+}
+
+fn allowed_tool(tool: &serde_json::Value) -> bool {
+    is_local_tool(tool)
+        || (tool.get("type").and_then(serde_json::Value::as_str) == Some("namespace")
+            && tool
+                .get("tools")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|tools| tools.iter().all(is_local_tool)))
+}
+
+fn is_local_tool(tool: &serde_json::Value) -> bool {
+    matches!(
+        tool.get("type").and_then(serde_json::Value::as_str),
+        Some("function" | "custom")
+    )
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Request {
+    id: u64,
+    method: String,
+    path: String,
+    body: String,
+}
+
+#[derive(Serialize)]
+struct Reply<'a> {
+    status: u16,
+    content_type: &'a str,
+}
+
+#[derive(Serialize)]
+struct Chunk {
+    chunk: String,
+}
+
+#[derive(Serialize)]
+struct End {
+    end: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Cancellation {
+    cancel: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Frame {
+    Request(Request),
+    Cancellation(Cancellation),
+}
+
+async fn receive(
+    reader: &mut FramedRead<impl AsyncRead + Unpin, LinesCodec>,
+) -> io::Result<Option<Frame>> {
+    reader
+        .next()
+        .await
+        .map(|line| {
+            let line = line.map_err(io::Error::other)?;
+            serde_json::from_str(&line)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid provider frame"))
+        })
+        .transpose()
+}
+
+async fn wait_for_cancel(
+    reader: &mut FramedRead<impl AsyncRead + Unpin, LinesCodec>,
+    id: u64,
+) -> io::Result<bool> {
+    while let Some(frame) = receive(reader).await? {
+        match frame {
+            Frame::Cancellation(message) if message.cancel == id => return Ok(true),
+            Frame::Cancellation(_) => {}
+            Frame::Request(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "provider requests are serialized",
+                ));
+            }
+        }
+    }
+    Ok(false)
+}
+
+async fn send_frame(output: &mpsc::Sender<Vec<u8>>, value: &impl Serialize) -> io::Result<()> {
+    let frame = encode_frame(value)?;
+    output
+        .send(frame)
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "provider bridge disconnected"))
+}
+
+fn encode_frame(value: &impl Serialize) -> io::Result<Vec<u8>> {
+    let mut frame = serde_json::to_vec(value)?;
+    frame.push(b'\n');
+    Ok(frame)
+}
+
+async fn send_error(output: &mpsc::Sender<Vec<u8>>, status: u16, message: &str) -> io::Result<()> {
+    send_frame(
+        output,
+        &Reply {
+            status,
+            content_type: "application/json",
+        },
+    )
+    .await?;
+    let body = serde_json::json!({"error":{"message":message}}).to_string();
+    send_frame(
+        output,
+        &Chunk {
+            chunk: STANDARD.encode(body),
+        },
+    )
+    .await?;
+    send_frame(output, &End { end: true }).await
+}
+
+pub(crate) struct BrokerTask {
+    child: Child,
+    job: Option<JoinHandle<io::Result<()>>>,
+}
+
+impl Drop for BrokerTask {
+    fn drop(&mut self) {
+        if let Some(job) = &self.job {
+            job.abort();
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+    use tokio::io::{AsyncBufReadExt, BufReader as AsyncBufReader, duplex, split};
+
+    #[test]
+    fn denies_unconfigured_models_and_provider_tools() {
+        let allowed_payload = |body, model| super::allowed_payload(body, model, Provider::OpenAi);
+        assert!(Provider::OpenAi.allows("POST", "/v1/responses"));
+        assert!(!Provider::OpenAi.allows("POST", "/v1/chat/completions"));
+        assert!(!Provider::XAi.allows("POST", "/v1/responses"));
+        assert!(!Provider::XAi.allows("GET", "https://api.x.ai/v1/models"));
+        assert!(!Provider::XAi.allows("GET", "/v1/models?extra=1"));
+        assert!(
+            super::allowed_payload(
+                r#"{"model":"selected","search_parameters":{"mode":"on"}}"#,
+                "selected",
+                Provider::XAi
+            )
+            .is_none()
+        );
+
+        assert!(
+            allowed_payload(
+                r#"{"model":"selected","tools":[{"type":"function"}]}"#,
+                "selected"
+            )
+            .is_some()
+        );
+        assert!(allowed_payload(r#"{"model":"selected","tools":[{"type":"namespace","tools":[{"type":"function"}]}]}"#, "selected").is_some());
+        assert!(allowed_payload(r#"{"model":"selected","tools":[{"type":"namespace","tools":[{"type":"web_search"}]}]}"#, "selected").is_none());
+        assert!(allowed_payload(r#"{"model":"other"}"#, "selected").is_none());
+        assert!(
+            allowed_payload(
+                r#"{"model":"selected","tools":[{"type":"web_search"}]}"#,
+                "selected"
+            )
+            .is_none()
+        );
+        assert!(
+            allowed_payload(
+                r#"{"model":"selected","previous_response_id":"other"}"#,
+                "selected"
+            )
+            .is_none()
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(
+                &allowed_payload(
+                    r#"{"model":"other","model":"selected","client_metadata":{"fixture":true}}"#,
+                    "selected"
+                )
+                .unwrap()
+            )
+            .unwrap(),
+            serde_json::json!({"max_output_tokens":8192,"model":"selected","store":false})
+        );
+    }
+
+    #[tokio::test]
+    async fn streams_the_fixed_upstream_and_cancels_an_open_request() {
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", upstream.local_addr().unwrap());
+        let (opened, opening) = tokio::sync::oneshot::channel();
+        let upstream = std::thread::spawn(move || {
+            let mut first = accept(&upstream);
+            write!(
+                first,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 100\r\n\r\ndata: first\n\n"
+            )
+            .unwrap();
+            opened.send(()).unwrap();
+            let mut remaining = [0];
+            assert_eq!(first.read(&mut remaining).unwrap(), 0);
+            let mut second = accept(&upstream);
+            write!(
+                second,
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://127.0.0.1:1/\r\nContent-Length: 0\r\n\r\n"
+            )
+            .unwrap();
+        });
+        let broker = Broker {
+            provider: Provider::OpenAi,
+            client: Client::builder()
+                .no_proxy()
+                .redirect(Policy::none())
+                .build()
+                .unwrap(),
+            key: Zeroizing::new("fixture-host-key".to_owned()),
+            origin,
+            model: "selected".to_owned(),
+        };
+        let (guest, host) = duplex(32 * 1024);
+        let (host_read, host_write) = split(host);
+        let (guest_read, mut guest_write) = split(guest);
+        let requests = FramedRead::new(host_read, LinesCodec::new_with_max_length(WIRE_BYTES));
+        let mut replies = AsyncBufReader::new(guest_read).lines();
+        let check = async move {
+            let request = |id| {
+                serde_json::json!({
+                    "id": id,
+                    "method": "POST",
+                    "path": "/v1/responses",
+                    "body": "{\"model\":\"selected\"}"
+                })
+            };
+            guest_write
+                .write_all(&encode_frame(&request(1)).unwrap())
+                .await
+                .unwrap();
+            opening.await.unwrap();
+            let head = replies.next_line().await.unwrap().unwrap();
+            assert!(head.contains("text/event-stream"));
+            let frame = replies.next_line().await.unwrap().unwrap();
+            assert!(frame.contains(&STANDARD.encode("data: first\n\n")));
+            guest_write
+                .write_all(&encode_frame(&serde_json::json!({"cancel":1})).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                replies.next_line().await.unwrap().unwrap(),
+                r#"{"end":true}"#
+            );
+            guest_write
+                .write_all(&encode_frame(&request(2)).unwrap())
+                .await
+                .unwrap();
+            assert!(replies.next_line().await.unwrap().unwrap().contains("502"));
+            assert!(
+                replies
+                    .next_line()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .contains("chunk")
+            );
+            assert_eq!(
+                replies.next_line().await.unwrap().unwrap(),
+                r#"{"end":true}"#
+            );
+            guest_write.shutdown().await.unwrap();
+        };
+        let (served, ()) = timeout(Duration::from_secs(10), async {
+            tokio::join!(broker.serve(requests, host_write), check)
+        })
+        .await
+        .unwrap();
+        served.unwrap();
+        upstream.join().unwrap();
+    }
+
+    fn accept(listener: &TcpListener) -> std::net::TcpStream {
+        let (stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        assert_eq!(line.trim_end(), "POST /v1/responses HTTP/1.1");
+        let mut length = 0;
+        let mut authenticated = false;
+        loop {
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            if line == "\r\n" {
+                break;
+            }
+            if let Some(value) = line.strip_prefix("content-length: ") {
+                length = value.trim().parse().unwrap();
+            }
+            authenticated |= line.trim_end() == "authorization: Bearer fixture-host-key";
+        }
+        assert!(authenticated);
+        let mut body = vec![0; length];
+        reader.read_exact(&mut body).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({"max_output_tokens":8192,"model":"selected","store":false})
+        );
+        reader.into_inner()
+    }
+}
