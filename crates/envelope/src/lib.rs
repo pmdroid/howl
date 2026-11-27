@@ -45,6 +45,18 @@ pub enum Intent {
     Chat = 1,
     Wake = 2,
     AgentReply = 3,
+    IntegrationChat = 4,
+    IntegrationWake = 5,
+}
+
+impl Intent {
+    pub const fn is_wake(self) -> bool {
+        matches!(self, Self::Wake | Self::IntegrationWake)
+    }
+
+    pub const fn is_integration(self) -> bool {
+        matches!(self, Self::IntegrationChat | Self::IntegrationWake)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -172,6 +184,7 @@ pub struct ReceivePolicy<'a> {
 pub struct OpenedEnvelope {
     pub metadata: Metadata,
     pub body: Body<String>,
+    pub integration: Option<Id>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -211,7 +224,32 @@ pub fn seal(
     signer: &SigningKey,
     recipients: &[Recipient],
 ) -> Result<Vec<u8>, Error> {
-    let intent = body.intent();
+    seal_envelope(routing, body, signer, recipients, None)
+}
+
+pub fn seal_integration(
+    routing: Routing,
+    body: Body<&str>,
+    signer: &SigningKey,
+    recipients: &[Recipient],
+    integration: Id,
+) -> Result<Vec<u8>, Error> {
+    seal_envelope(routing, body, signer, recipients, Some(integration))
+}
+
+fn seal_envelope(
+    routing: Routing,
+    body: Body<&str>,
+    signer: &SigningKey,
+    recipients: &[Recipient],
+    integration: Option<Id>,
+) -> Result<Vec<u8>, Error> {
+    let intent = match (body.intent(), integration.is_some()) {
+        (Intent::Chat, true) => Intent::IntegrationChat,
+        (Intent::Wake, true) => Intent::IntegrationWake,
+        (_, true) => return Err(Error::Unauthorized),
+        (intent, false) => intent,
+    };
     wire::validate_routing(routing, intent)?;
     if recipients.is_empty() || recipients.len() > MAX_RECIPIENTS {
         return Err(Error::Encoding);
@@ -230,7 +268,7 @@ pub fn seal(
     {
         return Err(Error::Unauthorized);
     }
-    let mut padded = wire::pad(body)?;
+    let mut padded = wire::pad(body, integration)?;
     let mut rng = ChaCha20Rng::try_from_rng(&mut OsRng).map_err(|_| Error::Randomness)?;
     let mut secret = Zeroizing::new([0; KEY_SIZE]);
     let mut message_id = [0; KEY_SIZE];
@@ -330,14 +368,14 @@ fn open_envelope(
     if routing.sender != policy.sender.address
         || metadata.signing_key_id != key_id(b"device-signing", &policy.sender.signing_key)
         || !match metadata.intent {
-            Intent::Chat | Intent::AgentReply => policy.sender.chat,
-            Intent::Wake => policy.sender.wake,
+            Intent::Chat | Intent::AgentReply | Intent::IntegrationChat => policy.sender.chat,
+            Intent::Wake | Intent::IntegrationWake => policy.sender.wake,
         }
     {
         return Err(Error::Unauthorized);
     }
     if enforce_wake_expiry
-        && metadata.intent == Intent::Wake
+        && metadata.intent.is_wake()
         && (policy.now < routing.created_at.saturating_sub(30) || policy.now >= routing.expires_at)
     {
         return Err(Error::Stale);
@@ -407,13 +445,17 @@ fn open_envelope(
             tag.into(),
         )
         .map_err(|_| Error::Ciphertext)?;
-    let body = wire::unpad(metadata.intent, &padded)?;
+    let (body, integration) = wire::unpad(metadata.intent, &padded)?;
     if let Body::AgentReply(reply) = &body
         && reply.agent != reply.role.agent_id(&routing.sender.device)
     {
         return Err(Error::Unauthorized);
     }
-    Ok(OpenedEnvelope { metadata, body })
+    Ok(OpenedEnvelope {
+        metadata,
+        body,
+        integration,
+    })
 }
 
 fn derive(secret: &[u8; KEY_SIZE], message_id: &Id) -> (Zeroizing<[u8; KEY_SIZE]>, Id) {
