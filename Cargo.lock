@@ -1327,6 +1327,7 @@ dependencies = [
  "getrandom 0.4.3",
  "hex",
  "howl",
+ "howl-envelope",
  "reqwest",
  "serde",
  "serde_json",

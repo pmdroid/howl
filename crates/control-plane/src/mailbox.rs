@@ -1,12 +1,12 @@
 use std::ops::RangeInclusive;
 
-use deadpool_postgres::{Pool, Transaction};
+use deadpool_postgres::Pool;
 use sha2::{Digest, Sha256};
-use tokio_postgres::{Row, types::ToSql};
+use tokio_postgres::{Row, Transaction, types::ToSql};
 
 use crate::Id;
 
-const FRAME_LIMIT: usize = 77_112;
+pub(crate) const FRAME_LIMIT: usize = 77_112;
 const RETENTION: i64 = 7 * 24 * 60 * 60;
 const FUTURE_SKEW: i64 = 30;
 const PAGE_LIMIT: usize = 64;
@@ -149,16 +149,26 @@ impl Mailbox {
         let mut db = pool.get().await?;
         let transaction = db.transaction().await?;
         transaction
-            .query_one("SELECT pg_advisory_xact_lock(4983033826038031202)", &[])
+            .query_one("SELECT pg_advisory_xact_lock(4983033826038031201)", &[])
             .await?;
-        transaction
-            .batch_execute(include_str!("../migrations/003_mailbox.sql"))
-            .await?;
+        migrate_in(&transaction).await?;
         transaction.commit().await?;
         Ok(())
     }
 
     pub async fn deposit(&self, request: EnrolledSubmission<'_>) -> Result<Deposit> {
+        let mut db = self.pool.get().await?;
+        let tx = db.transaction().await?;
+        let stored = self.deposit_in(&tx, request).await?;
+        tx.commit().await?;
+        Ok(stored)
+    }
+
+    pub(crate) async fn deposit_in(
+        &self,
+        tx: &Transaction<'_>,
+        request: EnrolledSubmission<'_>,
+    ) -> Result<Deposit> {
         let recipient = request.recipient.0;
         let header = request.header;
         let sender = header.stream.sender;
@@ -170,8 +180,6 @@ impl Mailbox {
             .checked_add(RETENTION)
             .ok_or(MailboxError::Invalid)?;
 
-        let mut db = self.pool.get().await?;
-        let tx = db.transaction().await?;
         let recipient_key: &[&(dyn ToSql + Sync)] =
             &[&recipient.account.as_slice(), &recipient.device.as_slice()];
         tx.execute(
@@ -186,7 +194,7 @@ impl Mailbox {
             recipient_key,
         )
         .await?;
-        let now = database_time(&tx).await?;
+        let now = database_time(tx).await?;
         if header.sent_at > now + FUTURE_SKEW {
             return Err(MailboxError::Invalid);
         }
@@ -228,7 +236,6 @@ impl Mailbox {
         match present.as_slice() {
             [] => {}
             [row] if read_header(row)? == header && get_bytes::<32>(row, 8)? == digest => {
-                tx.commit().await?;
                 return Ok(Deposit::Duplicate);
             }
             _ => return Err(MailboxError::Conflict),
@@ -282,20 +289,29 @@ impl Mailbox {
             ],
         )
         .await?;
-        tx.commit().await?;
         Ok(Deposit::Stored)
     }
 
     pub async fn fetch(&self, caller: &EnrolledDevice, after: i64, count: usize) -> Result<Page> {
+        let mut db = self.pool.get().await?;
+        let tx = db.transaction().await?;
+        let page = self.fetch_in(&tx, caller, after, count).await?;
+        tx.commit().await?;
+        Ok(page)
+    }
+
+    pub(crate) async fn fetch_in(
+        &self,
+        tx: &Transaction<'_>,
+        caller: &EnrolledDevice,
+        after: i64,
+        count: usize,
+    ) -> Result<Page> {
         let limit = page_limit(count)?;
         if after < 0 {
             return Err(MailboxError::Invalid);
         }
-        let rows = self
-            .pool
-            .get()
-            .await?
-            .query(
+        let rows = tx.query(
                 "SELECT cursor, channel, epoch, sender_account, sender_device, sequence,
                         message, sent_at, digest, ciphertext
                  FROM howl_mailbox.envelopes
@@ -323,14 +339,28 @@ impl Mailbox {
         range: RangeInclusive<u64>,
         count: usize,
     ) -> Result<RangePage> {
+        let mut db = self.pool.get().await?;
+        let tx = db.transaction().await?;
+        let page = self
+            .fetch_range_in(&tx, caller, stream, range, count)
+            .await?;
+        tx.commit().await?;
+        Ok(page)
+    }
+
+    pub(crate) async fn fetch_range_in(
+        &self,
+        tx: &Transaction<'_>,
+        caller: &EnrolledDevice,
+        stream: Stream,
+        range: RangeInclusive<u64>,
+        count: usize,
+    ) -> Result<RangePage> {
         let limit = page_limit(count)?;
         if range.is_empty() || *range.start() == 0 || stream.epoch == 0 {
             return Err(MailboxError::Invalid);
         }
-        let rows = self
-            .pool
-            .get()
-            .await?
+        let rows = tx
             .query(
                 "SELECT cursor, channel, epoch, sender_account, sender_device, sequence,
                         message, sent_at, digest, ciphertext
@@ -378,11 +408,21 @@ impl Mailbox {
         message: Id,
         digest: Id,
     ) -> Result<bool> {
-        let row = self
-            .pool
-            .get()
-            .await?
-            .query_one(
+        let mut db = self.pool.get().await?;
+        let tx = db.transaction().await?;
+        let confirmed = self.acknowledge_in(&tx, caller, message, digest).await?;
+        tx.commit().await?;
+        Ok(confirmed)
+    }
+
+    pub(crate) async fn acknowledge_in(
+        &self,
+        tx: &Transaction<'_>,
+        caller: &EnrolledDevice,
+        message: Id,
+        digest: Id,
+    ) -> Result<bool> {
+        let row = tx.query_one(
                 "WITH eligible AS (
                      SELECT cursor FROM howl_mailbox.envelopes
                      WHERE recipient_account = $1 AND recipient_device = $2 AND message = $3
@@ -420,6 +460,12 @@ impl Mailbox {
             .await?;
         Ok(deleted)
     }
+}
+
+pub(crate) async fn migrate_in(tx: &Transaction<'_>) -> Result<()> {
+    tx.batch_execute(include_str!("../migrations/003_mailbox.sql"))
+        .await?;
+    Ok(())
 }
 
 async fn database_time(db: &Transaction<'_>) -> Result<i64> {
