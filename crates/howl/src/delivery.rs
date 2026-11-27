@@ -5,6 +5,7 @@ mod messages;
 #[cfg(test)]
 mod reply_tests;
 mod wake;
+mod webhook_queue;
 pub use budget::{
     ApprovedWake, BudgetError, BudgetLimit, BudgetLimits, ConversationBudget, HumanAction,
     HumanCommand, Turn, WakeApproval, WakeOutcome, WakeTurnError,
@@ -17,6 +18,7 @@ pub(crate) use integration_runs::{
 pub(crate) use mailbox_outbox::MAILBOX_OUTBOX_BATCH;
 pub use messages::{ChannelEvent, ChannelMessage};
 pub use wake::{WakeClaim, WakeJob, WakeState};
+pub(crate) use webhook_queue::{WebhookAttempt, WebhookEventKind, WebhookFilter, WebhookOutcome};
 
 use std::{fs::File, io, ops::RangeInclusive, path::Path, time::Duration};
 

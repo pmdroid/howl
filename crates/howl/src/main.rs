@@ -16,7 +16,7 @@ use howl::{
     managed_acp::{Harness, HostClaude, HostCodex, HostGrok},
     node,
     observer::{ObserverProvider, Snapshot},
-    remote_mcp, serve_gateway, tui, web,
+    remote_mcp, serve_gateway, tui, web, webhooks,
     workflow::{self, RunTurn},
 };
 use howl_envelope::AgentRole;
@@ -187,6 +187,36 @@ async fn main() -> ExitCode {
                 }
                 Err(error) => Err(error),
             }
+        }
+        [group, action, state, config] if group == "webhook" && action == "run" => {
+            webhooks::run(Path::new(state), Path::new(config)).await
+        }
+        [group, action, state] if group == "webhook" && action == "status" => {
+            webhooks::status(Path::new(state)).and_then(print_json)
+        }
+        [group, action, state, config, endpoint, event]
+            if group == "webhook" && action == "replay" =>
+        {
+            required_text(endpoint)
+                .and_then(|endpoint| {
+                    webhooks::replay(
+                        Path::new(state),
+                        Path::new(config),
+                        endpoint,
+                        parse_id(event)?,
+                    )
+                })
+                .and_then(|queued| {
+                    if queued {
+                        println!("Webhook replay queued.");
+                        Ok(())
+                    } else {
+                        Err(io::Error::new(
+                            io::ErrorKind::NotFound,
+                            "Webhook replay unavailable.",
+                        ))
+                    }
+                })
         }
         [command, state, channel, peer, route] if command == "send" => {
             let (Ok(channel), Ok(peer), Some(route)) =
