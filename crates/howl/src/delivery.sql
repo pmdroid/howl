@@ -97,6 +97,10 @@ CREATE TABLE IF NOT EXISTS agent_replies (
     in_reply_to BLOB NOT NULL CHECK (length(in_reply_to) = 32),
     context_digest BLOB NOT NULL CHECK (length(context_digest) = 32)
 ) STRICT;
+CREATE TABLE IF NOT EXISTS integration_events (
+    cursor INTEGER PRIMARY KEY REFERENCES inbox(id),
+    actor BLOB NOT NULL CHECK (length(actor) = 32)
+) STRICT;
 CREATE TABLE IF NOT EXISTS channel_event_addresses (
     cursor INTEGER PRIMARY KEY REFERENCES inbox(id),
     outbound INTEGER NOT NULL CHECK (outbound IN (0, 1)),

@@ -9,6 +9,7 @@ pub struct ChannelMessage {
     pub message: Id,
     pub received_at: u64,
     pub body: Body<String>,
+    pub integration: Option<Id>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -18,13 +19,21 @@ pub struct ChannelEvent {
     pub recipient: Option<Device>,
 }
 
+pub(crate) struct ChannelEventPage {
+    pub events: Vec<ChannelEvent>,
+    pub cursor: u64,
+    pub gap: bool,
+    pub more: bool,
+}
+
 const MESSAGE_FIELDS: &str = "
     substr(i.stream, 33, 64), i.message, i.received, i.body,
-    i.kind, a.agent, a.role, a.in_reply_to, a.context_digest, i.target";
+    i.kind, a.agent, a.role, a.in_reply_to, a.context_digest, i.target, g.actor AS integration_actor";
 
 const MESSAGES: &str = "
     FROM inbox i LEFT JOIN agent_replies a ON a.cursor = i.id
     LEFT JOIN channel_event_addresses e ON e.cursor = i.id
+    LEFT JOIN integration_events g ON g.cursor = i.id
     WHERE substr(i.stream, 1, 32) = ?1 AND i.body IS NOT NULL";
 
 impl DeliveryStore {
@@ -48,8 +57,8 @@ impl DeliveryStore {
             return Ok(Vec::new());
         };
         let mut statement = self.connection.prepare(&format!(
-            "SELECT {MESSAGE_FIELDS}, i.id, e.recipient {MESSAGES}
-             AND i.kind IN (1, 3, 4) AND i.id > ?2 ORDER BY i.id LIMIT ?3"
+            "SELECT {MESSAGE_FIELDS}, i.id AS cursor, e.recipient {MESSAGES}
+             AND i.kind IN (1, 2, 3, 4) AND i.id > ?2 ORDER BY i.id LIMIT ?3"
         ))?;
         Ok(statement
             .query_map(params![channel, after, limit.min(256) as u32], read_event)?
@@ -71,8 +80,9 @@ impl DeliveryStore {
             return Ok(Vec::new());
         };
         let mut statement = self.connection.prepare(&format!(
-            "SELECT {MESSAGE_FIELDS}, i.id, e.recipient, CASE WHEN e.cursor IS NULL THEN i.frame END
-             {MESSAGES} AND i.kind IN (1, 3, 4) AND i.id > ?2
+            "SELECT {MESSAGE_FIELDS}, i.id AS cursor, e.recipient,
+             CASE WHEN e.cursor IS NULL THEN i.frame END AS legacy_frame
+             {MESSAGES} AND i.kind IN (1, 2, 3, 4) AND i.id > ?2
              AND ((e.outbound = 1 AND e.recipient = ?3)
                OR (e.outbound IS NOT 1 AND substr(i.stream, 33, 64) = ?3
                  AND (e.recipient = ?4 OR (e.cursor IS NULL AND i.frame IS NOT NULL))))
@@ -85,7 +95,7 @@ impl DeliveryStore {
         {
             let mut event = read_event(row)?;
             if event.recipient.is_none() {
-                let Some(frame) = row.get::<_, Option<Vec<u8>>>(12)? else {
+                let Some(frame) = row.get::<_, Option<Vec<u8>>>("legacy_frame")? else {
                     continue;
                 };
                 event.recipient = sole_recipient(&frame).filter(|recipient| *recipient == local);
@@ -95,6 +105,51 @@ impl DeliveryStore {
             }
         }
         Ok(events)
+    }
+
+    pub(crate) fn event_page(
+        &self,
+        channel: Id,
+        direct: Option<(Device, Device)>,
+        after: u64,
+        limit: usize,
+    ) -> Result<ChannelEventPage> {
+        let tx = self.connection.unchecked_transaction()?;
+        let limit = limit.clamp(1, 255);
+        let mut events = match direct {
+            Some((local, peer)) => self.direct_events(channel, local, peer, after, limit + 1)?,
+            None => self.channel_events(channel, after, limit + 1)?,
+        };
+        let more = events.len() > limit;
+        events.truncate(limit);
+        let last = events.last().map(|event| event.cursor);
+        let pruned = if let Ok(after) = i64::try_from(after) {
+            let upper = last
+                .and_then(|id| i64::try_from(id).ok())
+                .unwrap_or(i64::MAX);
+            let (local, peer) = direct
+                .map(|(local, peer)| (local.encode(), peer.encode()))
+                .unzip();
+            tx.query_row(
+                "SELECT MAX(i.id) FROM inbox i LEFT JOIN channel_event_addresses e ON e.cursor = i.id
+                 WHERE substr(i.stream, 1, 32) = ?1 AND i.body IS NULL AND i.kind IN (1, 2, 3, 4)
+                 AND i.id > ?2 AND i.id <= ?3
+                 AND (?4 IS NULL OR (e.outbound = 1 AND e.recipient = ?4)
+                    OR (e.outbound = 0 AND e.recipient = ?5 AND substr(i.stream, 33, 64) = ?4))",
+                params![channel, after, upper, peer, local],
+                |row| row.get::<_, Option<i64>>(0),
+            )?
+            .and_then(|id| u64::try_from(id).ok())
+        } else {
+            None
+        };
+        tx.commit()?;
+        Ok(ChannelEventPage {
+            events,
+            cursor: last.or(pruned).unwrap_or(after),
+            gap: pruned.is_some(),
+            more,
+        })
     }
 
     pub fn channel_message(
@@ -123,7 +178,7 @@ pub(super) fn record_outbound(
     recipient: Device,
     now: u64,
     body: Body<&str>,
-) -> Result<()> {
+) -> Result<i64> {
     let (kind, target, text) = match &body {
         Body::Chat(text) => (1, None, *text),
         Body::AgentReply(reply) => (3, None, reply.text),
@@ -142,6 +197,14 @@ pub(super) fn record_outbound(
     connection.execute(
         "INSERT INTO channel_event_addresses (cursor, outbound, recipient) VALUES (?1, 1, ?2)",
         params![cursor, recipient.encode()],
+    )?;
+    Ok(cursor)
+}
+
+pub(super) fn record_integration(connection: &Connection, cursor: i64, actor: Id) -> Result<()> {
+    connection.execute(
+        "INSERT INTO integration_events (cursor, actor) VALUES (?1, ?2)",
+        params![cursor, actor],
     )?;
     Ok(())
 }
@@ -191,9 +254,12 @@ fn sole_recipient(bytes: &[u8]) -> Option<Device> {
 
 fn read_event(row: &Row<'_>) -> rusqlite::Result<ChannelEvent> {
     Ok(ChannelEvent {
-        cursor: u64::try_from(row.get::<_, i64>(10)?).map_err(|_| rusqlite::Error::InvalidQuery)?,
+        cursor: u64::try_from(row.get::<_, i64>("cursor")?)
+            .map_err(|_| rusqlite::Error::InvalidQuery)?,
         message: read(row)?,
-        recipient: row.get::<_, Option<[u8; 64]>>(11)?.map(Device::decode),
+        recipient: row
+            .get::<_, Option<[u8; 64]>>("recipient")?
+            .map(Device::decode),
     })
 }
 
@@ -209,7 +275,7 @@ fn read(row: &Row<'_>) -> rusqlite::Result<ChannelMessage> {
             context_digest: row.get(8)?,
             text,
         }),
-        4 => Body::Wake {
+        2 | 4 => Body::Wake {
             session: row.get(9)?,
             text,
         },
@@ -220,5 +286,6 @@ fn read(row: &Row<'_>) -> rusqlite::Result<ChannelMessage> {
         message: row.get(1)?,
         received_at: u64::from_be_bytes(row.get(2)?),
         body,
+        integration: row.get("integration_actor")?,
     })
 }

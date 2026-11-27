@@ -1,6 +1,6 @@
 use std::{io, path::Path};
 
-use howl_envelope::{DeviceAddress, Intent, inspect_unverified};
+use howl_envelope::{DeviceAddress, inspect_unverified};
 use reqwest::StatusCode;
 use serde::Deserialize;
 
@@ -117,7 +117,7 @@ fn may_deposit(
         ));
     }
     let roster = Channel::load(state, identity, &routing.channel)?;
-    let permission = if metadata.intent == Intent::Wake {
+    let permission = if metadata.intent.is_wake() {
         ChannelPermission::Wake
     } else {
         ChannelPermission::Send

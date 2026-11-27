@@ -1,0 +1,22 @@
+CREATE TABLE IF NOT EXISTS integration_runs (
+    id BLOB PRIMARY KEY NOT NULL CHECK (length(id) = 32),
+    owner TEXT NOT NULL,
+    request_key TEXT NOT NULL,
+    fingerprint BLOB NOT NULL CHECK (length(fingerprint) = 32),
+    channel BLOB NOT NULL CHECK (length(channel) = 32),
+    peer BLOB NOT NULL CHECK (length(peer) = 32),
+    target BLOB NOT NULL CHECK (length(target) = 32),
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    dispatch_before INTEGER NOT NULL,
+    finish_before INTEGER NOT NULL,
+    state INTEGER NOT NULL DEFAULT 0 CHECK (state BETWEEN 0 AND 3),
+    cancellation_requested INTEGER NOT NULL DEFAULT 0 CHECK (cancellation_requested IN (0, 1)),
+    envelope INTEGER UNIQUE REFERENCES outbox(id),
+    run_message BLOB UNIQUE CHECK (run_message IS NULL OR length(run_message) = 32),
+    reply_message BLOB,
+    reply TEXT,
+    CHECK ((envelope IS NULL) = (run_message IS NULL)),
+    CHECK ((state = 1) = (reply_message IS NOT NULL AND reply IS NOT NULL)),
+    UNIQUE (owner, request_key)
+) STRICT;

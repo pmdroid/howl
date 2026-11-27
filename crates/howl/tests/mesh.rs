@@ -474,6 +474,13 @@ async fn enrolled_peers_stop_new_delivery_after_signed_revocation() {
     .unwrap();
     assert!(queued.starts_with("queued "));
     wait_for_text(&bob, second_channel, "second channel").await;
+    let hint = node::export_hint(&alice, alice_address.parse().unwrap()).unwrap();
+    node::import_hint(&bob, &hint).unwrap();
+    let architect = howl_envelope::AgentRole::Architect.agent_id(&a_device);
+    node::grant_wake(&alice, channel_id, b_device, architect, 1)
+        .await
+        .unwrap();
+    check_gateway(&alice, &bob, channel, second_channel, a_device, architect).await;
 
     let revocation = successful(cli(
         &["roster", "revoke"],
@@ -527,6 +534,175 @@ async fn enrolled_peers_stop_new_delivery_after_signed_revocation() {
     successful(cli(&["mesh", "stop"], &bob, &[]));
     assert!(a_node.0.wait().unwrap().success());
     assert!(b_node.0.wait().unwrap().success());
+}
+
+async fn check_gateway(
+    receiver: &Path,
+    state: &Path,
+    channel: &str,
+    denied_channel: &str,
+    peer: [u8; 32],
+    target: [u8; 32],
+) {
+    use serde_json::json;
+    use sha2::{Digest, Sha256};
+
+    let config = tempfile::NamedTempFile::new().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/mcp", listener.local_addr().unwrap());
+    let primary = "howl-mcp-test-primary-4c5d44382e232";
+    let reader = "howl-mcp-test-reader-3d172d3363427d";
+    let expires_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 300;
+    let grant = |id, token: &str, permissions| {
+        json!({
+            "id": id,
+            "token_sha256": hex::encode(Sha256::digest(token)),
+            "expires_at": expires_at,
+            "channels": [channel],
+            "permissions": permissions,
+        })
+    };
+    std::fs::write(
+        config.path(),
+        json!({
+            "resource": endpoint,
+            "grants": [
+                grant("primary", primary, json!(["read", "send", "wake", "cancel"])),
+                grant("reader", reader, json!(["read"]))
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let state = state.to_owned();
+    let path = config.path().to_owned();
+    let gateway = tokio::spawn(async move { howl::serve_gateway(&state, &path, listener).await });
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .no_proxy()
+        .build()
+        .unwrap();
+    let call = |token: &str, name: &str, args: serde_json::Value| {
+        client
+            .post(&endpoint)
+            .bearer_auth(token)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream")
+            .header("MCP-Protocol-Version", "2026-07-28")
+            .header("Mcp-Method", "tools/call")
+            .header("Mcp-Name", name)
+            .body(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {
+                        "name": name,
+                        "arguments": args,
+                        "_meta": {
+                            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                            "io.modelcontextprotocol/clientCapabilities": {},
+                        },
+                    },
+                })
+                .to_string(),
+            )
+    };
+    let list = mcp_response(call(reader, "list_channels", json!({}))).await;
+    assert_eq!(
+        list["result"]["structuredContent"]["channels"],
+        json!([channel])
+    );
+    let denied = mcp_response(call(reader, "read", json!({"channel": denied_channel}))).await;
+    assert!(denied.get("error").is_some(), "{denied}");
+    let post = mcp_response(call(
+        primary,
+        "dm",
+        json!({"channel": channel, "peer": hex::encode(peer), "text": "signed integration chat"}),
+    ))
+    .await;
+    assert!(
+        post["result"]["structuredContent"]["message"].is_string(),
+        "{post}"
+    );
+    wait_for_text(receiver, channel, "signed integration chat").await;
+    let request = json!({
+        "channel": channel,
+        "peer": hex::encode(peer),
+        "target": hex::encode(target),
+        "key": "mesh-gateway-test-1",
+        "lifetime": 30,
+        "text": "wake via remote MCP",
+    });
+    let denied = mcp_response(call(reader, "wake", request.clone())).await;
+    assert!(denied.get("error").is_some(), "{denied}");
+    let first = mcp_response(call(primary, "wake", request.clone())).await;
+    let retry = mcp_response(call(primary, "wake", request)).await;
+    let first_run = &first["result"]["structuredContent"];
+    let retry_run = &retry["result"]["structuredContent"];
+    assert!(first_run["run"].is_string(), "{first}");
+    assert!(first_run["wake_message"].is_string(), "{first}");
+    assert_eq!(first_run["run"], retry_run["run"]);
+    assert_eq!(first_run["wake_message"], retry_run["wake_message"]);
+    let args = json!({ "channel": channel, "run": first_run["run"] });
+    let other_owner = mcp_response(call(reader, "get_run", args.clone())).await;
+    assert!(other_owner.get("error").is_some(), "{other_owner}");
+    let own = mcp_response(call(primary, "get_run", args)).await;
+    assert_eq!(own["result"]["structuredContent"]["run"], first_run["run"]);
+    let channel_id = hex::decode(channel).unwrap().try_into().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(job) =
+            howl::workflow::claim(receiver, channel_id, howl_envelope::AgentRole::Architect)
+                .unwrap()
+        {
+            assert_eq!(job.text, "wake via remote MCP");
+            assert_eq!(
+                json!(hex::encode(job.claim.message)),
+                first_run["wake_message"]
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "remote wake did not reach the mesh"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let events = serde_json::to_value(
+        howl::interaction::LocalInteraction::new(receiver)
+            .events(channel_id, 0, 100)
+            .unwrap(),
+    )
+    .unwrap();
+    let events = events.as_array().unwrap();
+    let origin = |text| &events.iter().find(|event| event["text"] == text).unwrap()["integration"];
+    assert!(origin("signed integration chat").is_string());
+    assert_eq!(
+        origin("signed integration chat"),
+        origin("wake via remote MCP")
+    );
+    assert!(origin("review from the human client").is_null());
+    gateway.abort();
+}
+
+async fn mcp_response(request: reqwest::RequestBuilder) -> serde_json::Value {
+    let response = request.send().await.unwrap();
+    let status = response.status();
+    let text = response.text().await.unwrap();
+    assert!(status.is_success(), "{status}: {text}");
+    let payload = text
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("data: ")
+                .filter(|data| data.starts_with('{'))
+        })
+        .unwrap_or(&text);
+    serde_json::from_str(payload).unwrap()
 }
 
 async fn wait_for_text(state: &Path, channel: &str, text: &str) {

@@ -8,8 +8,8 @@ use std::{
 
 use ed25519_dalek::VerifyingKey;
 use howl_envelope::{
-    AgentReply, AuthorizedSender, Body, DeviceAddress, Id, Intent, Metadata, ReceivePolicy,
-    Recipient, RecipientSecret, Routing,
+    AgentReply, AuthorizedSender, Body, DeviceAddress, Id, Metadata, ReceivePolicy, Recipient,
+    RecipientSecret, Routing,
 };
 use sha2::{Digest, Sha256};
 use tokio::{
@@ -20,8 +20,9 @@ use tokio::{
 use crate::{
     channel::Channel,
     delivery::{
-        ACK_LENGTH, ACK_TAG, Acknowledgment, ApprovedAgentReply, DeliveryStore, Device, Frame,
-        Payload, Receipt, Stream,
+        ACK_LENGTH, ACK_TAG, Acknowledgment, AdmissionTime, ApprovedAgentReply, DeliveryStore,
+        Device, Frame, IntegrationDelivery, IntegrationDispatch, IntegrationRun, NewIntegrationRun,
+        Payload, Receipt, Stream, run_fingerprint, valid_integration_owner,
     },
     discovery::{self, HINT_LEN, RouteHint},
     enrollment::{ChannelPermission, profile::Profile},
@@ -33,6 +34,8 @@ use crate::{
 
 pub const CHAT_LIMIT: usize = 65_532;
 pub const WAKE_LIMIT: usize = CHAT_LIMIT - 32;
+const INTEGRATION_CHAT_LIMIT: usize = CHAT_LIMIT - 32;
+pub(crate) const INTEGRATION_WAKE_LIMIT: usize = WAKE_LIMIT - 32;
 const CONTROL_WORKERS: usize = 16;
 const DELIVERY_WORKERS: usize = 8;
 const DELIVERY_KEY: &str = "delivery.key";
@@ -206,6 +209,24 @@ pub async fn send(
     request_message(state, channel, recipient, route, b'S', message.as_bytes()).await
 }
 
+pub(crate) async fn send_integration_chat(
+    state: &Path,
+    channel: Id,
+    peer: Id,
+    owner: &str,
+    text: &str,
+) -> io::Result<String> {
+    StateDirectory::open(state)?;
+    if !valid_integration_owner(owner) || text.is_empty() || text.len() > INTEGRATION_CHAT_LIMIT {
+        return Err(invalid("invalid integration chat"));
+    }
+    let mut body = Vec::with_capacity(1 + owner.len() + text.len());
+    body.push(owner.len() as u8);
+    body.extend_from_slice(owner.as_bytes());
+    body.extend_from_slice(text.as_bytes());
+    request_message(state, channel, peer, "-", b'I', &body).await
+}
+
 pub async fn send_wake(
     state: &Path,
     channel: Id,
@@ -216,6 +237,71 @@ pub async fn send_wake(
     message: &str,
 ) -> io::Result<String> {
     StateDirectory::open(state)?;
+    let body = encode_wake(target, lifetime_secs, message)?;
+    request_message(state, channel, recipient, route, b'W', &body).await
+}
+
+pub(crate) fn prepare_integration_run(
+    state: &Path,
+    request: NewIntegrationRun<'_>,
+) -> io::Result<IntegrationRun> {
+    LocalInteraction::new(state).authorize(request.channel, ChannelPermission::Wake)?;
+    run_delivery(state)?
+        .prepare_integration_run(&request, unix_time()?)
+        .map_err(integration_error)
+}
+
+pub(crate) fn integration_run(
+    state: &Path,
+    owner: &str,
+    id: Id,
+) -> io::Result<Option<IntegrationRun>> {
+    run_delivery(state)?
+        .integration_run(owner, id, unix_time()?)
+        .map_err(integration_error)
+}
+
+pub(crate) fn cancel_integration_run(
+    state: &Path,
+    owner: &str,
+    id: Id,
+) -> io::Result<Option<IntegrationRun>> {
+    run_delivery(state)?
+        .cancel_integration_run(owner, id, unix_time()?)
+        .map_err(integration_error)
+}
+
+pub(crate) async fn send_integration_wake(
+    state: &Path,
+    id: Id,
+    request: NewIntegrationRun<'_>,
+) -> io::Result<String> {
+    if request.text.len() > INTEGRATION_WAKE_LIMIT {
+        return Err(invalid("integration wake text is too large"));
+    }
+    let mut body = id.to_vec();
+    body.extend(encode_wake(request.target, request.lifetime, request.text)?);
+    request_message(state, request.channel, request.peer, "-", b'T', &body).await
+}
+
+fn run_delivery(state: &Path) -> io::Result<DeliveryStore> {
+    let identity = LocalIdentity::load_or_create(state)?;
+    open_delivery(
+        state,
+        &StateDirectory::open(state)?,
+        &identity.certificate(),
+    )
+}
+
+fn integration_error(error: crate::delivery::Error) -> io::Error {
+    match error {
+        crate::delivery::Error::Conflict => invalid("idempotency key is already in use"),
+        crate::delivery::Error::InvalidFrame => invalid("invalid integration run"),
+        _ => io::Error::other(error),
+    }
+}
+
+fn encode_wake(target: Id, lifetime_secs: u16, message: &str) -> io::Result<Vec<u8>> {
     if message.is_empty() || message.len() > WAKE_LIMIT || !(1..=300).contains(&lifetime_secs) {
         return Err(invalid("invalid wake text or lifetime"));
     }
@@ -223,7 +309,7 @@ pub async fn send_wake(
     body.extend_from_slice(&target);
     body.extend_from_slice(&lifetime_secs.to_be_bytes());
     body.extend_from_slice(message.as_bytes());
-    request_message(state, channel, recipient, route, b'W', &body).await
+    Ok(body)
 }
 
 pub async fn grant_wake(
@@ -272,7 +358,11 @@ pub async fn stop(state: &Path) -> io::Result<()> {
 
 pub fn read(state: &Path, id: Id) -> io::Result<()> {
     for item in LocalInteraction::new(state).history_messages(id, 100)? {
-        let sender = hex::encode(item.sender.device);
+        let device = hex::encode(item.sender.device);
+        let sender = match item.integration {
+            Some(actor) => format!("integration {} {device}", hex::encode(actor)),
+            None => device,
+        };
         match item.body {
             Body::Chat(text) => println!("{sender} {} {text:?}", item.received_at),
             Body::AgentReply(reply) => println!(
@@ -346,6 +436,9 @@ fn queue(
         .split_at_checked(usize::from(*route_length))
         .ok_or_else(|| invalid("invalid peer route"))?;
     let route = parse_route(route)?;
+    if matches!(*command, b'I' | b'T') && route.is_some() {
+        return Err(invalid("integration operations require a signed route"));
+    }
     if route.is_none() && !has_relay {
         let peer = PeerTrust::open(state)?.pinned(peer)?;
         if cached_address(delivery, &peer)?.is_none() {
@@ -358,24 +451,57 @@ fn queue(
         channel: *channel,
         peer: *peer,
         route,
+        integration: None,
     };
     match command {
-        b'S' => {
+        b'S' | b'I' => {
+            let (integration, body) = if *command == b'I' {
+                let ([length], body) = body
+                    .split_first_chunk()
+                    .ok_or_else(|| invalid("missing integration owner"))?;
+                let (owner, body) = body
+                    .split_at_checked(usize::from(*length))
+                    .ok_or_else(|| invalid("invalid integration owner length"))?;
+                let owner = std::str::from_utf8(owner).map_err(io::Error::other)?;
+                if !valid_integration_owner(owner) {
+                    return Err(invalid("invalid integration owner"));
+                }
+                let actor = integration_actor(identity.certificate().device_id(), owner);
+                (Some(IntegrationSource::Chat(actor)), body)
+            } else {
+                (None, body)
+            };
             let text = std::str::from_utf8(body).map_err(io::Error::other)?;
-            if text.is_empty() || text.len() > CHAT_LIMIT {
+            let text_limit = if integration.is_some() {
+                INTEGRATION_CHAT_LIMIT
+            } else {
+                CHAT_LIMIT
+            };
+            if text.is_empty() || text.len() > text_limit {
                 return Err(invalid("invalid chat length"));
             }
             queue_frame(
                 state,
                 identity,
                 delivery,
-                address,
+                Destination {
+                    integration,
+                    ..address
+                },
                 Body::Chat(text),
                 0,
                 None,
             )
         }
-        b'W' => {
+        b'W' | b'T' => {
+            let (integration, body) = if *command == b'T' {
+                let (id, body) = body
+                    .split_first_chunk::<32>()
+                    .ok_or_else(|| invalid("invalid integration run"))?;
+                (Some(*id), body)
+            } else {
+                (None, body)
+            };
             let (target, rest) = body
                 .split_first_chunk()
                 .ok_or_else(|| invalid("invalid wake target"))?;
@@ -384,9 +510,23 @@ fn queue(
                 .ok_or_else(|| invalid("invalid wake lifetime"))?;
             let lifetime = u16::from_be_bytes(*lifetime);
             let text = std::str::from_utf8(bytes).map_err(io::Error::other)?;
-            if text.is_empty() || text.len() > WAKE_LIMIT || !(1..=300).contains(&lifetime) {
+            let text_limit = if integration.is_some() {
+                INTEGRATION_WAKE_LIMIT
+            } else {
+                WAKE_LIMIT
+            };
+            if text.is_empty() || text.len() > text_limit || !(1..=300).contains(&lifetime) {
                 return Err(invalid("invalid wake text or lifetime"));
             }
+            let address = Destination {
+                integration: integration.map(|id| {
+                    IntegrationSource::Wake(IntegrationDispatch {
+                        id,
+                        fingerprint: run_fingerprint(*channel, *peer, *target, lifetime, text),
+                    })
+                }),
+                ..address
+            };
             queue_frame(
                 state,
                 identity,
@@ -443,6 +583,20 @@ struct Destination {
     channel: Id,
     peer: Id,
     route: Option<SocketAddr>,
+    integration: Option<IntegrationSource>,
+}
+
+enum IntegrationSource {
+    Chat(Id),
+    Wake(IntegrationDispatch),
+}
+
+fn integration_actor(gateway: &Id, owner: &str) -> Id {
+    let mut hash = Sha256::new();
+    hash.update(b"howl/integration-actor/v1\0");
+    hash.update(gateway);
+    hash.update(owner.as_bytes());
+    hash.finalize().into()
 }
 
 pub fn queue_agent_reply(
@@ -462,6 +616,7 @@ pub fn queue_agent_reply(
             channel,
             peer: recipient,
             route: parse_route(route.as_bytes())?,
+            integration: None,
         },
         Body::AgentReply(approved.reply),
         0,
@@ -482,6 +637,7 @@ fn queue_frame(
         channel,
         peer,
         route,
+        integration,
     } = destination;
     let roster = Channel::load(state, identity, &channel)?;
     let local = identity.certificate();
@@ -495,6 +651,25 @@ fn queue_frame(
         ));
     }
     let target = channel_peer(&roster, &local, &peer, ChannelPermission::Receive)?;
+    let integration = match integration {
+        None => None,
+        Some(IntegrationSource::Chat(actor)) => Some(IntegrationDelivery {
+            actor,
+            dispatch: None,
+        }),
+        Some(IntegrationSource::Wake(dispatch)) => {
+            let (owner, message) = delivery
+                .integration_dispatch(dispatch, unix_time()?)
+                .map_err(integration_error)?;
+            if let Some(message) = message {
+                return Ok(format!("queued {}", hex::encode(message)));
+            }
+            Some(IntegrationDelivery {
+                actor: integration_actor(local.device_id(), &owner),
+                dispatch: Some(dispatch),
+            })
+        }
+    };
     let stream = local_stream(state, channel, &local)?;
     delivery
         .set_epoch(channel, roster.epoch())
@@ -521,40 +696,41 @@ fn queue_frame(
         }
         _ => None,
     };
-    let sealed = howl_envelope::seal(
-        Routing {
-            channel,
-            sender: address(stream.sender),
-            epoch: roster.epoch(),
-            sequence,
-            created_at: now,
-            expires_at,
-        },
-        body.clone(),
-        &signer,
-        &[recipient(device_for(state, target)?, target)],
-    )
+    let routing = Routing {
+        channel,
+        sender: address(stream.sender),
+        epoch: roster.epoch(),
+        sequence,
+        created_at: now,
+        expires_at,
+    };
+    let recipients = [recipient(device_for(state, target)?, target)];
+    let sealed = match integration {
+        Some(attribution) => howl_envelope::seal_integration(
+            routing,
+            body.clone(),
+            &signer,
+            &recipients,
+            attribution.actor,
+        ),
+        None => howl_envelope::seal(routing, body.clone(), &signer, &recipients),
+    }
     .map_err(io::Error::other)?;
     let metadata = howl_envelope::inspect_unverified(&sealed).map_err(io::Error::other)?;
-    let route = route.map_or("-".to_owned(), |address| address.to_string());
     let outbound = frame(metadata);
+    let target = device_for(state, target)?;
+    if let Some(attribution) = integration {
+        let message = delivery
+            .enqueue_integration(outbound, &sealed, target, body, now, attribution)
+            .map_err(integration_error)?;
+        return Ok(format!("queued {}", hex::encode(message)));
+    }
+    let route = route.map_or("-".to_owned(), |address| address.to_string());
     match approved {
-        Some(approved) => delivery.enqueue_agent_reply(
-            outbound,
-            &sealed,
-            device_for(state, target)?,
-            &route,
-            unix_time,
-            approved,
-        ),
-        None => delivery.enqueue_routed_message(
-            outbound,
-            &sealed,
-            device_for(state, target)?,
-            &route,
-            now,
-            Some(body),
-        ),
+        Some(approved) => {
+            delivery.enqueue_agent_reply(outbound, &sealed, target, &route, unix_time, approved)
+        }
+        None => delivery.enqueue_routed_message(outbound, &sealed, target, &route, now, Some(body)),
     }
     .map_err(io::Error::other)?;
     Ok(format!("queued {}", hex::encode(metadata.message_id)))
@@ -623,7 +799,7 @@ fn check_outbound(
 ) -> io::Result<()> {
     let metadata = howl_envelope::inspect_unverified(&attempt.frame).map_err(io::Error::other)?;
     let roster = Channel::load(state, identity, &metadata.routing.channel)?;
-    let permission = if metadata.intent == Intent::Wake {
+    let permission = if metadata.intent.is_wake() {
         ChannelPermission::Wake
     } else {
         ChannelPermission::Send
@@ -675,7 +851,7 @@ fn accept(
     }
 
     let unverified = howl_envelope::inspect_unverified(bytes).map_err(io::Error::other)?;
-    if !accepts_wakes && unverified.intent == Intent::Wake {
+    if !accepts_wakes && unverified.intent.is_wake() {
         return Err(forbidden("client-only device cannot receive wakes"));
     }
     let receipt = accept_envelope(
@@ -716,7 +892,7 @@ pub(crate) fn accept_envelope(
     };
     let mailbox = matches!(source, EnvelopeSource::Mailbox);
     let roster = Channel::load(state, identity, &unverified.routing.channel)?;
-    let wake = unverified.intent == Intent::Wake;
+    let wake = unverified.intent.is_wake();
     let permission = if wake {
         ChannelPermission::Wake
     } else {
@@ -791,14 +967,23 @@ pub(crate) fn accept_envelope(
             text: &reply.text,
         }),
     };
-    if mailbox {
-        delivery.accept_mailbox_history(metadata, bytes, payload, now, identity.signing_key())
+    let time = if mailbox {
+        AdmissionTime::MailboxHistory(now)
     } else if wake {
-        delivery.accept_network_wake(metadata, bytes, payload, unix_time, identity.signing_key())
+        AdmissionTime::NetworkWake(&unix_time)
     } else {
-        delivery.accept_authenticated(metadata, bytes, payload, now, identity.signing_key())
-    }
-    .map_err(io::Error::other)
+        AdmissionTime::Known(now)
+    };
+    delivery
+        .accept_payload(
+            metadata,
+            bytes,
+            payload,
+            time,
+            opened.integration,
+            identity.signing_key(),
+        )
+        .map_err(io::Error::other)
 }
 
 pub(crate) fn history_delivery(
@@ -934,4 +1119,115 @@ fn forbidden(message: &'static str) -> io::Error {
 
 fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+#[cfg(test)]
+mod integration_tests {
+    use howl_envelope::{AgentRole, Intent};
+
+    use super::*;
+
+    #[test]
+    fn integration_chat_and_run_sign_the_same_owner_across_the_wire() {
+        let temp = tempfile::tempdir().unwrap();
+        let gateway = temp.path().join("gateway");
+        let receiver = temp.path().join("receiver");
+        let sender = LocalIdentity::load_or_create(&gateway).unwrap();
+        let recipient = LocalIdentity::load_or_create(&receiver).unwrap();
+        let sender_cert = sender.certificate();
+        let recipient_cert = recipient.certificate();
+        let peer = *recipient_cert.device_id();
+        PeerTrust::open(&gateway)
+            .unwrap()
+            .pin(&recipient_cert, &recipient_cert.fingerprint())
+            .unwrap();
+        PeerTrust::open(&receiver)
+            .unwrap()
+            .pin(&sender_cert, &sender_cert.fingerprint())
+            .unwrap();
+        let channel = Channel::create(&gateway, &sender, &[peer]).unwrap();
+        Channel::join(&receiver, &recipient, channel.manifest()).unwrap();
+        let channel = *channel.id();
+        let mut outbox = run_delivery(&gateway).unwrap();
+        let mut inbox = run_delivery(&receiver).unwrap();
+        let owner = "review-source";
+
+        let command = |operation, body: &[u8]| {
+            let mut command = vec![operation];
+            command.extend_from_slice(&channel);
+            command.extend_from_slice(&peer);
+            command.extend_from_slice(b"\x01-");
+            command.extend_from_slice(body);
+            command
+        };
+        let mut chat = vec![owner.len() as u8];
+        chat.extend_from_slice(owner.as_bytes());
+        chat.extend_from_slice(b"private note from the connector");
+        queue(&gateway, &sender, &mut outbox, true, &command(b'I', &chat)).unwrap();
+
+        let request = NewIntegrationRun {
+            owner,
+            key: "review-once",
+            channel,
+            peer,
+            target: AgentRole::Reviewer.agent_id(&peer),
+            lifetime: 60,
+            text: "review the selected documents",
+        };
+        let run = outbox
+            .prepare_integration_run(&request, unix_time().unwrap())
+            .unwrap();
+        let mut wake = run.id.to_vec();
+        wake.extend(encode_wake(request.target, request.lifetime, request.text).unwrap());
+        let wake = command(b'T', &wake);
+        let first = queue(&gateway, &sender, &mut outbox, true, &wake).unwrap();
+        assert_eq!(
+            queue(&gateway, &sender, &mut outbox, true, &wake).unwrap(),
+            first
+        );
+        let actor = Some(integration_actor(sender_cert.device_id(), owner));
+        let events = outbox.channel_events(channel, 0, 10).unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(
+            events
+                .iter()
+                .all(|event| event.message.integration == actor)
+        );
+
+        let frames = outbox
+            .claim_due(Some(channel), unix_time().unwrap(), 10)
+            .unwrap();
+        assert_eq!(frames.len(), 2);
+        assert!(frames.iter().any(|frame| {
+            howl_envelope::inspect_unverified(&frame.frame)
+                .unwrap()
+                .intent
+                == Intent::IntegrationWake
+        }));
+        let chat = frames
+            .iter()
+            .find(|frame| {
+                howl_envelope::inspect_unverified(&frame.frame)
+                    .unwrap()
+                    .intent
+                    == Intent::IntegrationChat
+            })
+            .unwrap();
+        accept_envelope(
+            &receiver,
+            &recipient,
+            &mut inbox,
+            &chat.frame,
+            howl_envelope::inspect_unverified(&chat.frame).unwrap(),
+            EnvelopeSource::Peer(&sender_cert),
+        )
+        .unwrap();
+        let events = inbox.channel_events(channel, 0, 10).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].message.integration, actor);
+        assert_ne!(
+            actor,
+            Some(integration_actor(sender_cert.device_id(), "other-reviewer"))
+        );
+    }
 }

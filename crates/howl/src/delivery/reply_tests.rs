@@ -315,10 +315,11 @@ fn only_the_linked_running_wake_can_publish_and_finish_in_one_transaction() {
         1
     );
     let events = store.channel_events(CHANNEL, 0, 10).unwrap();
-    assert_eq!(events.len(), 1);
-    assert_eq!(events[0].recipient, Some(PEER));
-    assert_eq!(events[0].message.message, outgoing.message);
-    assert!(matches!(&events[0].message.body, Body::AgentReply(reply) if reply.text == "draft"));
+    assert_eq!(events.len(), 2);
+    assert!(matches!(&events[0].message.body, Body::Wake { .. }));
+    assert_eq!(events[1].recipient, Some(PEER));
+    assert_eq!(events[1].message.message, outgoing.message);
+    assert!(matches!(&events[1].message.body, Body::AgentReply(reply) if reply.text == "draft"));
 
     let next = Frame {
         sequence: 2,
