@@ -1,4 +1,4 @@
-use std::{io, path::Path};
+use std::{fs, io, path::Path};
 
 use howl_envelope::{AgentRole, Body, Id};
 use rmcp::schemars::{self, JsonSchema};
@@ -14,6 +14,18 @@ use crate::{
 
 pub struct LocalInteraction<'a> {
     state: &'a Path,
+}
+
+pub struct ChannelSummary {
+    pub id: Id,
+    pub peers: Vec<Id>,
+}
+
+pub struct LocalDevice {
+    pub id: Id,
+    pub certificate: String,
+    pub fingerprint: String,
+    pub enrolled: bool,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -136,6 +148,70 @@ impl<'a> LocalInteraction<'a> {
             .ok_or_else(|| denied("the local device must be enrolled"))?;
         profile.member(*local.device_id(), 0)?;
         Ok(())
+    }
+
+    pub fn device(&self) -> io::Result<LocalDevice> {
+        let identity = self.identity()?;
+        let local = identity.certificate();
+        let enrolled = match Profile::load(self.state, &local)? {
+            Some(profile) => match profile.member(*local.device_id(), 0) {
+                Ok(_) => true,
+                Err(error) if error.kind() == io::ErrorKind::PermissionDenied => false,
+                Err(error) => return Err(error),
+            },
+            None => false,
+        };
+        Ok(LocalDevice {
+            id: *local.device_id(),
+            certificate: hex::encode(local.as_bytes()),
+            fingerprint: hex::encode(local.fingerprint()),
+            enrolled,
+        })
+    }
+
+    pub fn channels(&self) -> io::Result<Vec<ChannelSummary>> {
+        self.require_enrolled()?;
+        let local = *self.identity()?.certificate().device_id();
+        let mut channels = Vec::new();
+        for entry in fs::read_dir(self.state)? {
+            let name = entry?.file_name();
+            let mut id = [0; 32];
+            let Some(encoded) = name
+                .to_str()
+                .and_then(|name| name.strip_prefix("roster-"))
+                .and_then(|name| name.strip_suffix("-0000"))
+            else {
+                continue;
+            };
+            if hex::decode_to_slice(encoded, &mut id).is_err() {
+                continue;
+            }
+            let roster = match self.authorize(id, ChannelPermission::Receive) {
+                Ok(roster) => roster,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::PermissionDenied
+                            | io::ErrorKind::InvalidData
+                            | io::ErrorKind::NotFound
+                    ) =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            channels.push(ChannelSummary {
+                id,
+                peers: roster
+                    .members()
+                    .iter()
+                    .map(|member| *member.device_id())
+                    .filter(|peer| *peer != local)
+                    .collect(),
+            });
+        }
+        channels.sort_unstable_by_key(|channel| channel.id);
+        Ok(channels)
     }
 
     pub fn authorize(&self, channel: Id, permission: ChannelPermission) -> io::Result<Channel> {
@@ -270,6 +346,10 @@ impl<'a> LocalInteraction<'a> {
         text: &str,
     ) -> io::Result<Receipt> {
         receipt(node::send(self.state, channel, peer, route, text).await?)
+    }
+
+    pub async fn post(&self, channel: Id, text: &str) -> io::Result<Receipt> {
+        receipt(node::send_channel(self.state, channel, text).await?)
     }
 
     pub async fn wake(&self, wake: Wake<'_>) -> io::Result<Receipt> {

@@ -411,6 +411,25 @@ impl DeliveryStore {
         )
     }
 
+    pub(crate) fn enqueue_channel_message(
+        &mut self,
+        frame: Frame,
+        bytes: &[u8],
+        recipients: &[Device],
+        body: Body<&str>,
+        now: u64,
+    ) -> Result<()> {
+        self.enqueue_frames(
+            frame,
+            bytes,
+            recipients,
+            EnqueueTime::Ordinary(now),
+            None,
+            Some(body),
+        )?;
+        Ok(())
+    }
+
     pub(crate) fn enqueue_agent_reply(
         &mut self,
         frame: Frame,
