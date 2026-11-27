@@ -216,7 +216,7 @@ impl PeerTrust {
     }
 }
 
-fn verify(key: &[u8; 32], signed: &[u8], signature: &[u8; 64]) -> io::Result<()> {
+pub(crate) fn verify(key: &[u8; 32], signed: &[u8], signature: &[u8; 64]) -> io::Result<()> {
     if !CompressedEdwardsY(*key)
         .decompress()
         .is_some_and(|point| point.is_torsion_free())
