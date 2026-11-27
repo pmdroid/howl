@@ -10,25 +10,27 @@ use rmcp::{
     ErrorData, RoleServer, ServerHandler,
     handler::server::{router::tool::ToolRouter, tool::ToolCallContext, wrapper::Parameters},
     model::{
-        CallToolRequestParams, CallToolResponse, CallToolResult, CancelTaskParams, GetTaskParams,
-        GetTaskResult, Implementation, InitializeRequestParams, InitializeResult, ListToolsResult,
-        PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerConfig,
+        CallToolRequestParams, CallToolResponse, CallToolResult, CancelTaskParams,
+        GetPromptRequestParams, GetPromptResponse, GetTaskParams, GetTaskResult, Implementation,
+        InitializeRequestParams, InitializeResult, ListPromptsResult, ListResourceTemplatesResult,
+        ListResourcesResult, ListToolsResult, PaginatedRequestParams, ProtocolVersion,
+        ReadResourceRequestParams, ReadResourceResponse, ServerCapabilities, ServerConfig,
         TASKS_EXTENSION_ID, UpdateTaskParams,
     },
     schemars::{self, JsonSchema},
     service::RequestContext,
     tool, tool_handler, tool_router,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
 use crate::{
     delivery::{IntegrationRun, IntegrationRunState, NewIntegrationRun},
     enrollment::ChannelPermission,
-    interaction::LocalInteraction,
+    interaction::{AgentAddress, EventPage, LocalInteraction, Receipt},
     node,
-    remote_mcp::{self, IntegrationPermission, authenticated, tasks},
+    remote_mcp::{self, IntegrationPermission, authenticated, resources, tasks},
 };
 
 #[derive(Clone)]
@@ -85,16 +87,22 @@ struct RunArgs {
     run: String,
 }
 
+#[derive(Serialize, JsonSchema)]
+struct Channels {
+    channels: Vec<String>,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct Agents {
+    agents: Vec<AgentAddress>,
+}
+
 #[tool_router(router = routes)]
 impl GatewayTools {
     #[tool(
         description = "List signed channels this integration may read",
-        annotations(
-            read_only_hint = true,
-            idempotent_hint = true,
-            destructive_hint = false,
-            open_world_hint = false
-        )
+        output_schema = rmcp::handler::server::tool::schema_for_type::<Channels>(),
+        annotations(read_only_hint = true, idempotent_hint = true, destructive_hint = false, open_world_hint = false)
     )]
     async fn list_channels(
         &self,
@@ -112,19 +120,15 @@ impl GatewayTools {
                     channels.push(hex::encode(channel));
                 }
             }
-            Ok(json!({ "channels": channels }))
+            Ok(Channels { channels })
         })
         .await
     }
 
     #[tool(
         description = "List signed channel members' agent addresses and known availability",
-        annotations(
-            read_only_hint = true,
-            idempotent_hint = true,
-            destructive_hint = false,
-            open_world_hint = false
-        )
+        output_schema = rmcp::handler::server::tool::schema_for_type::<Agents>(),
+        annotations(read_only_hint = true, idempotent_hint = true, destructive_hint = false, open_world_hint = false)
     )]
     async fn list_agents(
         &self,
@@ -132,18 +136,18 @@ impl GatewayTools {
         Parameters(args): Parameters<ChannelArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let channel = permitted(&context, &args.channel, IntegrationPermission::Read)?;
-        self.read_local(move |local| Ok(json!({ "agents": local.agents(channel)? })))
-            .await
+        self.read_local(move |local| {
+            Ok(Agents {
+                agents: local.agents(channel)?,
+            })
+        })
+        .await
     }
 
     #[tool(
         description = "Read durable channel events after a cursor, optionally for one direct peer",
-        annotations(
-            read_only_hint = true,
-            idempotent_hint = true,
-            destructive_hint = false,
-            open_world_hint = false
-        )
+        output_schema = rmcp::handler::server::tool::schema_for_type::<EventPage>(),
+        annotations(read_only_hint = true, idempotent_hint = true, destructive_hint = false, open_world_hint = false)
     )]
     async fn read(
         &self,
@@ -154,21 +158,14 @@ impl GatewayTools {
         let peer = args.peer.as_deref().map(parse_id).transpose()?;
         let limit = args.limit.unwrap_or(20).clamp(1, 32);
         let after = args.after.unwrap_or_default();
-        self.read_local(move |local| {
-            serde_json::to_value(local.event_page(channel, peer, after, limit)?)
-                .map_err(io::Error::other)
-        })
-        .await
+        self.read_local(move |local| local.event_page(channel, peer, after, limit))
+            .await
     }
 
     #[tool(
         description = "Post one signed message to all current recipients of a granted channel",
-        annotations(
-            read_only_hint = false,
-            idempotent_hint = false,
-            destructive_hint = false,
-            open_world_hint = true
-        )
+        output_schema = rmcp::handler::server::tool::schema_for_type::<Receipt>(),
+        annotations(read_only_hint = false, idempotent_hint = false, destructive_hint = false, open_world_hint = true)
     )]
     async fn post(
         &self,
@@ -181,12 +178,8 @@ impl GatewayTools {
 
     #[tool(
         description = "Queue a private message to the named peer in a granted channel",
-        annotations(
-            read_only_hint = false,
-            idempotent_hint = false,
-            destructive_hint = false,
-            open_world_hint = true
-        )
+        output_schema = rmcp::handler::server::tool::schema_for_type::<Receipt>(),
+        annotations(read_only_hint = false, idempotent_hint = false, destructive_hint = false, open_world_hint = true)
     )]
     async fn dm(
         &self,
@@ -341,16 +334,18 @@ impl GatewayTools {
         .await
     }
 
-    async fn read_local(
+    async fn read_local<T: Serialize + Send + 'static>(
         &self,
-        read: impl FnOnce(LocalInteraction<'_>) -> io::Result<Value> + Send + 'static,
+        read: impl FnOnce(LocalInteraction<'_>) -> io::Result<T> + Send + 'static,
     ) -> Result<CallToolResult, ErrorData> {
         let state = Arc::clone(&self.state);
-        tokio::task::spawn_blocking(move || read(LocalInteraction::new(&state)))
-            .await
-            .map_err(|_| ErrorData::internal_error("Howl operation interrupted", None))?
-            .map(CallToolResult::structured)
-            .map_err(from_io)
+        tokio::task::spawn_blocking(move || {
+            serde_json::to_value(read(LocalInteraction::new(&state))?).map_err(io::Error::other)
+        })
+        .await
+        .map_err(|_| ErrorData::internal_error("Howl operation interrupted", None))?
+        .map(CallToolResult::structured)
+        .map_err(from_io)
     }
 
     async fn task_operation(
@@ -396,6 +391,8 @@ impl ServerHandler for GatewayTools {
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_tasks()
+                .enable_resources()
+                .enable_prompts()
                 .build(),
         )
         .with_server_info(Implementation::new("howl", env!("CARGO_PKG_VERSION")))
@@ -419,6 +416,49 @@ impl ServerHandler for GatewayTools {
 
     fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
         Cow::Borrowed(&[ProtocolVersion::V_2025_11_25, ProtocolVersion::V_2026_07_28])
+    }
+
+    async fn list_resources(
+        &self,
+        request: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, ErrorData> {
+        resources::list_resources(&self.state, &context, request).await
+    }
+
+    async fn list_resource_templates(
+        &self,
+        request: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ListResourceTemplatesResult, ErrorData> {
+        authenticated(&context)?;
+        resources::list_resource_templates(request)
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResponse, ErrorData> {
+        resources::read_resource(&self.state, &context, request).await
+    }
+
+    async fn list_prompts(
+        &self,
+        request: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ListPromptsResult, ErrorData> {
+        authenticated(&context)?;
+        resources::list_prompts(request)
+    }
+
+    async fn get_prompt(
+        &self,
+        request: GetPromptRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<GetPromptResponse, ErrorData> {
+        authenticated(&context)?;
+        resources::get_prompt(request)
     }
 
     async fn get_task(
