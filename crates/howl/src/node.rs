@@ -619,7 +619,7 @@ fn accept(
                 target: *session,
                 text,
             },
-            now,
+            unix_time,
             identity.signing_key(),
         ),
         Body::AgentReply(reply) => delivery.accept_authenticated(
