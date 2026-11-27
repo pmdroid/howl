@@ -38,7 +38,7 @@ const DELIVERY_KEY: &str = "delivery.key";
 const DELIVERY_DB: &str = "delivery.db";
 
 pub async fn run(state: &Path, listen: &str, relay: Option<&str>) -> io::Result<()> {
-    let identity = LocalIdentity::load_or_create(state)?;
+    let identity = Arc::new(LocalIdentity::load_or_create(state)?);
     let local = identity.certificate();
     let directory = StateDirectory::open(state)?;
     let control = ControlServer::bind(state)?;
@@ -112,8 +112,15 @@ pub async fn run(state: &Path, listen: &str, relay: Option<&str>) -> io::Result<
                     match target_address(state, &identity, &delivery, relay.as_ref(), &attempt) {
                         Ok(destination) => {
                             let transport = Arc::clone(&transport);
+                            let identity = Arc::clone(&identity);
+                            let state = state.to_owned();
                             deliveries.spawn(async move {
-                                transport.send(&attempt.recipient.device, destination, &attempt.frame).await
+                                transport.send_authorized(
+                                    &attempt.recipient.device,
+                                    destination,
+                                    &attempt.frame,
+                                    || check_outbound(&state, &identity, &attempt),
+                                ).await
                             });
                         }
                         Err(error) => eprintln!("Delivery queued for retry. {error}"),
@@ -556,21 +563,7 @@ fn target_address(
     relay: Option<&RelayUrl>,
     attempt: &crate::delivery::Attempt,
 ) -> io::Result<EndpointAddr> {
-    let metadata = howl_envelope::inspect_unverified(&attempt.frame).map_err(io::Error::other)?;
-    let roster = Channel::load(state, identity, &metadata.routing.channel)?;
-    let permission = if metadata.intent == Intent::Wake {
-        ChannelPermission::Wake
-    } else {
-        ChannelPermission::Send
-    };
-    if roster.epoch() != metadata.routing.epoch
-        || !roster.allows(identity.certificate().device_id(), permission)
-        || !roster.allows(&attempt.recipient.device, ChannelPermission::Receive)
-    {
-        return Err(forbidden(
-            "outbox frame no longer has current signed channel authority",
-        ));
-    }
+    check_outbound(state, identity, attempt)?;
     let peer = PeerTrust::open(state)?.pinned(&attempt.recipient.device)?;
     if device_for(state, &peer)? != attempt.recipient {
         return Err(invalid(
@@ -598,6 +591,29 @@ fn target_address(
         destination = destination.with_relay_url(url.clone());
     }
     Ok(destination)
+}
+
+fn check_outbound(
+    state: &Path,
+    identity: &LocalIdentity,
+    attempt: &crate::delivery::Attempt,
+) -> io::Result<()> {
+    let metadata = howl_envelope::inspect_unverified(&attempt.frame).map_err(io::Error::other)?;
+    let roster = Channel::load(state, identity, &metadata.routing.channel)?;
+    let permission = if metadata.intent == Intent::Wake {
+        ChannelPermission::Wake
+    } else {
+        ChannelPermission::Send
+    };
+    if roster.epoch() != metadata.routing.epoch
+        || !roster.allows(identity.certificate().device_id(), permission)
+        || !roster.allows(&attempt.recipient.device, ChannelPermission::Receive)
+    {
+        return Err(forbidden(
+            "outbox frame no longer has current signed channel authority",
+        ));
+    }
+    Ok(())
 }
 
 fn cached_address(
