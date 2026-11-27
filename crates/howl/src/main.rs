@@ -92,6 +92,7 @@ async fn main() -> ExitCode {
         [group, action, state] if group == "mesh" && action == "stop" => {
             node::stop(Path::new(state)).await
         }
+        [group, command @ ..] if group == "enrollment" => howl::enrollment::cli::run(command),
         [group, command @ ..] if group == "workflow" => workflow_command(command).await,
         [command, state, channel, peer, route] if command == "send" => {
             let (Ok(channel), Ok(peer), Some(route)) =
