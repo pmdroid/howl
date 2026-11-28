@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Device details · Howl</title>
+  <link rel="stylesheet" href="/assets/devices.css">
+  <script type="module" src="/assets/device-details.js"></script>
+</head>
+<body>
+  <header>
+    <a href="/" class="wordmark" aria-label="Howl home">Howl</a>
+    <button id="logout" hidden>Sign out</button>
+  </header>
+  <main>
+    <nav class="back"><a href="/devices">Back to devices</a></nav>
+    <div class="device-heading">
+      <h1 dir="auto">Device details</h1>
+      <button id="rename" hidden>Rename</button>
+    </div>
+    <form id="editor" hidden>
+      <label for="name">Device name</label>
+      <input id="name" type="text" required autocomplete="off" dir="auto" aria-describedby="name-error">
+      <p id="name-error" role="alert"></p>
+      <div class="actions">
+        <button type="submit" class="primary">Save name</button>
+        <button type="button" id="cancel">Cancel</button>
+      </div>
+    </form>
+    <p id="status" role="status">Loading device…</p>
+    <p id="error" role="alert"></p>
+    <button id="retry" hidden>Try again</button>
+    <noscript><p>Enable JavaScript to view device details.</p></noscript>
+    <section id="login" hidden>
+      <p>Sign in to the GitHub account that owns this device.</p>
+      <a class="primary button" href="/login/github">Sign in with GitHub</a>
+    </section>
+    <div id="details" hidden>
+      <dl class="detail-list">
+        <div><dt>Membership</dt><dd id="state"></dd></div>
+        <div><dt>Mesh status</dt><dd id="mesh-status"></dd></div>
+        <div id="last-seen" hidden><dt>Last seen</dt><dd><time></time></dd></div>
+        <div><dt>Fingerprint</dt><dd class="fingerprint"><code></code></dd></div>
+        <div><dt>Device ID</dt><dd class="device-id"><code></code></dd></div>
+        <div id="requested" hidden><dt>Requested</dt><dd><time></time></dd></div>
+        <div id="admitted" hidden><dt>Approved</dt><dd><time></time></dd></div>
+      </dl>
+      <section class="detail-section">
+        <h2>Howl network</h2>
+        <dl class="detail-list">
+          <div id="network-name-row" hidden><dt>Network name</dt><dd id="network-name" dir="auto"></dd></div>
+          <div><dt>Network ID</dt><dd><code id="network-id"></code></dd></div>
+        </dl>
+      </section>
+      <section class="detail-section">
+        <h2>Iroh connection</h2>
+        <dl class="detail-list">
+          <div><dt>Endpoint ID</dt><dd><code id="endpoint-id"></code></dd></div>
+          <div><dt>Peer connections</dt><dd><p id="peer-status"></p><ul id="peer-connections"></ul></dd></div>
+          <div id="route-status-row"><dt>Discovery address</dt><dd id="route-status"></dd></div>
+          <div id="route-ip-row" hidden><dt>Advertised IP</dt><dd><code id="route-ip"></code></dd></div>
+          <div id="route-port-row" hidden><dt>UDP port</dt><dd><code id="route-port"></code></dd></div>
+          <div id="last-route" hidden><dt>Last address update</dt><dd><time></time></dd></div>
+          <div id="route-expires" hidden><dt>Address expires</dt><dd><time></time></dd></div>
+        </dl>
+      </section>
+    </div>
+  </main>
+</body>
+</html>

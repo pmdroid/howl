@@ -1,5 +1,5 @@
 name = "howl-control-plane-d1-prototype"
-main = "worker.mjs"
+main = ".build/worker.mjs"
 compatibility_date = "2026-07-30"
 workers_dev = false
 preview_urls = false
