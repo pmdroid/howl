@@ -161,7 +161,16 @@ async fn main() -> ExitCode {
             node::stop(Path::new(state)).await
         }
         [group, command, state] if group == "control" && command == "login" => {
-            control_client::login(Path::new(state)).await
+            howl::network_client::login(Path::new(state)).await
+        }
+        [group, command, state] if group == "control" && command == "devices" => {
+            howl::network_client::devices(Path::new(state)).await
+        }
+        [group, command, state, peer] if group == "control" && command == "approve" => {
+            match parse_id(peer) {
+                Ok(peer) => howl::network_client::approve(Path::new(state), peer).await,
+                Err(error) => Err(error),
+            }
         }
         [group, command, state, authority, designation, certificate]
             if group == "control" && command == "enroll" =>

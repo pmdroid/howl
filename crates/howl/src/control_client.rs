@@ -100,11 +100,12 @@ struct Proof {
 }
 
 pub async fn login(state: &Path) -> io::Result<()> {
-    let service = Service::configured()?;
     let identity = LocalIdentity::load_or_create(state)?;
     let state = StateDirectory::open(state)?;
     let _lock = state.lock(LOCK)?;
-    if let Some(existing) = load(&state)?
+    let existing = load(&state)?;
+    let service = Service::for_login(existing.as_ref()).await?;
+    if let Some(existing) = &existing
         && (existing.origin != service.origin.as_str()
             || parse_id(&existing.audience)? != service.audience)
     {
@@ -168,6 +169,13 @@ pub async fn login(state: &Path) -> io::Result<()> {
             Poll::Pending { .. } => return Err(refused()),
             Poll::Verified { credentials } => {
                 validate(&credentials, &identity)?;
+                if existing.as_ref().is_some_and(|prior| {
+                    prior.credentials.session.github_id != credentials.session.github_id
+                }) {
+                    return Err(io::Error::other(
+                        "This device profile is linked to a different GitHub account.",
+                    ));
+                }
                 save(&state, &service, credentials)?;
                 println!("GitHub login complete.");
                 return Ok(());
@@ -321,8 +329,47 @@ impl Service {
         )
     }
 
+    async fn for_login(existing: Option<&Stored>) -> io::Result<Self> {
+        let origin = configured("HOWL_CONTROL_URL")?;
+        match env::var("HOWL_CONTROL_AUDIENCE") {
+            Ok(audience) => return Self::new(&origin, parse_id(&audience)?),
+            Err(env::VarError::NotUnicode(_)) => return Err(configuration()),
+            Err(env::VarError::NotPresent) => {}
+        }
+        if let Some(existing) = existing {
+            return Self::new(&origin, parse_id(&existing.audience)?);
+        }
+        let (origin, http) = Self::connection(&origin)?;
+        let url = origin
+            .join("/v1/auth/config")
+            .map_err(|_| configuration())?;
+        let response = http.get(url).send().await.map_err(|_| refused())?;
+        #[derive(Deserialize)]
+        struct PublicConfig {
+            audience: String,
+        }
+        let config: PublicConfig = serde_json::from_slice(&read_response(response, 256).await?)?;
+        Self::from_parts(origin, http, parse_id(&config.audience)?)
+    }
+
     fn new(origin: &str, audience: Id) -> io::Result<Self> {
-        if origin.len() > 512 || audience == [0; 32] {
+        let (origin, http) = Self::connection(origin)?;
+        Self::from_parts(origin, http, audience)
+    }
+
+    fn from_parts(origin: Url, http: Client, audience: Id) -> io::Result<Self> {
+        if audience == [0; 32] {
+            return Err(configuration());
+        }
+        Ok(Self {
+            http,
+            origin,
+            audience,
+        })
+    }
+
+    fn connection(origin: &str) -> io::Result<(Url, Client)> {
+        if origin.len() > 512 {
             return Err(configuration());
         }
         let origin = Url::parse(origin).map_err(|_| configuration())?;
@@ -346,11 +393,7 @@ impl Service {
             .timeout(Duration::from_secs(8))
             .build()
             .map_err(|_| configuration())?;
-        Ok(Self {
-            http,
-            origin,
-            audience,
-        })
+        Ok((origin, http))
     }
 
     fn endpoint(&self, path: &str) -> io::Result<Url> {
