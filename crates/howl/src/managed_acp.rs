@@ -645,6 +645,10 @@ impl ManagedSession {
             .await
     }
 
+    pub async fn prompt_text(&self, text: String, limit: Duration) -> io::Result<String> {
+        crate::ongoing::prompt(self, text, limit).await
+    }
+
     pub async fn export_changes(&mut self) -> Result<serde_json::Value> {
         if self.status().phase != Phase::Ready {
             return Err(Error::State);

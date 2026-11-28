@@ -1,6 +1,8 @@
 import { readFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 
+import { burst } from "./reply-burst.mjs";
+
 const lines = createInterface({ input: process.stdin });
 const sessionId = "synthetic-v2-session";
 const send = (message) => process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", ...message })}\n`);
@@ -70,6 +72,12 @@ lines.on("line", (line) => {
     }
     if (text === "wait") {
       reply(id, { messageId });
+      return;
+    }
+    if (text === "burst") {
+      reply(id, { messageId });
+      burst(update, true);
+      state("idle", { stopReason: "end_turn" });
       return;
     }
     if (text === "error") {
