@@ -1,5 +1,5 @@
 use serde_json::Value;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use super::*;
 use crate::{delivery::Work, microvm::Guest};
@@ -11,7 +11,8 @@ pub(crate) struct WorkTools {
     thread: OngoingThread,
     can_start: bool,
     peers: Vec<AgentPeer>,
-    can_ask: AtomicBool,
+    asking_turn: AtomicI64,
+    sending_peer: Arc<tokio::sync::Mutex<()>>,
 }
 
 #[derive(Deserialize)]
@@ -27,6 +28,7 @@ struct SendPeer {
     #[serde(deserialize_with = "decode_id")]
     peer: Id,
     text: String,
+    thread: Option<String>,
 }
 
 impl WorkTools {
@@ -34,32 +36,39 @@ impl WorkTools {
         state: PathBuf,
         thread: OngoingThread,
         conversation: &Conversation,
+        sending_peer: Arc<tokio::sync::Mutex<()>>,
     ) -> Arc<Self> {
         Arc::new(Self {
             state,
             thread,
             can_start: conversation.work,
             peers: conversation.peers.clone(),
-            can_ask: AtomicBool::new(false),
+            asking_turn: AtomicI64::new(0),
+            sending_peer,
         })
     }
 
-    pub(crate) fn set_source(&self, source: OngoingSource) {
-        self.can_ask.store(
-            matches!(
+    pub(crate) fn set_source(&self, source: OngoingSource, turn: i64) {
+        self.asking_turn.store(
+            if matches!(
                 source,
                 OngoingSource::DirectMessage | OngoingSource::Schedule
-            ),
+            ) {
+                turn
+            } else {
+                0
+            },
             Ordering::Release,
         );
     }
 
     pub(crate) async fn call(&self, tool: &str, arguments: Value) -> io::Result<String> {
+        let turn = self.asking_turn.load(Ordering::Acquire);
         match tool {
             "start_work" if self.can_start => {
                 self.start(arguments).map(|id| format!("Work {id} queued."))
             }
-            "send_peer" if self.can_ask.load(Ordering::Acquire) => self.send_peer(arguments).await,
+            "send_peer" if turn > 0 => self.send_peer(arguments, turn).await,
             _ => Err(io::ErrorKind::PermissionDenied.into()),
         }
     }
@@ -88,17 +97,25 @@ impl WorkTools {
         Ok(hex::encode(id))
     }
 
-    async fn send_peer(&self, arguments: Value) -> io::Result<String> {
+    async fn send_peer(&self, arguments: Value, turn: i64) -> io::Result<String> {
         let request: SendPeer = serde_json::from_value(arguments).map_err(io::Error::other)?;
         let peer = self
             .peers
             .iter()
             .find(|peer| peer.id == request.peer)
             .ok_or(io::ErrorKind::PermissionDenied)?;
-        if request.text.trim().is_empty() || request.text.len() > 4096 {
+        let text = match request.thread {
+            Some(name) if super::valid_thread_name(&name) => {
+                format!("/thread {name} {}", request.text)
+            }
+            Some(_) => return Err(invalid("invalid shared thread name")),
+            None => request.text.clone(),
+        };
+        if request.text.trim().is_empty() || text.len() > 4096 {
             return Err(invalid("invalid peer message"));
         }
         let now = i64::try_from(node::unix_time()?).map_err(io::Error::other)?;
+        let _sending = self.sending_peer.lock().await;
         let store = self.authorized_store()?;
         if store
             .peer_pending(self.thread.scope, now)
@@ -112,7 +129,7 @@ impl WorkTools {
             self.thread.channel,
             request.peer,
             peer.route.as_deref().unwrap_or("-"),
-            &request.text,
+            &text,
         )
         .await?;
         let id = parse_id(
@@ -121,7 +138,13 @@ impl WorkTools {
                 .ok_or_else(|| io::Error::other("invalid peer receipt"))?,
         )?;
         self.authorized_store()?
-            .expect_peer_reply(self.thread.scope, id, request.peer, now.saturating_add(300))
+            .expect_peer_reply(
+                self.thread.scope,
+                id,
+                request.peer,
+                now.saturating_add(300),
+                turn,
+            )
             .map_err(io::Error::other)?;
         Ok(format!("Peer message {} queued.", hex::encode(id)))
     }

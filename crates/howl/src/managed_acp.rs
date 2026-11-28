@@ -608,9 +608,9 @@ impl ManagedSession {
         })
     }
 
-    pub(crate) fn conversation_source(&self, source: crate::delivery::OngoingSource) {
+    pub(crate) fn conversation_source(&self, source: crate::delivery::OngoingSource, turn: i64) {
         if let Some(tools) = &self.work_tools {
-            tools.set_source(source);
+            tools.set_source(source, turn);
         }
     }
 

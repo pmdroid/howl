@@ -51,7 +51,7 @@ if (process.argv[2] === "work") {
     description: "Send one message to an approved peer. The peer's signed reply enters this conversation in a later turn.",
     inputSchema: {
       type: "object",
-      properties: { peer: { type: "string" }, text: { type: "string" } },
+      properties: { peer: { type: "string" }, text: { type: "string" }, thread: { type: "string", description: "Optional shared thread name at the receiving agent. Participants in that thread can see this exchange." } },
       required: ["peer", "text"],
       additionalProperties: false,
     },
