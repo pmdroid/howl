@@ -1,4 +1,5 @@
 mod context;
+mod github;
 mod tokens;
 mod work;
 
@@ -82,6 +83,7 @@ struct AgentPeer {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Schedule {
+    github_pull_requests: Option<String>,
     name: String,
     seconds: i64,
     instruction: String,
@@ -134,7 +136,11 @@ impl Conversation {
             || self.revision.trim().is_empty()
             || self.schedules.len() > 8
             || self.schedules.iter().any(|schedule| {
-                schedule.name.is_empty()
+                schedule
+                    .github_pull_requests
+                    .as_deref()
+                    .is_some_and(|name| !github::valid_repository(name))
+                    || schedule.name.is_empty()
                     || !names.insert(&schedule.name)
                     || !(60..=31_536_000).contains(&schedule.seconds)
                     || schedule.instruction.trim().is_empty()
@@ -155,16 +161,24 @@ impl Conversation {
     fn schedules(&self) -> Vec<OngoingSchedule> {
         self.schedules
             .iter()
-            .map(|schedule| OngoingSchedule {
-                id: Sha256::new()
+            .map(|schedule| {
+                let mut hash = Sha256::new()
                     .chain_update(schedule.seconds.to_be_bytes())
                     .chain_update(schedule.name.as_bytes())
                     .chain_update([0])
-                    .chain_update(schedule.instruction.as_bytes())
-                    .finalize()
-                    .into(),
-                seconds: schedule.seconds,
-                text: schedule.instruction.clone(),
+                    .chain_update(schedule.instruction.as_bytes());
+                if let Some(repo) = &schedule.github_pull_requests {
+                    hash = Sha256::new()
+                        .chain_update(b"howl/github-pr-schedule/v1")
+                        .chain_update(hash.finalize())
+                        .chain_update(repo.as_bytes());
+                }
+                OngoingSchedule {
+                    id: hash.finalize().into(),
+                    seconds: schedule.seconds,
+                    text: schedule.instruction.clone(),
+                    github_pull_requests: schedule.github_pull_requests.clone(),
+                }
             })
             .collect()
     }
