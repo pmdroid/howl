@@ -150,7 +150,7 @@ For an existing Howl ChatGPT plan connection, set the profile's provider to `cha
 howl worker run "$HOWL_STATE" /path/to/repo main < instruction.txt
 ```
 
-Worker patches are saved under `worker-patches` in the node's state directory.
+Howl checks a worker patch against the files the session received and the pinned Git commit, then saves it under `worker-patches` in the node's state directory. The patch header records the run ID, base commit, and snapshot digest.
 
 Set `"work": true` on a conversation to give its ongoing agent the `start_work` tool. It launches a separate ACP worker and returns a run ID. Send `/work RUN`, `/steer RUN MESSAGE`, or `/cancel RUN` in the same TUI DM or through MCP `dm` to check status, send feedback, or cancel. To give an integration permission to steer work from a human conversation, add its signed integration ID to that conversation's `work_control_from` list.
 
