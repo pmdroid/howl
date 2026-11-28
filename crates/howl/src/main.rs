@@ -160,7 +160,14 @@ async fn main() -> ExitCode {
         [group, action, state] if group == "mesh" && action == "stop" => {
             node::stop(Path::new(state)).await
         }
-        [group, command, state] if group == "control" && command == "login" => {
+        [group, command, option, state]
+            if group == "control" && command == "login" && option == "--device-code" =>
+        {
+            howl::network_client::login_with_device_code(Path::new(state)).await
+        }
+        [group, command, state]
+            if group == "control" && command == "login" && state != "--device-code" =>
+        {
             howl::network_client::login(Path::new(state)).await
         }
         [group, command, state] if group == "control" && command == "transfer" => {

@@ -91,3 +91,60 @@ async fn advertised_link_recovers_its_nonce_and_reports_owner_denial() {
     assert!(!state.join("credentials").exists());
     assert!(!state.join("hosted-designation").exists());
 }
+
+#[tokio::test]
+async fn web_enabled_servers_keep_manual_and_explicit_device_code_routes() {
+    let config = || async {
+        Json(json!({
+            "audience":hex::encode([1;32]),
+            "browser_link_origin":"https://howl.test"
+        }))
+    };
+    let (observed, mut requests) = tokio::sync::mpsc::unbounded_channel();
+    let start = move |uri: axum::http::Uri| {
+        observed.send(uri.path().to_owned()).unwrap();
+        async {
+            Json(json!({
+                "login": hex::encode([2;32]),
+                "verification_uri": "https://github.com/login/device",
+                "user_code": "ABCD-EFGH",
+                "expires_in": 1,
+                "interval": 1
+            }))
+        }
+    };
+    let api = Router::new()
+        .route("/v1/auth/config", get(config))
+        .route("/v1/login/device", post(start.clone()))
+        .route("/v1/network/login/device", post(start));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async { axum::serve(listener, api).await.unwrap() });
+    let directory = tempfile::tempdir().unwrap();
+    let manual = directory.path().join("enrolled");
+    LocalIdentity::load_or_create(&manual).unwrap();
+    std::fs::write(manual.join("mesh.lock"), []).unwrap();
+    let fresh = directory.path().join("fresh");
+    for (state, flags, route) in [
+        (&manual, &[][..], "/v1/login/device"),
+        (&fresh, &["--device-code"][..], "/v1/network/login/device"),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_howl"))
+            .args(["control", "login"])
+            .args(flags)
+            .arg(state)
+            .env("HOWL_CONTROL_URL", &origin)
+            .env_remove("HOWL_CONTROL_AUDIENCE")
+            .env("HOWL_NO_BROWSER", "1")
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .contains("https://github.com/login/device")
+        );
+        assert_eq!(requests.try_recv().unwrap(), route);
+    }
+    server.abort();
+}

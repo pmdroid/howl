@@ -102,10 +102,17 @@ struct Proof {
 }
 
 pub async fn login(state: &Path) -> io::Result<()> {
-    login_device(state, false).await
+    login_device(state, LoginMode::Manual).await
 }
 
-pub(crate) async fn login_device(path: &Path, join_network: bool) -> io::Result<()> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LoginMode {
+    Manual,
+    Hosted,
+    DeviceCode,
+}
+
+pub(crate) async fn login_device(path: &Path, mode: LoginMode) -> io::Result<()> {
     let identity = LocalIdentity::load_or_create(path)?;
     let state = StateDirectory::open(path)?;
     let _lock = crate::identity::retry_state_lock(|| state.lock(LOCK)).await?;
@@ -125,15 +132,11 @@ pub(crate) async fn login_device(path: &Path, join_network: bool) -> io::Result<
     let previous_owner = existing
         .as_ref()
         .map(|stored| stored.credentials.session.github_id);
-    let credentials = if let Some(origin) = browser {
-        if !join_network {
-            return Err(io::Error::other(
-                "Use a fresh device state directory to link this machine to an account-managed network.",
-            ));
+    let credentials = match (mode, browser) {
+        (LoginMode::Hosted, Some(origin)) => {
+            device_link::login(&service, &identity, path, origin, previous_owner).await?
         }
-        device_link::login(&service, &identity, path, origin, previous_owner).await?
-    } else {
-        github_device_login(&service, &identity, join_network).await?
+        _ => github_device_login(&service, &identity, mode != LoginMode::Manual).await?,
     };
     validate_login(&credentials, &identity, previous_owner)?;
     save(&state, &service, credentials)?;
