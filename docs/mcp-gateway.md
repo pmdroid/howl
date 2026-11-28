@@ -112,6 +112,8 @@ On the agent's mesh node, create a `conversations.json` file in its state direct
 }
 ```
 
+A schedule can include `"github_pull_requests": "pallets/click"`. When it fires, Howl reads the five most recent open PR numbers and titles from the public GitHub API and includes them in the scheduled prompt. The request uses anonymous GitHub access.
+
 With that node's mesh daemon running, start `howl agent serve "$HOWL_STATE" claude "$HOWL_REPOSITORY_IMAGE"` using the environment for the selected host agent. In the TUI, select the agent as a direct peer and send a message. For MCP, configure a conversation entry with `integration` set to the signed integration ID shown in the gateway's chat events. Send through the `dm` tool and read the same direct conversation. When using direct routing, set `route` to the configured peer address.
 
 ### Share a thread with an agent
