@@ -43,6 +43,11 @@ async fn main() -> ExitCode {
         [group, action, state] if group == "worker" && action == "check" => {
             howl::microvm::check(Path::new(state))
         }
+        [group, action, state, repo, run] if group == "worker" && action == "inspect" => {
+            required_text(run).and_then(|run| {
+                howl::worker_artifact::inspect(Path::new(state), Path::new(repo), run)
+            })
+        }
         [group, action, state, repo, revision] if group == "worker" && action == "run" => {
             run_worker(Path::new(state), Path::new(repo), revision).await
         }

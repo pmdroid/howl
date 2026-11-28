@@ -160,7 +160,7 @@ For an existing Howl ChatGPT plan connection, set the profile's provider to `cha
 howl worker run "$HOWL_STATE" /path/to/repo main < instruction.txt
 ```
 
-Howl checks a worker patch against the files the session received and the pinned Git commit, then saves it under `worker-patches` in the node's state directory. The patch header records the run ID, base commit, and snapshot digest.
+Howl checks a worker patch against the files the session received and the pinned Git commit, then saves it under `worker-patches` in the node's state directory. The patch header records the run ID, base commit, and snapshot digest. Run `howl worker inspect STATE_DIR REPO RUN` on the host to revalidate the saved patch against its pinned commit and review the repository, diff, and operation digest.
 
 To exercise the subscription worker with a synthetic repository, set `HOWL_TEST_MICROVM_STATE` to the directory containing its `microvm.json` and run the hardware test in the same broker environment.
 
