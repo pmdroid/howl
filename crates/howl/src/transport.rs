@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, VecDeque},
+    collections::{BTreeMap, VecDeque},
     future::Future,
     io,
     net::{IpAddr, SocketAddr},
@@ -8,7 +8,7 @@ use std::{
 };
 
 use iroh::{
-    Endpoint, EndpointId, RelayConfig, RelayMap,
+    Endpoint, EndpointId, RelayConfig, RelayMap, TransportAddr, Watcher,
     endpoint::{Connection, QuicTransportConfig, RelayMode, WeakConnectionHandle, presets},
 };
 pub use iroh::{EndpointAddr, RelayUrl};
@@ -31,6 +31,7 @@ const RECEIVE_QUEUE_LEN: usize = 32;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const LAN_HEAD_START: Duration = Duration::from_millis(750);
 const STREAM_TIMEOUT: Duration = Duration::from_secs(10);
+const INITIAL_RTT: Duration = Duration::from_millis(333);
 
 pub enum Network {
     Direct,
@@ -46,11 +47,28 @@ pub enum PathKind {
     Relay,
 }
 
-#[derive(Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PeerPath {
     pub device: String,
     pub kind: PathKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub direct_rtt_us: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relay_rtt_us: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relay: Option<String>,
+}
+
+struct PathSample {
+    kind: PathKind,
+    selected: bool,
+    rtt: Option<u32>,
+    relay: Option<String>,
+}
+
+fn relay_for_report(url: &RelayUrl) -> Option<String> {
+    (url.scheme() == "https" && url.as_str().len() <= 255).then(|| url.to_string())
 }
 
 #[derive(Default)]
@@ -69,8 +87,8 @@ impl ActiveConnections {
         }
     }
 
-    async fn paths(&self) -> BTreeSet<PeerPath> {
-        let mut paths = BTreeSet::new();
+    async fn paths(&self) -> Vec<PeerPath> {
+        let mut paths = BTreeMap::new();
         for (device, handle) in self.0.lock().await.iter() {
             let Some(connection) = handle.upgrade() else {
                 continue;
@@ -78,21 +96,54 @@ impl ActiveConnections {
             if connection.close_reason().is_some() {
                 continue;
             }
-            for path in connection.paths().iter().filter(|path| path.is_selected()) {
-                let kind = if path.is_ip() {
-                    PathKind::Direct
-                } else if path.is_relay() {
-                    PathKind::Relay
-                } else {
-                    continue;
+            let samples: Vec<_> = connection
+                .paths()
+                .iter()
+                .filter_map(|path| {
+                    let (kind, relay) = match path.remote_addr() {
+                        TransportAddr::Ip(_) => (PathKind::Direct, None),
+                        TransportAddr::Relay(url) => (PathKind::Relay, relay_for_report(url)),
+                        _ => return None,
+                    };
+                    let stats = path.stats();
+                    let received_response = stats.frame_rx.acks > 0
+                        || stats.frame_rx.path_acks > 0
+                        || stats.frame_rx.path_response > 0;
+                    let rtt =
+                        if received_response && stats.rtt != INITIAL_RTT && !stats.rtt.is_zero() {
+                            u32::try_from(stats.rtt.as_micros().max(1)).ok()
+                        } else {
+                            None
+                        };
+                    Some(PathSample {
+                        kind,
+                        selected: path.is_selected(),
+                        rtt,
+                        relay,
+                    })
+                })
+                .collect();
+            if let Some(selected) = samples.iter().find(|sample| sample.selected) {
+                let best = |kind| {
+                    samples
+                        .iter()
+                        .filter(|sample| sample.kind == kind)
+                        .min_by_key(|sample| (!sample.selected, sample.rtt.unwrap_or(u32::MAX)))
                 };
-                paths.insert(PeerPath {
-                    device: hex::encode(device),
-                    kind,
-                });
+                let relay = best(PathKind::Relay);
+                paths.insert(
+                    (*device, selected.kind),
+                    PeerPath {
+                        device: hex::encode(device),
+                        kind: selected.kind,
+                        direct_rtt_us: best(PathKind::Direct).and_then(|sample| sample.rtt),
+                        relay_rtt_us: relay.and_then(|sample| sample.rtt),
+                        relay: relay.and_then(|sample| sample.relay.clone()),
+                    },
+                );
             }
         }
-        paths
+        paths.into_values().collect()
     }
 }
 
@@ -154,6 +205,7 @@ impl Transport {
     ) -> io::Result<Self> {
         let window = (MAX_FRAME_BYTES + FRAME_PREFIX_BYTES + 1) as u32;
         let config = QuicTransportConfig::builder()
+            .initial_rtt(INITIAL_RTT)
             .max_concurrent_uni_streams(1u32.into())
             .max_concurrent_bidi_streams(1u32.into())
             .stream_receive_window(window.into())
@@ -262,7 +314,16 @@ impl Transport {
         .await
     }
 
-    pub(crate) async fn peer_paths(&self) -> BTreeSet<PeerPath> {
+    pub(crate) fn connected_relay(&self) -> Option<String> {
+        self.endpoint
+            .home_relay_status()
+            .get()
+            .iter()
+            .filter(|relay| relay.is_connected())
+            .find_map(|relay| relay_for_report(relay.url()))
+    }
+
+    pub(crate) async fn peer_paths(&self) -> Vec<PeerPath> {
         self.active.paths().await
     }
 

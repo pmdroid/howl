@@ -70,11 +70,14 @@ async fn sends_a_maximum_frame_and_replies_on_the_cached_connection_after_a_rest
     assert_eq!(returned.peer.as_bytes(), bob_device.as_bytes());
     for (transport, peer) in [(&alice, &bob_device), (&bob_server, &alice_device)] {
         timeout(TEST_TIMEOUT, async {
-            let expected = PeerPath {
-                device: hex::encode(peer.device_id()),
-                kind: PathKind::Direct,
-            };
-            while !transport.peer_paths().await.contains(&expected) {
+            let device = hex::encode(peer.device_id());
+            while !transport.peer_paths().await.iter().any(|path| {
+                path.device == device
+                    && path.kind == PathKind::Direct
+                    && path.direct_rtt_us.is_some_and(|rtt| rtt > 0)
+                    && path.relay_rtt_us.is_none()
+                    && path.relay.is_none()
+            }) {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         })
