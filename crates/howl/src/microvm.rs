@@ -1,5 +1,7 @@
 use std::{
+    fs::Permissions,
     io,
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::Stdio,
     time::Duration,
@@ -8,7 +10,7 @@ use std::{
 use serde::Deserialize;
 use serde_json::json;
 use tokio::{
-    io::AsyncReadExt,
+    io::{AsyncBufReadExt, AsyncReadExt, BufReader},
     net::{UnixListener, UnixStream},
     process::{Child, ChildStdin, Command},
     task::JoinHandle,
@@ -27,8 +29,9 @@ const RUN_LIMIT: Duration = Duration::from_secs(900);
 const PATCH_LIMIT: usize = 4 * 1024 * 1024;
 const WATCH_OWNER: &str = r#"
 exec 3<&0
-"$@" </dev/null 3<&- &
+"$@" </dev/null >/dev/null 3<&- &
 machine=$!
+printf '%s\n' "$machine"
 (
     IFS= read -r unused <&3 || :
     kill -KILL "$machine" 2>/dev/null
@@ -38,6 +41,8 @@ wait "$machine"
 status=$?
 kill "$watcher" 2>/dev/null || :
 wait "$watcher" 2>/dev/null || :
+/bin/rm -f ./repo.tar ./acp ./patch ./provider
+if [ . -ef "$PWD" ]; then /bin/rmdir "$PWD" 2>/dev/null || :; fi
 exit "$status"
 "#;
 
@@ -86,7 +91,6 @@ pub(crate) struct Guest {
     patch: UnixStream,
     process: Child,
     owner: Option<ChildStdin>,
-    _directory: tempfile::TempDir,
     broker: Option<JoinHandle<io::Result<()>>>,
 }
 
@@ -159,9 +163,13 @@ impl Guest {
         };
         let directory = tempfile::Builder::new()
             .prefix("howl-vm-")
+            .permissions(Permissions::from_mode(0o700))
             .tempdir_in("/tmp")?;
         let archive = directory.path().join("repo.tar");
         snapshot.archive(&archive)?;
+        let commit = snapshot.commit().to_owned();
+        let selection = snapshot.selection();
+        drop(snapshot);
         let mut command = Command::new("/bin/sh");
         command
             .args(["-c", WATCH_OWNER, "howl-microvm"])
@@ -170,7 +178,7 @@ impl Guest {
             .env_clear()
             .current_dir(directory.path())
             .stdin(Stdio::piped())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .kill_on_drop(true)
             .args([
@@ -220,12 +228,21 @@ impl Guest {
             .stdin
             .take()
             .ok_or_else(|| io::Error::other("microVM owner pipe unavailable"))?;
+        let launcher = process
+            .stdout
+            .take()
+            .ok_or_else(|| io::Error::other("missing QEMU PID pipe"))?;
         let connect = async {
-            let (mut acp, _) = acp.accept().await?;
-            let (patch, _) = patch.accept().await?;
+            let mut pid = String::new();
+            BufReader::new(launcher.take(32))
+                .read_line(&mut pid)
+                .await?;
+            let pid = pid.trim_end().parse::<i32>().map_err(io::Error::other)?;
+            let mut acp = accept_vm(&acp, pid).await?;
+            let patch = accept_vm(&patch, pid).await?;
             let broker = if let Some((broker, port)) = inference {
-                let (link, _) = port.accept().await?;
-                Some(tokio::spawn(broker.serve_guest(link)))
+                let link = accept_vm(&port, pid).await?;
+                Some((broker, link))
             } else {
                 None
             };
@@ -240,7 +257,9 @@ impl Guest {
             result = timeout(BOOT, connect) => result.map_err(io::Error::other)??,
             _ = process.wait() => return Err(io::Error::other("microVM exited during startup")),
         };
-        let session = ManagedSession::guest(&state.join("worker-acp"), &snapshot, link)
+        directory.close()?;
+        let broker = broker.map(|(broker, link)| tokio::spawn(broker.serve_guest(link)));
+        let session = ManagedSession::guest(&state.join("worker-acp"), commit, selection, link)
             .await
             .map_err(io::Error::other)?;
         Ok(Self {
@@ -248,7 +267,6 @@ impl Guest {
             patch,
             process,
             owner: Some(owner),
-            _directory: directory,
             broker,
         })
     }
@@ -261,6 +279,15 @@ impl Guest {
         timeout(Duration::from_secs(10), read_patch(&mut self.patch))
             .await
             .map_err(io::Error::other)?
+    }
+}
+
+async fn accept_vm(listener: &UnixListener, pid: i32) -> io::Result<UnixStream> {
+    loop {
+        let (link, _) = listener.accept().await?;
+        if link.peer_cred()?.pid() == Some(pid) {
+            return Ok(link);
+        }
     }
 }
 
@@ -336,11 +363,34 @@ mod tests {
         assert!(read_patch(&mut host).await.is_err());
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn serial_connections_require_the_expected_process() {
+        let pair = tempfile::tempdir().unwrap();
+        let socket = pair.path().join("acp");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let pid = i32::try_from(std::process::id()).unwrap();
+        let _other = UnixStream::connect(&socket).await.unwrap();
+        assert!(
+            timeout(Duration::from_millis(100), accept_vm(&listener, pid + 1))
+                .await
+                .is_err()
+        );
+        let _expected = UnixStream::connect(&socket).await.unwrap();
+        accept_vm(&listener, pid).await.unwrap();
+    }
+
     #[tokio::test]
     async fn owner_pipe_outlives_startup_polling_and_stops_the_guest_on_close() {
+        let parent = tempfile::tempdir().unwrap();
+        let runtime = parent.path().join("runtime");
+        std::fs::create_dir(&runtime).unwrap();
+        std::fs::write(runtime.join("repo.tar"), "synthetic snapshot").unwrap();
         let mut process = Command::new("/bin/sh")
+            .current_dir(&runtime)
             .args(["-c", WATCH_OWNER, "howl-watchdog-test", "/bin/sleep", "20"])
             .stdin(Stdio::piped())
+            .stdout(Stdio::null())
             .stderr(Stdio::null())
             .kill_on_drop(true)
             .spawn()
@@ -357,5 +407,6 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(!status.success());
+        assert!(!runtime.exists());
     }
 }

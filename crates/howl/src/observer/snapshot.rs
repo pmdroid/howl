@@ -90,6 +90,7 @@ impl Snapshot {
 
         let directory = tempfile::Builder::new()
             .prefix("howl-snapshot-")
+            .permissions(fs::Permissions::from_mode(0o700))
             .tempdir()?;
         let tree = directory.path().join("tree");
         fs::create_dir(&tree)?;
