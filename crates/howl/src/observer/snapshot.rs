@@ -155,6 +155,10 @@ impl Snapshot {
         self.selection
     }
 
+    pub(crate) fn repository(&self) -> &Path {
+        &self.repository
+    }
+
     pub fn commit(&self) -> &str {
         &self.commit
     }
