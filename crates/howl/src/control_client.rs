@@ -246,6 +246,10 @@ pub async fn enroll(
 }
 
 impl ControlClient {
+    pub(crate) fn has_credentials(state: &Path) -> io::Result<bool> {
+        state.join(CREDENTIALS).try_exists()
+    }
+
     pub async fn open(state: &Path) -> io::Result<Self> {
         let identity = LocalIdentity::load_or_create(state)?;
         let state = StateDirectory::open(state)?;

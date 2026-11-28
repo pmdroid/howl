@@ -19,7 +19,7 @@ use crate::{
     channel::{Channel, MAX_MANIFEST_LEN},
     identity::{LocalIdentity, PeerCertificate, PeerTrust},
     interaction::{LocalInteraction, Wake},
-    node,
+    network_client, node,
     observer::Snapshot,
     workflow,
 };
@@ -28,6 +28,15 @@ use crate::{
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub(super) enum Command {
     Overview,
+    DeviceRequests,
+    ApproveDevice {
+        device: String,
+        fingerprint: String,
+    },
+    DenyDevice {
+        device: String,
+        fingerprint: String,
+    },
     Create {
         peers: Vec<String>,
     },
@@ -99,12 +108,16 @@ impl From<Role> for AgentRole {
 }
 
 pub(super) async fn command(State(web): State<Arc<Web>>, Json(input): Json<Command>) -> Response {
+    if web.approvals_only && !input.is_device_action() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
     match execute(web, input).await {
         Ok(value) => Json(value).into_response(),
         Err(error) => {
             let status = match error.kind() {
                 io::ErrorKind::InvalidInput | io::ErrorKind::InvalidData => StatusCode::BAD_REQUEST,
                 io::ErrorKind::PermissionDenied => StatusCode::FORBIDDEN,
+                io::ErrorKind::AlreadyExists => StatusCode::CONFLICT,
                 io::ErrorKind::NotFound => StatusCode::NOT_FOUND,
                 _ => StatusCode::INTERNAL_SERVER_ERROR,
             };
@@ -117,6 +130,24 @@ async fn execute(web: Arc<Web>, input: Command) -> io::Result<Value> {
     let state = &web.directory;
     let interaction = LocalInteraction::new(state);
     let receipt = match input {
+        Command::DeviceRequests => {
+            return serde_json::to_value(network_client::device_requests(state).await?)
+                .map_err(io::Error::other);
+        }
+        Command::ApproveDevice {
+            device,
+            fingerprint,
+        } => {
+            network_client::approve_request(state, id(&device)?, Some(id(&fingerprint)?)).await?;
+            return Ok(json!({ "device": device, "fingerprint": fingerprint }));
+        }
+        Command::DenyDevice {
+            device,
+            fingerprint,
+        } => {
+            network_client::deny_request(state, id(&device)?, id(&fingerprint)?).await?;
+            return Ok(json!({ "device": device, "fingerprint": fingerprint }));
+        }
         Command::Send {
             channel,
             peer,
@@ -253,9 +284,12 @@ fn execute_local(state: &Path, input: Command) -> io::Result<Value> {
                 .collect::<Vec<_>>();
             Ok(json!({ "recipients": items }))
         }
-        Command::Send { .. } | Command::Wake { .. } | Command::Grant { .. } => {
-            Err(io::Error::other("Invalid local command"))
-        }
+        Command::Send { .. }
+        | Command::Wake { .. }
+        | Command::Grant { .. }
+        | Command::DeviceRequests
+        | Command::ApproveDevice { .. }
+        | Command::DenyDevice { .. } => Err(io::Error::other("Invalid local command")),
     }
 }
 

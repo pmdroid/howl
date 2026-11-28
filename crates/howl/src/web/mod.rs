@@ -12,7 +12,7 @@ use axum::{
     extract::{DefaultBodyLimit, Request, State},
     http::{HeaderMap, HeaderName, Method, StatusCode, header},
     middleware::{self, Next},
-    response::{IntoResponse, Response},
+    response::{IntoResponse, Redirect, Response},
     routing::{get, post},
 };
 use subtle::ConstantTimeEq;
@@ -25,27 +25,47 @@ struct Web {
     directory: PathBuf,
     authority: String,
     origin: String,
+    approvals_only: bool,
     secret: Zeroizing<[u8; 32]>,
 }
 
 pub async fn run(directory: &Path, port: u16) -> io::Result<()> {
     LocalIdentity::load_or_create(directory)?;
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await?;
-    let authority = listener.local_addr()?.to_string();
-    let origin = format!("http://{authority}");
+    let external = std::env::var_os("HOWL_WEB_APPROVAL_ORIGIN");
+    let approvals_only = external.is_some();
+    let (origin, authority) = match external {
+        Some(value) => approval_origin(value.to_str().unwrap_or_default())?,
+        None => {
+            let authority = listener.local_addr()?.to_string();
+            (format!("http://{authority}"), authority)
+        }
+    };
+    let path = if approvals_only { "/devices" } else { "/" };
     let mut secret = Zeroizing::new([0; 32]);
     getrandom::fill(secret.as_mut()).map_err(io::Error::other)?;
     let fragment = Zeroizing::new(hex::encode(secret.as_ref()));
-    writeln!(io::stdout(), "Open {origin}/#{}", fragment.as_str())?;
+    writeln!(io::stdout(), "Open {origin}{path}#{}", fragment.as_str())?;
     let web = Arc::new(Web {
         directory: directory.to_owned(),
         authority,
         origin,
+        approvals_only,
         secret,
     });
     let app = Router::new()
         .route(
             "/",
+            get(move || async move {
+                if approvals_only {
+                    Redirect::temporary("/devices").into_response()
+                } else {
+                    asset("text/html; charset=utf-8", INDEX).into_response()
+                }
+            }),
+        )
+        .route(
+            "/devices",
             get(|| async { asset("text/html; charset=utf-8", INDEX) }),
         )
         .route(
@@ -65,6 +85,41 @@ pub async fn run(directory: &Path, port: u16) -> io::Result<()> {
         .layer(middleware::from_fn_with_state(Arc::clone(&web), guard))
         .with_state(web);
     axum::serve(listener, app).await
+}
+
+fn approval_origin(value: &str) -> io::Result<(String, String)> {
+    let invalid = || {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Expected an HTTPS approval origin",
+        )
+    };
+    let url = reqwest::Url::parse(value).map_err(|_| invalid())?;
+    if url.scheme() != "https"
+        || url.host().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(invalid());
+    }
+    let origin = url.origin().ascii_serialization();
+    let authority = origin
+        .strip_prefix("https://")
+        .ok_or_else(invalid)?
+        .to_owned();
+    Ok((origin, authority))
+}
+
+impl api::Command {
+    fn is_device_action(&self) -> bool {
+        matches!(
+            self,
+            Self::DeviceRequests | Self::ApproveDevice { .. } | Self::DenyDevice { .. }
+        )
+    }
 }
 
 const INDEX: &str = include_str!("../../web/src/index.html");

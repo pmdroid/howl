@@ -1,5 +1,6 @@
 import { useEffect, useState, type FormEvent, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
+import { DeviceApprovals } from "./device-approvals";
 
 type Device = { id: string; certificate: string; fingerprint: string };
 type Channel = { id: string; members: string[]; manifest: string };
@@ -140,13 +141,12 @@ function App() {
     await lookup(receipt.message);
   }
 
-  if (!session) return <main className="locked"><h1>Howl</h1><p>Open the session link printed by <code>howl web</code>.</p></main>;
-
   return <>
     <header className="topbar">
       <a href="/" className="wordmark">Howl</a>
       <div className="top-actions">
         {overview && <span title={overview.local.id}>This device <code>{short(overview.local.id)}</code></span>}
+        <a href="/devices">Device approvals</a>
         <button type="button" disabled={busy} onClick={() => refresh(value => value + 1)}>Refresh</button>
       </div>
     </header>
@@ -323,4 +323,9 @@ function App() {
   </>;
 }
 
-createRoot(document.getElementById("root")!).render(<App />);
+const devicesPage = window.location.pathname === "/devices";
+if (devicesPage) document.title = "Device approvals · Howl";
+createRoot(document.getElementById("root")!).render(
+  !session ? <main className="locked"><h1>Howl</h1><p>Open the session link printed by <code>howl web</code>.</p></main>
+    : devicesPage ? <DeviceApprovals api={api} /> : <App />
+);
