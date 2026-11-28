@@ -36,6 +36,10 @@ jobs:
           node-version: '24'
       - name: Test ChatGPT authorization and repository tool transport
         run: node --test tools/chatgpt-auth/chatgpt-auth.test.mjs crates/howl/tests/fixtures/host-agent/repository-http.test.cjs
+      - name: Test the Cloudflare Worker and D1 prototype
+        if: runner.os == 'Linux'
+        working-directory: deploy/cloudflare-prototype
+        run: npm ci && npm test
       - name: Install Rust toolchain
         run: rustup show
       - name: Check formatting
