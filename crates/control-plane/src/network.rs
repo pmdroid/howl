@@ -11,7 +11,7 @@ use howl::{
     enrollment::hosted::{Candidate, Network},
     identity::PeerCertificate,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_postgres::Transaction;
 
@@ -23,6 +23,7 @@ pub(crate) fn routes() -> Router<Arc<ControlPlane>> {
     Router::new()
         .route("/v1/network", get(read))
         .route("/v1/network/devices", post(register))
+        .route("/v1/network/deny", post(deny))
         .route(
             "/v1/network/approve",
             post(approve).layer(DefaultBodyLimit::max(1024 * 1024)),
@@ -163,13 +164,27 @@ async fn read(State(control): State<Arc<ControlPlane>>, headers: HeaderMap) -> R
             view.pending = tx
                 .query(
                     "SELECT candidate FROM howl_control.network_requests
-                WHERE github_id = $1 AND expires_at > clock_timestamp() ORDER BY device_id",
+                WHERE github_id = $1 AND NOT denied AND expires_at > clock_timestamp() ORDER BY device_id",
                     &[&session.github_id],
                 )
                 .await?
                 .into_iter()
                 .map(|r| serde_json::from_value(r.get(0)).map_err(|_| Error::Internal))
                 .collect::<Result<_>>()?;
+        } else if view.state == "pending" {
+            let device: Id = proof::decode(&session.device_id)?;
+            if let Some(row) = tx.query_opt(
+                "SELECT candidate FROM howl_control.network_requests WHERE github_id = $1 AND device_id = $2 AND denied",
+                &[&session.github_id, &&device[..]],
+            ).await? {
+                let candidate: Candidate = serde_json::from_value(row.get(0)).map_err(|_| Error::Internal)?;
+                if !matches(&session, &candidate.identity().map_err(|_| Error::Internal)?)? {
+                    return Err(Error::Unauthorized);
+                }
+                view.state = "denied";
+                view.authority.clear();
+                view.designation = None;
+            }
         }
     }
     tx.commit().await?;
@@ -208,13 +223,13 @@ async fn register(
         }
     }
     let candidate = serde_json::to_value(candidate).map_err(|_| Error::Internal)?;
-    tx.execute("DELETE FROM howl_control.network_requests WHERE github_id = $1 AND expires_at <= clock_timestamp()", &[&session.github_id]).await?;
+    tx.execute("DELETE FROM howl_control.network_requests WHERE github_id = $1 AND NOT denied AND expires_at <= clock_timestamp()", &[&session.github_id]).await?;
     if tx.execute("INSERT INTO howl_control.network_requests (github_id,device_id,candidate,expires_at)
          SELECT $1,$2,$3,clock_timestamp()+interval '1 day'
-         WHERE (SELECT count(*) FROM howl_control.network_requests WHERE github_id = $1) < 64
+         WHERE (SELECT count(*) FROM howl_control.network_requests WHERE github_id = $1 AND NOT denied) < 64
             OR EXISTS (SELECT FROM howl_control.network_requests WHERE github_id = $1 AND device_id = $2)
          ON CONFLICT (github_id,device_id) DO UPDATE SET expires_at = EXCLUDED.expires_at
-         WHERE network_requests.candidate = EXCLUDED.candidate", &[&session.github_id, &&peer.device_id()[..], &candidate]).await? != 1 {
+         WHERE NOT network_requests.denied AND network_requests.candidate = EXCLUDED.candidate", &[&session.github_id, &&peer.device_id()[..], &candidate]).await? != 1 {
         return Err(Error::Unauthorized);
     }
     tx.commit().await?;
@@ -245,7 +260,7 @@ async fn approve(
         let row = tx
             .query_opt(
                 "SELECT candidate FROM howl_control.network_requests
-             WHERE github_id = $1 AND device_id = $2 AND expires_at > clock_timestamp()",
+             WHERE github_id = $1 AND device_id = $2 AND NOT denied AND expires_at > clock_timestamp()",
                 &[&session.github_id, &&peer.device_id()[..]],
             )
             .await?
@@ -298,6 +313,48 @@ async fn approve(
         &[&session.github_id, &&peer.device_id()[..]],
     )
     .await?;
+    tx.commit().await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Deny {
+    device: String,
+    fingerprint: String,
+}
+
+async fn deny(
+    State(control): State<Arc<ControlPlane>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<StatusCode> {
+    let request: Deny = serde_json::from_slice(&body).map_err(|_| Error::Invalid)?;
+    let device: Id = proof::decode(&request.device)?;
+    let fingerprint: Id = proof::decode(&request.fingerprint)?;
+    let mut connection = control.pool.get().await?;
+    let tx = connection.transaction().await?;
+    let (session, network) = signed_network(&control, &tx, &headers, "network-deny", &body).await?;
+    if !network.ok_or(Error::Unauthorized)?.is_founder(&session)? {
+        return Err(Error::Unauthorized);
+    }
+    let row = tx
+        .query_opt(
+            "SELECT candidate FROM howl_control.network_requests
+         WHERE github_id = $1 AND device_id = $2 AND (denied OR expires_at > clock_timestamp())",
+            &[&session.github_id, &&device[..]],
+        )
+        .await?
+        .ok_or(Error::Unauthorized)?;
+    let candidate: Candidate = serde_json::from_value(row.get(0)).map_err(|_| Error::Internal)?;
+    let peer = candidate.identity().map_err(|_| Error::Internal)?;
+    if peer.device_id() != &device || peer.fingerprint() != fingerprint {
+        return Err(Error::Unauthorized);
+    }
+    tx.execute(
+        "UPDATE howl_control.network_requests SET denied = true WHERE github_id = $1 AND device_id = $2 AND NOT denied",
+        &[&session.github_id, &&device[..]],
+    ).await?;
     tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
 }
