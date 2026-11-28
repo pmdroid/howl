@@ -1,10 +1,18 @@
-use std::{collections::VecDeque, future::Future, io, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeSet, VecDeque},
+    future::Future,
+    io,
+    net::SocketAddr,
+    sync::Arc,
+    time::Duration,
+};
 
 use iroh::{
     Endpoint, EndpointId, RelayConfig,
-    endpoint::{Connection, QuicTransportConfig, RelayMode, presets},
+    endpoint::{Connection, QuicTransportConfig, RelayMode, WeakConnectionHandle, presets},
 };
 pub use iroh::{EndpointAddr, RelayUrl};
+use serde::{Deserialize, Serialize};
 use tokio::{
     sync::{Mutex, Semaphore, mpsc},
     task::{JoinHandle, JoinSet},
@@ -17,6 +25,7 @@ const ALPN: &[u8] = b"howl/mesh/1";
 pub const MAX_FRAME_BYTES: usize = 77_112;
 const FRAME_PREFIX_BYTES: usize = 4;
 const CONNECTION_LIMIT: usize = 32;
+pub const MAX_REPORTED_PATHS: usize = 2 * CONNECTION_LIMIT;
 const RECEIVE_QUEUE_LEN: usize = 32;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const STREAM_TIMEOUT: Duration = Duration::from_secs(10);
@@ -25,6 +34,63 @@ pub enum Network {
     Direct,
     Automatic(RelayUrl),
     RelayOnly(RelayUrl),
+}
+
+#[derive(Clone, Copy, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PathKind {
+    Direct,
+    Relay,
+}
+
+#[derive(Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeerPath {
+    pub device: String,
+    pub kind: PathKind,
+}
+
+#[derive(Default)]
+struct ActiveConnections(Mutex<Vec<([u8; 32], WeakConnectionHandle)>>);
+
+impl ActiveConnections {
+    async fn record(&self, device: [u8; 32], connection: &Connection) {
+        let mut connections = self.0.lock().await;
+        connections.retain(|(_, handle)| {
+            handle
+                .upgrade()
+                .is_some_and(|connection| connection.close_reason().is_none())
+        });
+        if connections.len() < MAX_REPORTED_PATHS {
+            connections.push((device, connection.weak_handle()));
+        }
+    }
+
+    async fn paths(&self) -> BTreeSet<PeerPath> {
+        let mut paths = BTreeSet::new();
+        for (device, handle) in self.0.lock().await.iter() {
+            let Some(connection) = handle.upgrade() else {
+                continue;
+            };
+            if connection.close_reason().is_some() {
+                continue;
+            }
+            for path in connection.paths().iter().filter(|path| path.is_selected()) {
+                let kind = if path.is_ip() {
+                    PathKind::Direct
+                } else if path.is_relay() {
+                    PathKind::Relay
+                } else {
+                    continue;
+                };
+                paths.insert(PeerPath {
+                    device: hex::encode(device),
+                    kind,
+                });
+            }
+        }
+        paths
+    }
 }
 
 pub struct ReceivedFrame {
@@ -48,6 +114,7 @@ pub struct Transport {
     endpoint: Endpoint,
     device_id: [u8; 32],
     trust: Arc<PeerTrust>,
+    active: Arc<ActiveConnections>,
     outgoing: Mutex<VecDeque<CachedConnection>>,
     send_slots: Semaphore,
     frames: mpsc::Sender<ReceivedFrame>,
@@ -120,17 +187,20 @@ impl Transport {
         let endpoint = builder.bind().await.map_err(io::Error::other)?;
         let device_id = *identity.certificate().device_id();
         let trust = Arc::new(trust);
+        let active = Arc::new(ActiveConnections::default());
         let (sender, received) = mpsc::channel(RECEIVE_QUEUE_LEN);
         let accepting = tokio::spawn(accept_connections(
             endpoint.clone(),
             device_id,
             trust.clone(),
             sender.clone(),
+            active.clone(),
         ));
         Ok(Self {
             endpoint,
             device_id,
             trust,
+            active,
             outgoing: Mutex::new(VecDeque::new()),
             send_slots: Semaphore::new(CONNECTION_LIMIT),
             frames: sender,
@@ -156,6 +226,10 @@ impl Transport {
             Ok(())
         })
         .await
+    }
+
+    pub(crate) async fn peer_paths(&self) -> BTreeSet<PeerPath> {
+        self.active.paths().await
     }
 
     pub async fn send(
@@ -262,6 +336,7 @@ impl Transport {
         })
         .await?;
 
+        self.active.record(*device_id, &connection).await;
         let receiving = tokio::spawn(read_frames(
             connection.clone(),
             *device_id,
@@ -287,6 +362,7 @@ async fn accept_connections(
     device_id: [u8; 32],
     trust: Arc<PeerTrust>,
     frames: mpsc::Sender<ReceivedFrame>,
+    active: Arc<ActiveConnections>,
 ) {
     let mut connections = JoinSet::new();
     loop {
@@ -302,12 +378,16 @@ async fn accept_connections(
                 }
                 let frames = frames.clone();
                 let trust = trust.clone();
+                let active = active.clone();
                 connections.spawn(async move {
                     let connection = within(CONNECT_TIMEOUT, async {
                         incoming.await.map_err(io::Error::other)
                     }).await?;
                     match accept_peer(&connection, &device_id, &trust).await {
-                        Ok(peer) => read_frames(connection, peer, trust, frames).await,
+                        Ok(peer) => {
+                            active.record(peer, &connection).await;
+                            read_frames(connection, peer, trust, frames).await;
+                        }
                         Err(_) => connection.close(1u32.into(), b"transport peer rejected"),
                     }
                     Ok::<_, io::Error>(())

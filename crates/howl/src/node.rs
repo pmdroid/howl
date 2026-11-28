@@ -96,6 +96,11 @@ async fn run_node(
     if hosted {
         let state = state.to_owned();
         let transport = Arc::clone(&transport);
+        let report_state = state.clone();
+        let report_transport = Arc::clone(&transport);
+        discovery_task.spawn(async move {
+            crate::discovery_client::report_status(&report_state, &report_transport).await;
+        });
         discovery_task.spawn(async move {
             crate::network_client::discover(&state, &transport, bind).await;
         });

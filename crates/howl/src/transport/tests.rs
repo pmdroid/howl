@@ -58,6 +58,19 @@ async fn sends_a_maximum_frame_and_replies_on_the_cached_connection_after_a_rest
     let returned = next_frame(&alice).await;
     assert_eq!(returned.bytes, b"first ack");
     assert_eq!(returned.peer.as_bytes(), bob_device.as_bytes());
+    for (transport, peer) in [(&alice, &bob_device), (&bob_server, &alice_device)] {
+        timeout(TEST_TIMEOUT, async {
+            let expected = PeerPath {
+                device: hex::encode(peer.device_id()),
+                kind: PathKind::Direct,
+            };
+            while !transport.peer_paths().await.contains(&expected) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("direct connection was not reported");
+    }
     let cached = alice
         .connect(bob_device.device_id(), address.clone())
         .await
@@ -65,6 +78,7 @@ async fn sends_a_maximum_frame_and_replies_on_the_cached_connection_after_a_rest
     assert_eq!(cached.stable_id(), returned.connection.stable_id());
     bob_server.close().await;
     timeout(TEST_TIMEOUT, cached.closed()).await.unwrap();
+    assert!(alice.peer_paths().await.is_empty());
 
     let reloaded = LocalIdentity::load_or_create(&root.path().join("bob")).unwrap();
     let reopened = PeerTrust::open(&root.path().join("bob")).unwrap();
