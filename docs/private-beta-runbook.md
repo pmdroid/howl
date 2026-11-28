@@ -46,20 +46,37 @@ export HOWL_BETA_GITHUB_OAUTH_DIR="$HOME/.local/share/howl/github-oauth"
 docker compose -f deploy/private-beta/compose.yaml -f deploy/private-beta/compose.docker.yaml \
   -f deploy/private-beta/compose.github.yaml up -d --no-deps api
 export HOWL_CONTROL_URL="$api_url"
-export HOWL_CONTROL_AUDIENCE
-HOWL_CONTROL_AUDIENCE=$(cat "$HOWL_BETA_PRIVATE_DIR/audience")
 howl control login "$device_state"
 ```
 
 The device prints a GitHub verification URL and one-time code. After consent it saves a Howl session bound to its signing key. Include the GitHub override when recreating this API.
 
-### Verify the native API and mailbox
+### Connect your devices after GitHub sign-in
 
-Run without `HOWL_BETA_KEEP` for a clean rehearsal on disposable volumes. For the native API diagnostic and the separate mock GitHub device-flow test, build the host control-plane binary and use the following command.
+Set `HOWL_CONTROL_URL` on each machine to the same HTTPS control-plane URL. Use a fresh private state directory on each machine. The first device to complete GitHub sign-in creates the network and holds its membership signing key. Its login prints the network ID and device ID. Save the founder’s sibling recovery directory on offline storage after setup. Set `HOWL_NETWORK_RECOVERY_DIR` before the first login to choose that location.
+
+On the second machine, run `howl control login "$device_state"` and sign in with the same GitHub account. Match the device ID printed by that machine to the pending entry on the founder, then approve it.
 
 ```sh
-cargo build --locked -p howl-control-plane --bin howl-control-plane
-HOWL_BETA_TEST_GITHUB_FIXTURE=1 bash deploy/private-beta/rehearse.sh "$PWD/target/debug/howl-control-plane"
+howl control devices "$founder_state"
+howl control approve "$founder_state" "$second_device_id"
+```
+
+Run `howl mesh run "$device_state" -` on each machine using its own state. The devices retrieve the signed channel membership and publish and fetch signed iroh addresses through the control plane. On the founder, send a message using the network ID printed at login. The final dash selects the discovered route.
+
+```sh
+printf '%s\n' 'hello from my first device' | howl send "$founder_state" "$network_id" "$second_device_id" -
+howl read "$device_state" "$network_id"
+```
+
+### Verify the native API and mailbox
+
+Run without `HOWL_BETA_KEEP` for a clean rehearsal on disposable volumes. The GitHub fixture exercises device login, owner approval and delivery between two iroh nodes using the native CLI.
+
+```sh
+cargo build --locked -p howl -p howl-control-plane --bins
+HOWL_BETA_TEST_GITHUB_FIXTURE=1 HOWL_TEST_CONTROL_CLI="$PWD/target/debug/howl" \
+  bash deploy/private-beta/rehearse.sh "$PWD/target/debug/howl-control-plane"
 cargo test --locked -p howl --test enrollment_cli --test mesh --test web
 HOWL_TEST_IROH_RELAY=/absolute/path/to/native/iroh-relay \
   cargo test --locked -p howl --test relay stock_relay_allows_only_configured_endpoint_identities -- --ignored
