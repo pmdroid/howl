@@ -43,7 +43,7 @@ tailscale serve --bg --https=8446 "$api_url"
 export HOWL_CONTROL_WEB_ORIGIN=https://control.example.ts.net:8446
 ```
 
-Register a dedicated GitHub OAuth app. Use the control-plane origin as its homepage, append `/login/github/callback` for the authorization callback URL, and enable device flow for the CLI. Store the client ID and secret in separate files named `client-id` and `client-secret` in `~/.local/share/howl/github-oauth`. Give the directory mode `0700` and both files mode `0600`. [GitHub OAuth app setup](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/creating-an-oauth-app)
+Register a dedicated GitHub OAuth app. Use the control-plane origin as its homepage and append `/login/github/callback` for the authorization callback URL. Store the client ID and secret in separate files named `client-id` and `client-secret` in `~/.local/share/howl/github-oauth`. Give the directory mode `0700` and both files mode `0600`. [GitHub OAuth app setup](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/creating-an-oauth-app)
 
 Start the API with the GitHub override. Include it whenever you recreate the API.
 
@@ -58,14 +58,13 @@ docker compose -f deploy/private-beta/compose.yaml -f deploy/private-beta/compos
 
 Open `/devices` at the control-plane origin and choose **Sign in with GitHub**. Your first web sign-in creates your account's network. Returning to the dashboard with the same GitHub account opens that network.
 
-On each device, set `HOWL_CONTROL_URL` to the same HTTPS origin. Use a fresh private state directory. Run the login command and enter the one-time code at the GitHub URL it prints. Sign in with the account that owns the network.
+On each device, set `HOWL_CONTROL_URL` to the same HTTPS origin. Run the login command with a fresh private state directory. It prints a private Howl link and the full certificate fingerprint. Keep the command running while you open the link in your browser.
 
 ```sh
 howl control login "$device_state"
-howl control devices "$device_state"
 ```
 
-Compare the full certificate fingerprint printed on the device with the one under **Pending requests** on the dashboard. Select **Approve** or **Deny** for that fingerprint. The control plane records the decision even when every previously approved device is offline. Run `howl control devices "$device_state"` again on the requesting device to see its membership.
+If prompted, sign in with the GitHub account that owns the network. Opening the link while signed in binds the request to that account and adds it to **Pending requests**. Check that the network ID matches your dashboard and compare the full fingerprint on the page with the one printed on the device. Choose **Approve** or **Deny**. The CLI receives the decision from the control plane, even when every previously approved device is offline. Approved devices appear under **Approved devices** on the dashboard after the CLI completes enrollment. On an approved device, run `howl control devices "$device_state"` to see its membership.
 
 Start the mesh on each approved device. Use the network ID shown on the dashboard and the recipient's device ID. The final dash selects the discovered iroh route.
 
@@ -157,7 +156,7 @@ docker compose -f deploy/private-beta/compose.yaml up -d --wait
 bash deploy/private-beta/database.sh bootstrap
 ```
 
-Configure the OAuth app's homepage with the HTTPS control-plane origin and its callback with the same origin followed by `/login/github/callback`. Enable device flow. Put the app's client ID and secret in the API service's private environment. [GitHub OAuth app setup](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/creating-an-oauth-app)
+Configure the OAuth app's homepage with the HTTPS control-plane origin and its callback with the same origin followed by `/login/github/callback`. Put the app's client ID and secret in the API service's private environment. [GitHub OAuth app setup](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/creating-an-oauth-app)
 
 Use shell assignments from a private service environment or secret manager. Run migrations before starting the API and on every release that changes the database schema.
 

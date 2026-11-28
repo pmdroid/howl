@@ -8,6 +8,7 @@ pub(crate) fn routes() -> Router<Arc<ControlPlane>> {
     Router::new()
         .route("/", get(page))
         .route("/devices", get(page))
+        .route("/link", get(page))
         .route(
             "/assets/devices.css",
             get(|| async {
