@@ -84,12 +84,14 @@ pub(crate) async fn ensure(
 struct Device {
     id: String,
     fingerprint: String,
+    name: String,
 }
 
 impl From<PeerCertificate> for Device {
     fn from(peer: PeerCertificate) -> Self {
         Self {
             id: hex::encode(peer.device_id()),
+            name: crate::device_details::default_name(peer.device_id()),
             fingerprint: hex::encode(peer.fingerprint()),
         }
     }
@@ -132,6 +134,31 @@ async fn devices(
                     .approved
                     .push(member.identity().map_err(|_| Error::Internal)?.into());
             }
+        }
+    }
+    let ids: Vec<&str> = devices
+        .pending
+        .iter()
+        .chain(&devices.approved)
+        .map(|device| device.id.as_str())
+        .collect();
+    let labels: std::collections::HashMap<String, (String, String)> = tx
+        .query(
+            "SELECT encode(device_id,'hex'), encode(fingerprint,'hex'), name
+         FROM howl_control.device_details WHERE github_id=$1 AND name IS NOT NULL
+         AND device_id IN (SELECT decode(unnest($2::text[]),'hex'))",
+            &[&github, &ids],
+        )
+        .await?
+        .into_iter()
+        .map(|row| (row.get(0), (row.get(1), row.get(2))))
+        .collect();
+    for device in devices.pending.iter_mut().chain(&mut devices.approved) {
+        if let Some((fingerprint, label)) = labels.get(&device.id) {
+            if fingerprint != &device.fingerprint {
+                return Err(Error::Conflict);
+            }
+            device.name.clone_from(label);
         }
     }
     tx.commit().await?;
