@@ -18,6 +18,7 @@ mod account_network;
 mod discovery;
 mod enrollment;
 mod github;
+mod link;
 mod login;
 pub mod mailbox;
 mod mailbox_http;
@@ -115,6 +116,7 @@ impl ControlPlane {
         if self.web_origin.is_some() {
             app = app
                 .merge(web_login::routes())
+                .merge(link::routes())
                 .merge(account_network::routes())
                 .merge(account_dashboard::routes());
         }
@@ -161,6 +163,8 @@ pub async fn migrate(pool: &Pool) -> Result<()> {
         .await?;
     tx.batch_execute(include_str!("../migrations/009_account_network.sql"))
         .await?;
+    tx.batch_execute(include_str!("../migrations/010_device_links.sql"))
+        .await?;
     tx.commit().await?;
     Ok(())
 }
@@ -180,11 +184,14 @@ fn id(row: &Row, column: usize) -> Result<Id> {
 #[derive(Serialize)]
 struct AuthConfig {
     audience: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    browser_link_origin: Option<String>,
 }
 
 async fn auth_config(State(control): State<Arc<ControlPlane>>) -> Json<AuthConfig> {
     Json(AuthConfig {
         audience: hex::encode(control.audience),
+        browser_link_origin: control.web_origin.clone(),
     })
 }
 

@@ -347,15 +347,15 @@ async fn approvals_bind_the_registered_device_and_isolate_other_accounts() {
     assert_eq!(outsider.view(&server).await["state"], "legacy");
 }
 
-const WEB_ORIGIN: &str = "https://howl.test";
+pub(super) const WEB_ORIGIN: &str = "https://howl.test";
 
-struct Owner {
-    cookie: String,
+pub(super) struct Owner {
+    pub(super) cookie: String,
     http: Client,
 }
 
 impl Owner {
-    async fn sign_in(control: &ControlPlane, account: i64) -> Self {
+    pub(super) async fn sign_in(control: &ControlPlane, account: i64) -> Self {
         let mut conn = control.pool.get().await.unwrap();
         let tx = conn.transaction().await.unwrap();
         crate::account_network::ensure(control, &tx, account)
@@ -649,3 +649,6 @@ async fn account_transfer_preserves_pins_and_disables_native_decisions() {
     assert!(next.rosters.starts_with(&genesis.rosters));
     next.verify(channel).unwrap();
 }
+
+#[path = "device_links.rs"]
+mod device_links;

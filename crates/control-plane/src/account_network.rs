@@ -121,6 +121,12 @@ async fn devices(
                     .map_err(|_| Error::Internal)?;
                 devices.pending.push(peer.into());
             }
+            for peer in crate::link::pending(&tx, github).await? {
+                let linked = Device::from(peer);
+                if !devices.pending.iter().any(|entry| entry.id == linked.id) {
+                    devices.pending.push(linked);
+                }
+            }
             for member in snapshot.devices {
                 devices
                     .approved
@@ -150,24 +156,39 @@ async fn approve(
     let fingerprint = proof::decode::<32>(&request.fingerprint)?;
     let mut conn = control.pool.get().await?;
     let tx = conn.transaction().await?;
-    let network = network::hosted(&tx, github).await?.ok_or(Error::Conflict)?;
+    approve_for(&control, &tx, github, device, fingerprint).await?;
+    tx.commit().await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub(crate) async fn approve_for(
+    control: &ControlPlane,
+    tx: &Transaction<'_>,
+    github: i64,
+    device: Id,
+    fingerprint: Id,
+) -> Result<()> {
+    let network = network::hosted(tx, github).await?.ok_or(Error::Conflict)?;
     let sealed = network.signer.ok_or(Error::Conflict)?;
     let snapshot = network.snapshot.ok_or(Error::Internal)?;
+    let linked = crate::link::queue_decision(tx, github, device, fingerprint, "approved").await?;
     for member in &snapshot.devices {
         let peer = member.identity().map_err(|_| Error::Internal)?;
         if peer.device_id() == &device {
             if peer.fingerprint() != fingerprint {
                 return Err(Error::NotFound);
             }
-            tx.commit().await?;
-            return Ok(StatusCode::NO_CONTENT);
+            return Ok(());
         }
     }
     let row = tx.query_opt(
         "SELECT candidate FROM howl_control.network_requests WHERE github_id=$1 AND device_id=$2
          AND NOT denied AND expires_at > clock_timestamp()",
         &[&github, &&device[..]]
-    ).await?.ok_or(Error::NotFound)?;
+    ).await?;
+    let Some(row) = row else {
+        return if linked { Ok(()) } else { Err(Error::NotFound) };
+    };
     let candidate: Candidate = serde_json::from_value(row.get(0)).map_err(|_| Error::Internal)?;
     let peer = candidate
         .verify(&snapshot.authority, &snapshot.designation)
@@ -175,14 +196,35 @@ async fn approve(
     if peer.device_id() != &device || peer.fingerprint() != fingerprint {
         return Err(Error::NotFound);
     }
-    let secret = control.open_sealed(&signer_context(github, &network.channel), &sealed)?;
+    admit(
+        control,
+        tx,
+        github,
+        network.channel,
+        &snapshot,
+        &sealed,
+        &candidate,
+    )
+    .await?;
+    Ok(())
+}
+
+pub(crate) async fn admit(
+    control: &ControlPlane,
+    tx: &Transaction<'_>,
+    github: i64,
+    channel: Id,
+    snapshot: &Network,
+    sealed: &[u8],
+    candidate: &Candidate,
+) -> Result<()> {
+    let secret = control.open_sealed(&signer_context(github, &channel), sealed)?;
     let signer = SigningKey::from_bytes(secret.as_slice().try_into().map_err(|_| Error::Internal)?);
     let next = snapshot
-        .admit(network.channel, &signer, &candidate)
+        .admit(channel, &signer, candidate)
         .map_err(|_| Error::Conflict)?;
-    network::commit_member(&tx, github, &next, false).await?;
-    tx.commit().await?;
-    Ok(StatusCode::NO_CONTENT)
+    network::commit_member(tx, github, &next, false).await?;
+    Ok(())
 }
 
 async fn deny(
@@ -194,14 +236,7 @@ async fn deny(
     let github = web_login::owner(&control, &headers).await?;
     let mut conn = control.pool.get().await?;
     let tx = conn.transaction().await?;
-    if network::hosted(&tx, github)
-        .await?
-        .and_then(|n| n.signer)
-        .is_none()
-    {
-        return Err(Error::Conflict);
-    }
-    network::deny_device(
+    deny_for(
         &tx,
         github,
         proof::decode(&request.device)?,
@@ -210,6 +245,26 @@ async fn deny(
     .await?;
     tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+pub(crate) async fn deny_for(
+    tx: &Transaction<'_>,
+    github: i64,
+    device: Id,
+    fingerprint: Id,
+) -> Result<()> {
+    if network::hosted(tx, github)
+        .await?
+        .and_then(|n| n.signer)
+        .is_none()
+    {
+        return Err(Error::Conflict);
+    }
+    let linked = crate::link::queue_decision(tx, github, device, fingerprint, "denied").await?;
+    match network::deny_device(tx, github, device, fingerprint).await {
+        Err(Error::NotFound) if linked => Ok(()),
+        result => result,
+    }
 }
 
 #[derive(Deserialize)]
