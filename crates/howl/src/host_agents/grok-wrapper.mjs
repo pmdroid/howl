@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { lstatSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
 
-const maxLine = 256 * 1024;
+const maxPromptBytes = 16 * 1024 * 1024;
 const tools = ['search_tool', 'use_tool'];
 const mcpName = 'howl_repository';
 const names = ['read_file', 'list_directory'];
@@ -31,20 +31,27 @@ function absent(path) {
   }
 }
 
-async function* lines(stream) {
-  let pending = Buffer.alloc(0);
+async function* lines(stream, maxBytes) {
+  let parts = [];
+  let size = 0;
   for await (const chunk of stream) {
-    pending = Buffer.concat([pending, chunk]);
-    let newline;
-    while ((newline = pending.indexOf(10)) >= 0) {
-      ensure(newline <= maxLine);
-      const line = pending.subarray(0, newline);
-      pending = pending.subarray(newline + 1);
+    let start = 0;
+    while (start < chunk.length) {
+      const newline = chunk.indexOf(10, start);
+      const end = newline < 0 ? chunk.length : newline;
+      const part = chunk.subarray(start, end);
+      size += part.length;
+      if (size > maxBytes) throw new Error("Oversized frame");
+      parts.push(part);
+      if (newline < 0) break;
+      const line = Buffer.concat(parts, size).toString("utf8");
+      parts = [];
+      size = 0;
       yield JSON.parse(line);
+      start = newline + 1;
     }
-    ensure(pending.length <= maxLine);
   }
-  ensure(pending.length === 0);
+  if (size > 0) throw new Error("Incomplete frame");
 }
 
 function send(frame) {
@@ -101,7 +108,7 @@ async function readReply(turn, id, sessionId) {
     turn.child.once('close', code => resolve(code));
   });
   try {
-    for await (const event of lines(turn.child.stdout)) {
+    for await (const event of lines(turn.child.stdout, 256 * 1024)) {
       if (event.type === 'available_commands') {
         ensure(Array.isArray(event.tools) && tools.every(tool => event.tools.includes(tool)) &&
           event.tools.every(tool => registeredTools.has(tool)));
@@ -170,7 +177,7 @@ async function serve() {
       cwd: work, env, timeout: 5000, maxBuffer: 8192, encoding: 'utf8',
     });
     ensure(version.status === 0 && /^grok 1\.0\.92 \(b06756fd6256\)(?: \[stable\])?\s*$/.test(version.stdout));
-    for await (const { id, method, params } of lines(process.stdin)) {
+    for await (const { id, method, params } of lines(process.stdin, 6 * maxPromptBytes + 8192)) {
       try {
         if (method === 'initialize' && Number.isSafeInteger(params?.protocolVersion) && params.protocolVersion >= 1) {
           initialized = true;
@@ -195,11 +202,12 @@ async function serve() {
           ensure(Array.isArray(params.prompt) && params.prompt.length > 0 &&
             params.prompt.every(item => item.type === 'text' && typeof item.text === 'string'));
           const prompt = params.prompt.map(item => item.text).join('\n');
-          ensure(prompt.length > 0 && Buffer.byteLength(prompt) <= 64 * 1024);
+          ensure(prompt.length > 0 && Buffer.byteLength(prompt) <= maxPromptBytes);
           const path = join(root, 'prompt');
           writeFileSync(path, prompt, { mode: 0o600 });
           const child = spawn(grok, [
             '--no-auto-update', '--no-memory', '--no-subagents', '--disable-web-search',
+            ...(process.env.HOWL_AGENT_MODEL ? ['--model', process.env.HOWL_AGENT_MODEL] : []),
             '--permission-mode', 'dontAsk', '--tools', tools.join(','),
             ...mcpTools.flatMap(tool => ['--allow', 'MCPTool(' + tool + ')']),
             saved ? '--resume' : '--session-id', session, '--verbatim', '--output-format', 'streaming-json',

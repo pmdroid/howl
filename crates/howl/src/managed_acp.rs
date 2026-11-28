@@ -52,7 +52,7 @@ use journal::Journal;
 
 const REQUEST_LIMIT: Duration = Duration::from_secs(25);
 const CANCEL_GRACE: Duration = Duration::from_secs(2);
-const MAX_PROMPT: usize = 64 * 1024;
+pub(crate) const MAX_PROMPT: usize = 16 * 1024 * 1024;
 const MAX_ACP_MESSAGE: usize = 256 * 1024;
 
 #[derive(Debug, thiserror::Error)]
@@ -184,6 +184,17 @@ impl Harness {
         );
         harness.host = Some(host);
         harness
+    }
+
+    pub(crate) fn with_model(mut self, model: &str) -> io::Result<Self> {
+        let host = self.host.as_mut().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "model selection requires a host agent",
+            )
+        })?;
+        host.select_model(model)?;
+        Ok(self)
     }
 
     pub fn with_provider(mut self, provider: Provider, model: &str) -> Self {

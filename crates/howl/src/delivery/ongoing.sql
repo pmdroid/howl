@@ -58,3 +58,19 @@ CREATE TABLE IF NOT EXISTS ongoing_peer_parents (
     PRIMARY KEY(scope, message),
     FOREIGN KEY(scope, message) REFERENCES ongoing_peer_requests(scope, message) ON DELETE CASCADE
 ) STRICT;
+
+CREATE VIEW IF NOT EXISTS ongoing_history AS
+SELECT t.id, t.scope, c.shared, t.input, t.result, t.finished,
+       lower(hex(coalesce(c.sender, substr(s.peer, 33, 32)))) AS sender
+FROM ongoing_turns t
+JOIN ongoing_threads s ON s.scope = t.scope
+LEFT JOIN ongoing_turn_context c ON c.turn = t.id
+WHERE t.input <> '';
+
+CREATE TABLE IF NOT EXISTS ongoing_checkpoints (
+    audience BLOB NOT NULL CHECK(length(audience) = 32),
+    is_shared INTEGER NOT NULL CHECK(is_shared IN (0, 1)),
+    through_turn INTEGER NOT NULL REFERENCES ongoing_turns(id),
+    summary TEXT NOT NULL CHECK(summary <> ''),
+    PRIMARY KEY(audience, is_shared, through_turn)
+) STRICT;

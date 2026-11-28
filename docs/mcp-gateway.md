@@ -120,6 +120,24 @@ On the receiving agent, set `"shared_thread": "codex"` on each participating con
 
 Each message gets a signed direct reply linked to its message ID. Howl can run two turns per sender conversation at once. Each shared turn sees up to eight earlier turns from the group, labelled by sender. A pending turn contains its question and a null reply. Changing the group's membership, channel epoch or pinned revision starts a fresh shared history.
 
+### Select the host model and compaction threshold
+
+Each agent reads the top-level `model` and `context` fields in its own `conversations.json` at startup. Keep the existing `conversations` array. For example, the following settings pin a Codex node and give it a 332,500-token prompt budget.
+
+```json
+{
+  "model": "gpt-6.2-sol",
+  "context": {
+    "window_tokens": 475000,
+    "compact_at_percent": 70
+  }
+}
+```
+
+Set `window_tokens` to the effective input window for the selected model and subscription. `compact_at_percent` defaults to 70 and accepts 1 through 100, with a minimum resulting budget of 512 tokens. Omitting `model` uses the host's existing model selection. Omitting `context` gives shared threads a 16,384-token fallback window and preserves native session reuse for private conversations.
+
+Before each context-managed turn Howl measures the serialized prompt with the local `o200k_base` tokenizer. This estimates the input for providers that use other tokenizers. The provider can add its own instructions and tool definitions. Above the configured threshold, Howl asks the selected model to summarize older completed exchanges. It stores that summary in the conversation's delivery database and keeps the original transcript. Current and pending questions stay verbatim. Each context-managed turn starts a fresh ACP session with the assembled prompt, so the native session cannot add a second copy of earlier turns.
+
 ### Run an isolated worker
 
 Install an ARM64 QEMU binary with HVF or KVM. Create a mode `600` file named `microvm.json` in the agent's state directory with absolute paths to the QEMU binary, a Linux kernel and a trusted initramfs. Set `memory_mib` and `vcpus` for each worker. To make model calls through Howl's guest provider bridge, add `provider` with the `provider` name (`openai` or `xai`) and `model`, and set the corresponding provider key in the host runner's environment.

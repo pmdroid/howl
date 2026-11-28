@@ -49,12 +49,17 @@ const forbidden = new Set([
   "--", "--add-dir", "--agent", "--agents", "--bare",
   "--plugin-dir", "--plugin-url", "--sdk-url", "--tmux", "--worktree", "-w",
 ]);
+const model = process.env.HOWL_AGENT_MODEL;
 const args = [];
 for (let index = 0; index < request.length; index++) {
   const arg = request[index];
   const flag = arg.split("=", 1)[0];
   if (forbidden.has(flag)) refuse("Claude Code received an unsafe session option.");
   if (flag === "--dangerously-skip-permissions" || flag === "--allow-dangerously-skip-permissions") continue;
+  if (model && ["--model", "--fallback-model"].includes(flag)) {
+    if (arg === flag) index++;
+    continue;
+  }
   if (["--setting-sources", "--settings", "--permission-mode"].includes(flag)) {
     if (arg === flag) index++;
     continue;
@@ -79,6 +84,7 @@ const work = process.env.HOWL_WORK_TOOLS === "1";
 const tools = ["read_file", "list_directory"];
 if (editable) tools.push("write_file", "delete_file", "run_tests");
 if (work) tools.push("start_work", "send_peer");
+if (model) args.push("--model", model);
 args.push(
   "--restricted", "--strict-mcp-config", "--tools", "", "--permission-mode", editable || work ? "default" : "plan",
   "--allowedTools", ...tools.map(name => "mcp__howl_repository__" + name),
