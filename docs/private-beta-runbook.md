@@ -34,6 +34,27 @@ source "$beta_compose_environment"
 docker compose -f deploy/private-beta/compose.yaml -f deploy/private-beta/compose.docker.yaml down
 ```
 
+### Enable GitHub sign-in for the local beta
+
+Create a dedicated GitHub OAuth app with device flow enabled. Store its client ID and client secret in separate files named `client-id` and `client-secret` in `~/.local/share/howl/github-oauth`. Give the directory mode `0700` and both files mode `0600`. Howl uses the secret to revoke the GitHub grant after reading the account ID. [GitHub OAuth app setup](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/creating-an-oauth-app)
+
+Use the Compose environment and API URL printed by the kept rehearsal. The override mounts the two credential files in the API container.
+
+```sh
+source "$beta_compose_environment"
+export HOWL_BETA_GITHUB_OAUTH_DIR="$HOME/.local/share/howl/github-oauth"
+docker compose -f deploy/private-beta/compose.yaml -f deploy/private-beta/compose.docker.yaml \
+  -f deploy/private-beta/compose.github.yaml up -d --no-deps api
+export HOWL_CONTROL_URL="$api_url"
+export HOWL_CONTROL_AUDIENCE
+HOWL_CONTROL_AUDIENCE=$(cat "$HOWL_BETA_PRIVATE_DIR/audience")
+howl control login "$device_state"
+```
+
+The device prints a GitHub verification URL and one-time code. After consent it saves a Howl session bound to its signing key. Include the GitHub override when recreating this API.
+
+### Verify the native API and mailbox
+
 Run without `HOWL_BETA_KEEP` for a clean rehearsal on disposable volumes. For the native API diagnostic and the separate mock GitHub device-flow test, build the host control-plane binary and use the following command.
 
 ```sh
