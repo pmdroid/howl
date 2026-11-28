@@ -1,3 +1,5 @@
+mod device_link;
+
 use std::{
     env, io,
     net::IpAddr,
@@ -103,20 +105,47 @@ pub async fn login(state: &Path) -> io::Result<()> {
     login_device(state, false).await
 }
 
-pub(crate) async fn login_device(state: &Path, join_network: bool) -> io::Result<()> {
-    let identity = LocalIdentity::load_or_create(state)?;
-    let state = StateDirectory::open(state)?;
+pub(crate) async fn login_device(path: &Path, join_network: bool) -> io::Result<()> {
+    let identity = LocalIdentity::load_or_create(path)?;
+    let state = StateDirectory::open(path)?;
     let _lock = crate::identity::retry_state_lock(|| state.lock(LOCK)).await?;
     let existing = load(&state)?;
-    let service = Service::for_login(existing.as_ref()).await?;
-    if let Some(existing) = &existing
-        && (existing.origin != service.origin.as_str()
-            || parse_id(&existing.audience)? != service.audience)
-    {
-        return Err(io::Error::other(
-            "local control credentials belong to a different hosted service",
-        ));
+    let (service, browser) = Service::for_login(existing.as_ref()).await?;
+    if let Some(stored) = &existing {
+        validate(&stored.credentials, &identity)?;
+        match service.resume_login(&state, &identity, stored).await {
+            Ok(()) => {
+                println!("Device is already signed in.");
+                return Ok(());
+            }
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {}
+            Err(error) => return Err(error),
+        }
     }
+    let previous_owner = existing
+        .as_ref()
+        .map(|stored| stored.credentials.session.github_id);
+    let credentials = if let Some(origin) = browser {
+        if !join_network {
+            return Err(io::Error::other(
+                "Use a fresh device state directory to link this machine to an account-managed network.",
+            ));
+        }
+        device_link::login(&service, &identity, path, origin, previous_owner).await?
+    } else {
+        github_device_login(&service, &identity, join_network).await?
+    };
+    validate_login(&credentials, &identity, previous_owner)?;
+    save(&state, &service, credentials)?;
+    println!("Howl sign-in complete.");
+    Ok(())
+}
+
+async fn github_device_login(
+    service: &Service,
+    identity: &LocalIdentity,
+    join_network: bool,
+) -> io::Result<Credentials> {
     let certificate = identity.certificate();
     let request = serde_json::json!({
         "device_id": hex::encode(certificate.device_id()),
@@ -170,7 +199,7 @@ pub(crate) async fn login_device(state: &Path, join_network: bool) -> io::Result
         }
         tokio::time::sleep(delay).await;
         let challenge = service.challenge("poll", None, Some(&login.login)).await?;
-        let proof = service.proof(&identity, subject, "poll", challenge, None, b"")?;
+        let proof = service.proof(identity, subject, "poll", challenge, None, b"")?;
         let response = service
             .json(&format!("/v1/login/device/{}/poll", login.login), &proof)?
             .send()
@@ -187,19 +216,7 @@ pub(crate) async fn login_device(state: &Path, join_network: bool) -> io::Result
         {
             Poll::Pending { interval: next } if (1..=900).contains(&next) => interval = next,
             Poll::Pending { .. } => return Err(refused()),
-            Poll::Verified { credentials } => {
-                validate(&credentials, &identity)?;
-                if existing.as_ref().is_some_and(|prior| {
-                    prior.credentials.session.github_id != credentials.session.github_id
-                }) {
-                    return Err(io::Error::other(
-                        "This device profile is linked to a different GitHub account.",
-                    ));
-                }
-                save(&state, &service, credentials)?;
-                println!("GitHub login complete.");
-                return Ok(());
-            }
+            Poll::Verified { credentials } => return Ok(credentials),
         }
     }
 }
@@ -267,18 +284,7 @@ impl ControlClient {
         let service = Service::new(&stored.origin, parse_id(&stored.audience)?)?;
         validate(&stored.credentials, &identity)?;
         if stored.access_expires <= node::unix_time()?.saturating_add(15) {
-            let token = &stored.credentials.refresh_token;
-            let nonce = service.challenge("refresh", Some(token), None).await?;
-            let subject = parse_id(&stored.credentials.session.id)?;
-            let proof = service.proof(&identity, subject, "refresh", nonce, Some(token), b"")?;
-            let credentials: Credentials = service
-                .decode(service.json("/v1/auth/refresh", &proof)?.bearer_auth(token))
-                .await?;
-            validate(&credentials, &identity)?;
-            if credentials.session != stored.credentials.session {
-                return Err(refused());
-            }
-            stored = save(&state, &service, credentials)?;
+            stored = service.refresh_stored(&state, &identity, &stored).await?;
         }
         Ok(Self {
             service,
@@ -353,27 +359,106 @@ impl Service {
         )
     }
 
-    async fn for_login(existing: Option<&Stored>) -> io::Result<Self> {
-        let origin = configured("HOWL_CONTROL_URL")?;
-        match env::var("HOWL_CONTROL_AUDIENCE") {
-            Ok(audience) => return Self::new(&origin, parse_id(&audience)?),
+    async fn resume_login(
+        &self,
+        state: &StateDirectory,
+        identity: &LocalIdentity,
+        stored: &Stored,
+    ) -> io::Result<()> {
+        if stored.access_expires <= node::unix_time()?.saturating_add(15) {
+            self.refresh_stored(state, identity, stored).await?;
+            return Ok(());
+        }
+        let token = &stored.credentials.access_token;
+        let nonce = self.challenge("session", Some(token), None).await?;
+        let proof = self.proof(
+            identity,
+            parse_id(&stored.credentials.session.id)?,
+            "session",
+            nonce,
+            Some(token),
+            b"",
+        )?;
+        let session: PendingSession = self
+            .decode(
+                self.http
+                    .get(self.endpoint("/v1/auth/session")?)
+                    .bearer_auth(token)
+                    .header("howl-nonce", proof.nonce)
+                    .header("howl-signature", proof.signature),
+            )
+            .await?;
+        if session != stored.credentials.session {
+            return Err(refused());
+        }
+        Ok(())
+    }
+
+    async fn refresh_stored(
+        &self,
+        state: &StateDirectory,
+        identity: &LocalIdentity,
+        stored: &Stored,
+    ) -> io::Result<Stored> {
+        let token = &stored.credentials.refresh_token;
+        let nonce = self.challenge("refresh", Some(token), None).await?;
+        let subject = parse_id(&stored.credentials.session.id)?;
+        let proof = self.proof(identity, subject, "refresh", nonce, Some(token), b"")?;
+        let credentials: Credentials = self
+            .decode(self.json("/v1/auth/refresh", &proof)?.bearer_auth(token))
+            .await?;
+        validate(&credentials, identity)?;
+        if credentials.session != stored.credentials.session {
+            return Err(refused());
+        }
+        save(state, self, credentials)
+    }
+
+    async fn for_login(existing: Option<&Stored>) -> io::Result<(Self, Option<Url>)> {
+        let (origin, http) = Self::connection(&configured("HOWL_CONTROL_URL")?)?;
+        if existing.is_some_and(|stored| stored.origin != origin.as_str()) {
+            return Err(io::Error::other(
+                "Local credentials belong to a different control plane.",
+            ));
+        }
+        let pinned = match env::var("HOWL_CONTROL_AUDIENCE") {
+            Ok(audience) => Some(parse_id(&audience)?),
             Err(env::VarError::NotUnicode(_)) => return Err(configuration()),
-            Err(env::VarError::NotPresent) => {}
+            Err(env::VarError::NotPresent) => None,
+        };
+        let previous = existing
+            .map(|stored| parse_id(&stored.audience))
+            .transpose()?;
+        if previous.zip(pinned).is_some_and(|(a, b)| a != b) {
+            return Err(configuration());
         }
-        if let Some(existing) = existing {
-            return Self::new(&origin, parse_id(&existing.audience)?);
-        }
-        let (origin, http) = Self::connection(&origin)?;
+        let expected = pinned.or(previous);
         let url = origin
             .join("/v1/auth/config")
             .map_err(|_| configuration())?;
         let response = http.get(url).send().await.map_err(|_| refused())?;
+        if response.status() == StatusCode::NOT_FOUND
+            && let Some(audience) = expected
+        {
+            return Ok((Self::from_parts(origin, http, audience)?, None));
+        }
         #[derive(Deserialize)]
         struct PublicConfig {
             audience: String,
+            browser_link_origin: Option<String>,
         }
-        let config: PublicConfig = serde_json::from_slice(&read_response(response, 256).await?)?;
-        Self::from_parts(origin, http, parse_id(&config.audience)?)
+        let config: PublicConfig =
+            serde_json::from_slice(&read_response(response, 1024).await?).map_err(|_| refused())?;
+        let audience = parse_id(&config.audience)?;
+        if expected.is_some_and(|pinned| pinned != audience) {
+            return Err(io::Error::other("The control plane audience has changed."));
+        }
+        let browser = config
+            .browser_link_origin
+            .as_deref()
+            .map(device_link::browser_origin)
+            .transpose()?;
+        Ok((Self::from_parts(origin, http, audience)?, browser))
     }
 
     fn new(origin: &str, audience: Id) -> io::Result<Self> {
@@ -499,6 +584,12 @@ pub async fn read_response(
     mut response: Response,
     maximum: usize,
 ) -> io::Result<Zeroizing<Vec<u8>>> {
+    if response.status() == StatusCode::UNAUTHORIZED {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "The control plane rejected the device credentials.",
+        ));
+    }
     if !response.status().is_success() {
         return Err(refused());
     }
@@ -536,6 +627,20 @@ fn save(
     let bytes = Zeroizing::new(serde_json::to_vec(&stored)?);
     directory.replace(CREDENTIALS, &bytes)?;
     Ok(stored)
+}
+
+fn validate_login(
+    credentials: &Credentials,
+    identity: &LocalIdentity,
+    previous_owner: Option<i64>,
+) -> io::Result<()> {
+    validate(credentials, identity)?;
+    if previous_owner.is_some_and(|id| id != credentials.session.github_id) {
+        return Err(io::Error::other(
+            "This device profile is linked to a different GitHub account.",
+        ));
+    }
+    Ok(())
 }
 
 fn validate(credentials: &Credentials, identity: &LocalIdentity) -> io::Result<()> {
