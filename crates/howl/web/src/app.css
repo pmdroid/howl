@@ -76,6 +76,22 @@ dd { margin: 0 0 .6rem; }
 .error, .notice { border: 1px solid; padding: .65rem .8rem; border-radius: 5px; margin-bottom: .8rem; overflow-wrap: anywhere; }
 .error { color: #792d26; background: #fae9e4; }
 .notice { color: #245540; background: #e0eee3; }
+.approvals { width: min(100%, 54rem); margin: 0 auto; padding: clamp(1.5rem, 5vw, 3.5rem) clamp(1rem, 4vw, 2rem); }
+.approvals h1 { margin-bottom: 1.8rem; }
+.approvals h2 { margin-bottom: .4rem; }
+.approval-help, .approval-empty { line-height: 1.5; color: var(--muted); }
+.approval-empty { padding-block: .8rem; border-top: 1px solid var(--line); }
+.device-requests { list-style: none; padding: 0; margin: 1rem 0 0; }
+.device-requests li { padding: 1.25rem; border-block-start: 1px solid var(--line); background: var(--paper); }
+.device-requests li:last-child { border-block-end: 1px solid var(--line); }
+.device-identity { margin: 0; }
+.approval-help + .device-identity { margin-top: 1.25rem; }
+.device-identity dt { color: var(--muted); font-size: .85rem; }
+.device-identity dd { margin: .25rem 0 0; overflow-wrap: anywhere; }
+.device-identity dd + dt { margin-top: .8rem; }
+.fingerprint code { display: flex; flex-wrap: wrap; gap: .2rem .7ch; font-size: 1rem; line-height: 1.5; }
+.device-id { font-size: .88rem; }
+.device-actions { display: flex; gap: .6rem; margin-top: 1.25rem; }
 @media (max-width: 680px) {
   .layout { grid-template-columns: minmax(0, 1fr); }
   .sidebar { border-right: 0; border-bottom: 1px solid var(--line); padding-block: 1rem; }
