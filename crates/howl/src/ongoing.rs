@@ -58,6 +58,8 @@ struct Conversation {
     revision: String,
     #[serde(default)]
     work: bool,
+    #[serde(skip)]
+    work_policy: Option<Id>,
     #[serde(default)]
     work_control_from: Vec<String>,
     #[serde(default)]
@@ -226,6 +228,30 @@ where
         .then(|| crate::microvm::Profile::load(state))
         .transpose()?;
     let identity = LocalIdentity::load_or_create(state)?;
+    let mut work_policies = Vec::new();
+    for (conversation, origin) in &mut conversations {
+        if let Some(guest) = microvm.as_ref().filter(|_| conversation.work) {
+            let binding = serde_json::to_vec(&(
+                "howl/work-policy/v1",
+                identity.certificate().device_id(),
+                profile,
+                conversation.channel,
+                conversation.peer,
+                origin,
+                &conversation.repository,
+                &conversation.revision,
+                &conversation.work_control_from,
+                guest,
+            ))
+            .map_err(io::Error::other)?;
+            let policy = Id::from(Sha256::digest(binding));
+            conversation.work_policy = Some(policy);
+            work_policies.push(policy);
+        }
+    }
+    node::open_delivery(state, &directory, &identity.certificate())?
+        .recover_work(&work_policies)
+        .map_err(io::Error::other)?;
     ManagedSession::reap_observers(&state.join("ongoing-acp"), &observer)
         .map_err(io::Error::other)?;
     let context = Arc::new(AgentContext {
@@ -536,6 +562,7 @@ where
                     context.state.clone(),
                     thread,
                     conversation,
+                    &snapshot,
                     context.sending_peer.clone(),
                 ));
             }

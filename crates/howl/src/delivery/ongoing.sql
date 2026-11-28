@@ -36,6 +36,12 @@ CREATE TABLE IF NOT EXISTS ongoing_work (
     reported INTEGER NOT NULL DEFAULT 0,
     UNIQUE (scope, request_key)
 ) STRICT;
+CREATE TABLE IF NOT EXISTS ongoing_work_grants (
+    run BLOB PRIMARY KEY REFERENCES ongoing_work(id),
+    policy BLOB NOT NULL CHECK (length(policy) = 32),
+    revision TEXT NOT NULL,
+    selection BLOB NOT NULL CHECK (length(selection) = 32)
+) STRICT;
 CREATE TABLE IF NOT EXISTS ongoing_peer_requests (
     scope BLOB NOT NULL REFERENCES ongoing_threads(scope),
     message BLOB NOT NULL,

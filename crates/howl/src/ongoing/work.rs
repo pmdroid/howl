@@ -2,14 +2,17 @@ use serde_json::Value;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use super::*;
-use crate::{delivery::Work, microvm::Guest};
+use crate::{
+    delivery::{Work, WorkGrant},
+    microvm::Guest,
+};
 
 const LIMIT: Duration = Duration::from_secs(900);
 
 pub(crate) struct WorkTools {
     state: PathBuf,
     thread: OngoingThread,
-    can_start: bool,
+    grant: Option<WorkGrant>,
     peers: Vec<AgentPeer>,
     asking_turn: AtomicI64,
     sending_peer: Arc<tokio::sync::Mutex<()>>,
@@ -36,12 +39,17 @@ impl WorkTools {
         state: PathBuf,
         thread: OngoingThread,
         conversation: &Conversation,
+        snapshot: &Snapshot,
         sending_peer: Arc<tokio::sync::Mutex<()>>,
     ) -> Arc<Self> {
         Arc::new(Self {
             state,
             thread,
-            can_start: conversation.work,
+            grant: conversation.work_policy.map(|policy| WorkGrant {
+                policy,
+                commit: snapshot.commit().to_owned(),
+                selection: snapshot.selection(),
+            }),
             peers: conversation.peers.clone(),
             asking_turn: AtomicI64::new(0),
             sending_peer,
@@ -64,16 +72,16 @@ impl WorkTools {
 
     pub(crate) async fn call(&self, tool: &str, arguments: Value) -> io::Result<String> {
         let turn = self.asking_turn.load(Ordering::Acquire);
-        match tool {
-            "start_work" if self.can_start => {
-                self.start(arguments).map(|id| format!("Work {id} queued."))
-            }
-            "send_peer" if turn > 0 => self.send_peer(arguments, turn).await,
+        match (tool, &self.grant) {
+            ("start_work", Some(grant)) => self
+                .start(arguments, grant)
+                .map(|id| format!("Work {id} queued.")),
+            ("send_peer", _) if turn > 0 => self.send_peer(arguments, turn).await,
             _ => Err(io::ErrorKind::PermissionDenied.into()),
         }
     }
 
-    fn start(&self, arguments: Value) -> io::Result<String> {
+    fn start(&self, arguments: Value, grant: &WorkGrant) -> io::Result<String> {
         let request: StartWork = serde_json::from_value(arguments).map_err(io::Error::other)?;
         if request.request_key.is_empty()
             || request.request_key.len() > 64
@@ -92,6 +100,7 @@ impl WorkTools {
                 self.thread.scope,
                 &request.request_key,
                 &request.instruction,
+                grant,
             )
             .map_err(io::Error::other)?;
         Ok(hex::encode(id))
@@ -234,7 +243,9 @@ where
     let directory = StateDirectory::open(&context.state)?;
     let mut delivery =
         node::open_delivery(&context.state, &directory, &context.identity.certificate())?;
-    let mut scope = None;
+    let policy = conversation
+        .work_policy
+        .ok_or(io::ErrorKind::PermissionDenied)?;
     let mut tick = interval(TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -247,14 +258,8 @@ where
             Err(error) if error.kind() == io::ErrorKind::PermissionDenied => continue,
             Err(error) => return Err(error),
         };
-        if scope != Some(thread.scope) {
-            delivery
-                .recover_work(thread.scope)
-                .map_err(io::Error::other)?;
-            scope = Some(thread.scope);
-        }
         let Some(work) = delivery
-            .claim_work(thread.scope)
+            .claim_work(thread.scope, policy)
             .map_err(io::Error::other)?
         else {
             continue;
@@ -273,18 +278,28 @@ where
         );
         let result = tokio::select! {
             _ = stopping.changed() => return Ok(()),
-            result = timeout(LIMIT, job) => result.map_err(io::Error::other).and_then(|outcome| outcome),
-        };
-        let id = hex::encode(work.id);
-        let (status, result) = match result {
-            Ok(reply) => ("completed", format!("Work {id} completed. {reply}")),
-            Err(error) => {
-                eprintln!("Howl microVM work {id} ended. {error}");
-                ("failed", format!("Work {id} ended before completion."))
-            }
+            result = timeout(Duration::from_secs(work.remaining), job) => result.map_err(io::Error::other).and_then(|outcome| outcome),
         };
         delivery
-            .finish_work(work.id, status, &result)
+            .finish_work(work.id, || {
+                let (reply, patch) = result?;
+                if !allowed() {
+                    return Err(io::ErrorKind::PermissionDenied.into());
+                }
+                if patch.is_empty() {
+                    return Ok(reply);
+                }
+                let name = format!("{}.patch", hex::encode(work.id));
+                if !StateDirectory::open(&context.state.join("worker-patches"))?
+                    .write(&name, &patch)?
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "worker patch already exists",
+                    ));
+                }
+                Ok(format!("{reply}\nPatch {name}"))
+            })
             .map_err(io::Error::other)?;
     }
 }
@@ -296,9 +311,12 @@ async fn execute(
     work: &Work,
     delivery: &mut DeliveryStore,
     allowed: impl Fn() -> bool,
-) -> io::Result<String> {
-    let snapshot = Snapshot::from_repository(&conversation.repository, &conversation.revision)
+) -> io::Result<(String, Vec<u8>)> {
+    let snapshot = Snapshot::from_repository(&conversation.repository, &work.commit)
         .map_err(io::Error::other)?;
+    if snapshot.selection() != work.selection {
+        return Err(io::ErrorKind::PermissionDenied.into());
+    }
     let boot = Guest::start(state, profile, snapshot);
     tokio::pin!(boot);
     let mut tick = interval(TICK);
@@ -341,21 +359,7 @@ async fn execute(
             break result?;
         }
     };
-    let patch = guest.finish().await?;
-    if !allowed() {
-        return Err(io::ErrorKind::PermissionDenied.into());
-    }
-    if patch.is_empty() {
-        return Ok(reply);
-    }
-    let name = format!("{}.patch", hex::encode(work.id));
-    if !StateDirectory::open(&state.join("worker-patches"))?.write(&name, &patch)? {
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "worker patch already exists",
-        ));
-    }
-    Ok(format!("{reply}\nPatch {name}"))
+    Ok((reply, guest.finish().await?))
 }
 
 fn control(
