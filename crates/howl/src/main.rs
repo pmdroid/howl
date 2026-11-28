@@ -40,6 +40,9 @@ async fn main() -> ExitCode {
         [group, action, state, driver, image] if group == "agent" && action == "serve" => {
             serve_agent(Path::new(state), driver, image).await
         }
+        [group, action, state] if group == "worker" && action == "check" => {
+            howl::microvm::check(Path::new(state))
+        }
         [group, action, state, repo, revision] if group == "worker" && action == "run" => {
             run_worker(Path::new(state), Path::new(repo), revision).await
         }
