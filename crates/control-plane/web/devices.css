@@ -56,3 +56,5 @@ li dd + dt { margin-top: .6rem; }
 .fingerprint code { display: flex; flex-wrap: wrap; gap: .1rem .7ch; font-size: 1rem; }
 .actions { margin-top: 1rem; }
 summary { cursor: pointer; font-weight: 600; padding: .6rem 0; }
+
+#leave-link:not([hidden]) { display: inline-block; margin-top: 1.5rem; color: var(--green); text-underline-offset: .15em; }
