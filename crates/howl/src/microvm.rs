@@ -1,9 +1,6 @@
 use std::{
-    fs::Permissions,
     io,
-    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
-    process::Stdio,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -12,11 +9,10 @@ use std::{
 };
 
 use serde::Deserialize;
-use serde_json::json;
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, BufReader},
-    net::{UnixListener, UnixStream},
-    process::{Child, ChildStdin, Command},
+    io::AsyncReadExt,
+    net::UnixStream,
+    process::{Child, ChildStdin},
     task::JoinHandle,
     time::timeout,
 };
@@ -28,28 +24,10 @@ use crate::{
     provider_broker::{Broker, Provider},
 };
 
-const BOOT: Duration = Duration::from_secs(60);
+mod qemu;
+
 const RUN_LIMIT: Duration = Duration::from_secs(900);
 pub(crate) const PATCH_LIMIT: usize = 4 * 1024 * 1024;
-const WATCH_OWNER: &str = r#"
-exec 3<&0
-"$@" </dev/null >/dev/null 3<&- &
-machine=$!
-printf '%s\n' "$machine"
-(
-    IFS= read -r unused <&3 || :
-    kill -KILL "$machine" 2>/dev/null
-) &
-watcher=$!
-wait "$machine"
-status=$?
-kill "$watcher" 2>/dev/null || :
-wait "$watcher" 2>/dev/null || :
-/bin/rm -f ./repo.tar ./acp ./patch ./provider
-if [ . -ef "$PWD" ]; then /bin/rmdir "$PWD" 2>/dev/null || :; fi
-exit "$status"
-"#;
-
 #[derive(Clone, Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Profile {
@@ -94,8 +72,7 @@ pub(crate) struct Guest {
     repository: PathBuf,
     pub session: ManagedSession,
     patch: UnixStream,
-    process: Child,
-    owner: Option<ChildStdin>,
+    _process: SandboxProcess,
     broker: Option<JoinHandle<io::Result<()>>>,
     rejected_subagent: Option<Arc<AtomicBool>>,
 }
@@ -105,9 +82,30 @@ impl Drop for Guest {
         if let Some(broker) = &self.broker {
             broker.abort();
         }
+    }
+}
+
+struct BootedSandbox {
+    acp: UnixStream,
+    patch: UnixStream,
+    inference: Option<UnixStream>,
+    process: SandboxProcess,
+}
+
+struct SandboxProcess {
+    process: Child,
+    owner: Option<ChildStdin>,
+}
+
+impl Drop for SandboxProcess {
+    fn drop(&mut self) {
         drop(self.owner.take());
         let _ = self.process.start_kill();
     }
+}
+
+trait SandboxProvider {
+    async fn boot(&self, snapshot: Snapshot, inference: bool) -> io::Result<BootedSandbox>;
 }
 
 impl Guest {
@@ -116,16 +114,7 @@ impl Guest {
         profile: &Profile,
         snapshot: Snapshot,
     ) -> io::Result<Self> {
-        let accelerator = match (std::env::consts::OS, std::env::consts::ARCH) {
-            ("macos", "aarch64") => "hvf",
-            ("linux", "aarch64") => "kvm",
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "microVM workers require ARM64 with HVF or KVM",
-                ));
-            }
-        };
+        let sandbox = qemu::Qemu::new(profile)?;
         let broker = match &profile.provider {
             Some(inference) => {
                 if inference.provider == "chatgpt_plan" {
@@ -167,117 +156,28 @@ impl Guest {
             }
             None => None,
         };
-        let directory = tempfile::Builder::new()
-            .prefix("howl-vm-")
-            .permissions(Permissions::from_mode(0o700))
-            .tempdir_in("/tmp")?;
-        let archive = directory.path().join("repo.tar");
-        snapshot.archive(&archive)?;
         let repository = snapshot.repository().to_owned();
         let commit = snapshot.commit().to_owned();
         let selection = snapshot.selection();
-        drop(snapshot);
-        let mut command = Command::new("/bin/sh");
-        command
-            .args(["-c", WATCH_OWNER, "howl-microvm"])
-            .arg(&profile.qemu);
-        command
-            .env_clear()
-            .current_dir(directory.path())
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .args([
-                "-no-user-config",
-                "-nodefaults",
-                "-no-reboot",
-                "-display",
-                "none",
-                "-monitor",
-                "none",
-                "-serial",
-                "none",
-                "-nic",
-                "none",
-            ])
-            .args(["-machine", "virt", "-accel", accelerator, "-cpu", "host"])
-            .arg("-m")
-            .arg(profile.memory_mib.to_string())
-            .arg("-smp")
-            .arg(profile.vcpus.to_string())
-            .arg("-kernel")
-            .arg(&profile.kernel)
-            .arg("-initrd")
-            .arg(&profile.initramfs)
-            .args([
-                "-append",
-                "rdinit=/init quiet panic=1",
-                "-device",
-                "virtio-serial-device,id=howl",
-            ])
-            .arg("-blockdev")
-            .arg(
-                json!({ "driver": "raw", "node-name": "repository", "read-only": true,
-                "file": { "driver": "file", "filename": archive } })
-                .to_string(),
-            )
-            .args(["-device", "virtio-blk-device,drive=repository"]);
-        let acp = port(&mut command, directory.path(), "acp", 1)?;
-        let patch = port(&mut command, directory.path(), "patch", 2)?;
-        let inference = broker
-            .map(|broker| {
-                port(&mut command, directory.path(), "provider", 3).map(|port| (broker, port))
-            })
-            .transpose()?;
-        let mut process = command.spawn()?;
-        let owner = process
-            .stdin
-            .take()
-            .ok_or_else(|| io::Error::other("microVM owner pipe unavailable"))?;
-        let launcher = process
-            .stdout
-            .take()
-            .ok_or_else(|| io::Error::other("missing QEMU PID pipe"))?;
-        let connect = async {
-            let mut pid = String::new();
-            BufReader::new(launcher.take(32))
-                .read_line(&mut pid)
-                .await?;
-            let pid = pid.trim_end().parse::<i32>().map_err(io::Error::other)?;
-            let mut acp = accept_vm(&acp, pid).await?;
-            let patch = accept_vm(&patch, pid).await?;
-            let broker = if let Some((broker, port)) = inference {
-                let link = accept_vm(&port, pid).await?;
-                Some((broker, link))
-            } else {
-                None
-            };
-            let mut ready = [0; 15];
-            acp.read_exact(&mut ready).await?;
-            if &ready != b"HOWL_ACP_READY\n" {
-                return Err(io::Error::other("invalid microVM ACP greeting"));
-            }
-            Ok((acp, patch, broker))
-        };
-        let (link, patch, broker) = tokio::select! {
-            result = timeout(BOOT, connect) => result.map_err(io::Error::other)??,
-            _ = process.wait() => return Err(io::Error::other("microVM exited during startup")),
-        };
-        directory.close()?;
+        let BootedSandbox {
+            acp,
+            patch,
+            inference,
+            process,
+        } = sandbox.boot(snapshot, broker.is_some()).await?;
+        let broker = broker.zip(inference);
         let rejected_subagent = broker
             .as_ref()
             .map(|(broker, _)| broker.rejected_subagent.clone());
         let broker = broker.map(|(broker, link)| tokio::spawn(broker.serve_guest(link)));
-        let session = ManagedSession::guest(&state.join("worker-acp"), commit, selection, link)
+        let session = ManagedSession::guest(&state.join("worker-acp"), commit, selection, acp)
             .await
             .map_err(io::Error::other)?;
         Ok(Self {
             repository,
             session,
             patch,
-            process,
-            owner: Some(owner),
+            _process: process,
             rejected_subagent,
             broker,
         })
@@ -328,36 +228,6 @@ impl Guest {
     }
 }
 
-async fn accept_vm(listener: &UnixListener, pid: i32) -> io::Result<UnixStream> {
-    loop {
-        let (link, _) = listener.accept().await?;
-        if link.peer_cred()?.pid() == Some(pid) {
-            return Ok(link);
-        }
-    }
-}
-
-fn port(
-    command: &mut Command,
-    directory: &Path,
-    name: &str,
-    number: u8,
-) -> io::Result<UnixListener> {
-    let socket = directory.join(name);
-    let listener = UnixListener::bind(&socket)?;
-    command
-        .arg("-chardev")
-        .arg(format!(
-            "socket,id={name},path={},server=off",
-            socket.display()
-        ))
-        .arg("-device")
-        .arg(format!(
-            "virtserialport,bus=howl.0,nr={number},chardev={name},name=howl.{name}"
-        ));
-    Ok(listener)
-}
-
 async fn read_patch(patch: &mut UnixStream) -> io::Result<Vec<u8>> {
     let mut size = [0; 8];
     patch.read_exact(&mut size).await?;
@@ -370,6 +240,17 @@ async fn read_patch(patch: &mut UnixStream) -> io::Result<Vec<u8>> {
     let mut bytes = vec![0; size];
     patch.read_exact(&mut bytes).await?;
     Ok(bytes)
+}
+
+pub fn check(state: &Path) -> io::Result<()> {
+    let profile = Profile::load(state)?;
+    let provider = qemu::Qemu::new(&profile)?;
+    println!("Configured QEMU accelerator: {}", provider.accelerator());
+    println!(
+        "Guest resources: {} MiB, {} vCPU",
+        profile.memory_mib, profile.vcpus
+    );
+    Ok(())
 }
 
 pub async fn run(state: &Path, repo: &Path, revision: &str, text: String) -> io::Result<()> {
@@ -407,52 +288,5 @@ mod tests {
             .await
             .unwrap();
         assert!(read_patch(&mut host).await.is_err());
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[tokio::test]
-    async fn serial_connections_require_the_expected_process() {
-        let pair = tempfile::tempdir().unwrap();
-        let socket = pair.path().join("acp");
-        let listener = UnixListener::bind(&socket).unwrap();
-        let pid = i32::try_from(std::process::id()).unwrap();
-        let _other = UnixStream::connect(&socket).await.unwrap();
-        assert!(
-            timeout(Duration::from_millis(100), accept_vm(&listener, pid + 1))
-                .await
-                .is_err()
-        );
-        let _expected = UnixStream::connect(&socket).await.unwrap();
-        accept_vm(&listener, pid).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn owner_pipe_outlives_startup_polling_and_stops_the_guest_on_close() {
-        let parent = tempfile::tempdir().unwrap();
-        let runtime = parent.path().join("runtime");
-        std::fs::create_dir(&runtime).unwrap();
-        std::fs::write(runtime.join("repo.tar"), "synthetic snapshot").unwrap();
-        let mut process = Command::new("/bin/sh")
-            .current_dir(&runtime)
-            .args(["-c", WATCH_OWNER, "howl-watchdog-test", "/bin/sleep", "20"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap();
-        let owner = process.stdin.take().unwrap();
-        assert!(
-            timeout(Duration::from_millis(150), process.wait())
-                .await
-                .is_err()
-        );
-        drop(owner);
-        let status = timeout(Duration::from_secs(3), process.wait())
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(!status.success());
-        assert!(!runtime.exists());
     }
 }
