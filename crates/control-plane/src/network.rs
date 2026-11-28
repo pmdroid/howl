@@ -173,12 +173,17 @@ async fn read(State(control): State<Arc<ControlPlane>>, headers: HeaderMap) -> R
             view.pending = pending(&tx, session.github_id).await?;
         } else if view.state == "pending" {
             let device: Id = proof::decode(&session.device_id)?;
-            if let Some(row) = tx.query_opt(
+            let denied_peer = if let Some(row) = tx.query_opt(
                 "SELECT candidate FROM howl_control.network_requests WHERE github_id = $1 AND device_id = $2 AND denied",
                 &[&session.github_id, &&device[..]],
             ).await? {
                 let candidate: Candidate = serde_json::from_value(row.get(0)).map_err(|_| Error::Internal)?;
-                if !matches(&session, &candidate.identity().map_err(|_| Error::Internal)?)? {
+                Some(candidate.identity().map_err(|_| Error::Internal)?)
+            } else {
+                crate::link::denied(&tx,session.github_id,&device).await?
+            };
+            if let Some(peer) = denied_peer {
+                if !matches(&session, &peer)? {
                     return Err(Error::Unauthorized);
                 }
                 view.state = "denied";
@@ -243,6 +248,20 @@ async fn register(
             if approved.as_bytes() != peer.as_bytes() {
                 return Err(Error::Unauthorized);
             }
+            tx.commit().await?;
+            return Ok(StatusCode::NO_CONTENT);
+        }
+    }
+    if let Some(row) = tx.query_opt(
+        "SELECT peer,decision FROM howl_control.device_link_requests WHERE github_id=$1 AND device_id=$2
+         AND (decision='denied' OR expires_at>now())", &[&session.github_id,&&peer.device_id()[..]]
+    ).await? {
+        if row.get::<_,&[u8]>(0)!=peer.as_bytes() || row.get::<_,Option<&str>>(1)==Some("denied") {
+            return Err(Error::Unauthorized);
+        }
+        if row.get::<_,Option<&str>>(1)==Some("approved") {
+            let signer=network.signer.as_deref().ok_or(Error::Conflict)?;
+            crate::account_network::admit(&control,&tx,session.github_id,network.channel,&snapshot,signer,&candidate).await?;
             tx.commit().await?;
             return Ok(StatusCode::NO_CONTENT);
         }
