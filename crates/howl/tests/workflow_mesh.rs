@@ -249,6 +249,56 @@ fn configured(name: &str) -> PathBuf {
 #[tokio::test]
 #[ignore = "requires a local Linux Docker engine and a pinned image with Node.js"]
 async fn ordinary_direct_messages_continue_the_same_acp_session() {
+    direct_conversation_script(
+        None,
+        vec![
+            ("remember".into(), "turn-1-remember".into()),
+            ("recall".into(), "turn-2-recall".into()),
+        ],
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "requires a local Linux Docker engine and a pinned image with Node.js"]
+async fn configured_context_compacts_at_threshold_and_keeps_the_shared_fact() {
+    let fact = format!("archive-{:016x}", getrandom::u64().unwrap());
+    let mut script = vec![
+        ("private-context-canary".to_owned(), "ack".to_owned()),
+        (format!("/thread review fact={fact}"), "ack".to_owned()),
+    ];
+    for index in 1..10 {
+        script.push((format!("/thread review note-{index}"), "ack".into()));
+    }
+    script.push((
+        "/thread review inspect-context".into(),
+        "history=10 summary=empty raw=true private=false".into(),
+    ));
+    for index in 0..4 {
+        script.push((
+            format!("/thread review filler-{index} {}", " word".repeat(380)),
+            "ack".into(),
+        ));
+    }
+    script.push((
+        "/thread review inspect-context".into(),
+        format!("summary={fact} raw=false private=false"),
+    ));
+    script.push((
+        "inspect-context".into(),
+        "summary=empty raw=false private=true".into(),
+    ));
+    direct_conversation_script(
+        Some(serde_json::json!({"window_tokens":2048,"compact_at_percent":70})),
+        script,
+    )
+    .await;
+}
+
+async fn direct_conversation_script(
+    context: Option<serde_json::Value>,
+    script: Vec<(String, String)>,
+) {
     let root = tempfile::tempdir().unwrap();
     let alice = root.path().join("alice");
     let bob = root.path().join("bob");
@@ -277,15 +327,15 @@ async fn ordinary_direct_messages_continue_the_same_acp_session() {
     let mut bob_node = Node::start(&bob);
     let (repository, revision) = repository(root.path(), "conversation-repo", "selected\n");
     let config = bob.join("conversations.json");
-    fs::write(
-        &config,
-        serde_json::json!({ "conversations": [{
-            "channel": hex::encode(channel), "peer": hex::encode(alice_device),
-            "route": alice_node.route, "repository": repository, "revision": revision,
-        }]})
-        .to_string(),
-    )
-    .unwrap();
+    let mut profile = serde_json::json!({ "conversations": [{
+        "channel": hex::encode(channel), "peer": hex::encode(alice_device),
+        "route": alice_node.route, "repository": repository, "revision": revision,
+    }]});
+    if let Some(context) = context {
+        profile["context"] = context;
+        profile["conversations"][0]["shared_thread"] = "review".into();
+    }
+    fs::write(&config, profile.to_string()).unwrap();
     fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
     let image = std::env::var("HOWL_MANAGED_FIXTURE_IMAGE").unwrap();
     let agent = howl::ongoing::serve(&bob, observer(), move || {
@@ -298,31 +348,28 @@ async fn ordinary_direct_messages_continue_the_same_acp_session() {
     });
     let exchange = async {
         tokio::time::sleep(Duration::from_secs(2)).await;
-        for (prompt, reply) in [("remember", "turn-1-remember"), ("recall", "turn-2-recall")] {
-            let receipt = node::send(&alice, channel, bob_device, &bob_node.route, prompt)
+        for (prompt, reply) in script {
+            let receipt = node::send(&alice, channel, bob_device, &bob_node.route, &prompt)
                 .await
                 .unwrap();
             let source = delivered(&alice, channel, &receipt, bob_device).await;
             let channel = hex::encode(channel);
-            let reply_seen = tokio::time::timeout(WAIT, async {
+            let reply_to = format!("reply-to={}", hex::encode(source));
+            let received = tokio::time::timeout(Duration::from_secs(45), async {
                 loop {
                     let history = stdout(mesh_cli(&["read"], &alice, &[&channel]));
-                    if history.lines().any(|line| {
-                        line.starts_with("agent ")
-                            && line.contains(&hex::encode(source))
-                            && line.contains(reply)
-                    }) {
-                        break;
+                    if let Some(line) = history
+                        .lines()
+                        .find(|line| line.starts_with("agent ") && line.contains(&reply_to))
+                    {
+                        break line.to_owned();
                     }
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
             })
-            .await;
-            assert!(
-                reply_seen.is_ok(),
-                "{}",
-                stdout(mesh_cli(&["read"], &alice, &[&channel]))
-            );
+            .await
+            .expect("agent did not reply to the signed message");
+            assert!(received.contains(&reply), "expected {reply} in {received}");
         }
     };
     tokio::select! {
