@@ -224,6 +224,97 @@ async fn approvals_bind_the_registered_device_and_isolate_other_accounts() {
     assert_eq!(member.view(&server).await["state"], "approved");
     assert_eq!(founder.view(&server).await["pending"], json!([]));
     assert!(outsider.view(&server).await["snapshot"].is_null());
+    let deny = "/v1/network/deny";
+    let member_request = json!({
+        "device": hex::encode(member_id),
+        "fingerprint": hex::encode(candidate.identity().unwrap().fingerprint()),
+    });
+    assert_eq!(
+        founder
+            .post(&server, deny, "network-deny", &member_request)
+            .await,
+        denied
+    );
+    let rejected_state = temp.path().join("rejected");
+    let rejected_peer = enrollment_identity(&rejected_state, [41, 42, 43, 44]).certificate();
+    let rejected = Device::login(
+        &runtime,
+        account,
+        *rejected_peer.device_id(),
+        SigningKey::from_bytes(&[42; 32]),
+    )
+    .await;
+    let rejected_candidate =
+        hosted::candidate(&rejected_state, &network.authority, &network.designation).unwrap();
+    let decision = json!({
+        "device": hex::encode(rejected_peer.device_id()),
+        "fingerprint": hex::encode(rejected_peer.fingerprint()),
+    });
+    assert_eq!(
+        rejected
+            .post(&server, register, "network-register", &rejected_candidate)
+            .await,
+        ok
+    );
+    assert_eq!(
+        member.post(&server, deny, "network-deny", &decision).await,
+        denied
+    );
+    assert_eq!(
+        outsider
+            .post(&server, deny, "network-deny", &decision)
+            .await,
+        denied
+    );
+    let mut wrong = decision.clone();
+    wrong["fingerprint"] = member_request["fingerprint"].clone();
+    assert_eq!(
+        founder.post(&server, deny, "network-deny", &wrong).await,
+        denied
+    );
+    assert_eq!(
+        founder.view(&server).await["pending"],
+        json!([rejected_candidate])
+    );
+    assert_eq!(
+        founder.post(&server, deny, "network-deny", &decision).await,
+        ok
+    );
+    let stale_approval =
+        hosted::approve(&founder_state, channel, &next, &rejected_candidate).unwrap();
+    assert_eq!(
+        founder
+            .post(&server, approve, "network-approve", &stale_approval)
+            .await,
+        denied
+    );
+    owner.get().await.unwrap().execute(
+        "UPDATE howl_control.network_requests SET expires_at = clock_timestamp() - interval '1 day' WHERE github_id = $1 AND device_id = $2",
+        &[&account, &&rejected_peer.device_id()[..]],
+    ).await.unwrap();
+    let relogin = Device::login(
+        &runtime,
+        account,
+        *rejected_peer.device_id(),
+        SigningKey::from_bytes(&[42; 32]),
+    )
+    .await;
+    assert_eq!(
+        relogin
+            .post(&server, register, "network-register", &rejected_candidate)
+            .await,
+        denied
+    );
+    let rejected_view = relogin.view(&server).await;
+    assert_eq!(rejected_view["state"], "denied");
+    assert!(rejected_view["snapshot"].is_null());
+    assert_eq!(rejected_view["authority"], json!([]));
+    assert_eq!(rejected_view["pending"], json!([]));
+    assert_eq!(
+        founder.post(&server, deny, "network-deny", &decision).await,
+        ok
+    );
+    assert_eq!(founder.view(&server).await["pending"], json!([]));
     let (left, right) = tokio::join!(
         Device::login(
             &runtime,
