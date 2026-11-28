@@ -100,6 +100,10 @@ struct Proof {
 }
 
 pub async fn login(state: &Path) -> io::Result<()> {
+    login_device(state, false).await
+}
+
+pub(crate) async fn login_device(state: &Path, join_network: bool) -> io::Result<()> {
     let identity = LocalIdentity::load_or_create(state)?;
     let state = StateDirectory::open(state)?;
     let _lock = state.lock(LOCK)?;
@@ -119,9 +123,25 @@ pub async fn login(state: &Path) -> io::Result<()> {
         "signing_key": hex::encode(certificate.signing_public()),
     });
     let started = Instant::now();
-    let login: Login = service
-        .decode(service.json("/v1/login/device", &request)?)
-        .await?;
+    let path = if join_network {
+        "/v1/network/login/device"
+    } else {
+        "/v1/login/device"
+    };
+    let mut response = service
+        .json(path, &request)?
+        .send()
+        .await
+        .map_err(|_| refused())?;
+    if join_network && response.status() == StatusCode::NOT_FOUND {
+        response = service
+            .json("/v1/login/device", &request)?
+            .send()
+            .await
+            .map_err(|_| refused())?;
+    }
+    let login: Login =
+        serde_json::from_slice(&read_response(response, STATE_LIMIT as usize).await?)?;
     let subject = parse_id(&login.login)?;
     if login.verification_uri != AUTHORIZATION_URL
         || login.user_code.len() != 9

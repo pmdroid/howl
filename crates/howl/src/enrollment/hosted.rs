@@ -221,6 +221,32 @@ impl Network {
     }
 }
 
+fn identity_only(state: &Path) -> io::Result<bool> {
+    for entry in std::fs::read_dir(state)? {
+        if !matches!(
+            entry?.file_name().as_encoded_bytes(),
+            b"device-v1"
+                | b"control-auth.lock"
+                | b"credentials"
+                | b"hosted-network.lock"
+                | b"hosted-designation"
+        ) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+pub fn can_join(state: &Path) -> io::Result<bool> {
+    let directory = StateDirectory::open(state)?;
+    match directory.read_bounded("hosted-network", 32) {
+        Ok(channel) if channel.len() == 32 && channel != [0; 32] => Ok(true),
+        Ok(_) => Err(invalid("invalid hosted network reservation")),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => identity_only(state),
+        Err(error) => Err(error),
+    }
+}
+
 fn bind(state: &Path, directory: &StateDirectory, channel: Id) -> io::Result<()> {
     if channel == [0; 32] {
         return Err(invalid("invalid network id"));
@@ -232,17 +258,10 @@ fn bind(state: &Path, directory: &StateDirectory, channel: Id) -> io::Result<()>
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
-    for entry in std::fs::read_dir(state)? {
-        let name = entry?.file_name();
-        let name = name.as_encoded_bytes();
-        if name == b"authority-pin"
-            || name.starts_with(b"enrollment-")
-            || name.starts_with(b"channel-")
-        {
-            return Err(invalid(
-                "existing mesh profile requires a separate device state for a new network",
-            ));
-        }
+    if !identity_only(state)? {
+        return Err(invalid(
+            "existing mesh profile requires a separate device state for a new network",
+        ));
     }
     if !directory.write(key, &channel)? && directory.read_bounded(key, 32)? != channel {
         return Err(invalid("device state belongs to another network"));
@@ -430,6 +449,43 @@ pub fn apply(state: &Path, channel: Id, network: &Network) -> io::Result<()> {
 mod tests {
     use super::*;
     use crate::{channel::Channel, enrollment::ChannelPermission, identity::PeerTrust};
+
+    #[test]
+    fn only_fresh_identities_and_reserved_profiles_join_during_login() {
+        let temp = tempfile::tempdir().unwrap();
+        let peer = LocalIdentity::load_or_create(&temp.path().join("peer"))
+            .unwrap()
+            .certificate();
+        let fresh = temp.path().join("fresh");
+        assert!(can_join(&fresh).unwrap());
+        LocalIdentity::load_or_create(&fresh).unwrap();
+        let directory = StateDirectory::open(&fresh).unwrap();
+        let _login = directory.lock("control-auth.lock").unwrap();
+        directory.write("credentials", b"session").unwrap();
+        assert!(can_join(&fresh).unwrap());
+        PeerTrust::open(&fresh)
+            .unwrap()
+            .pin(&peer, &peer.fingerprint())
+            .unwrap();
+        assert!(!can_join(&fresh).unwrap());
+        assert!(reserve(&fresh, [1; 32]).is_err());
+
+        for artifact in ["channel-manifest", "delivery.db", "authority-pin"] {
+            let state = temp.path().join(artifact);
+            StateDirectory::open(&state)
+                .unwrap()
+                .write(artifact, b"existing state")
+                .unwrap();
+            assert!(!can_join(&state).unwrap());
+        }
+        let hosted = temp.path().join("hosted");
+        reserve(&hosted, [2; 32]).unwrap();
+        PeerTrust::open(&hosted)
+            .unwrap()
+            .pin(&peer, &peer.fingerprint())
+            .unwrap();
+        assert!(can_join(&hosted).unwrap());
+    }
 
     #[test]
     fn synchronizes_only_committed_members_and_preserves_pinned_history() {
