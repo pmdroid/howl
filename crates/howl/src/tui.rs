@@ -585,7 +585,7 @@ impl App {
             .ok_or_else(|| invalid("Select a signed channel first."))?;
         let (prefix, body) = input.split_once(char::is_whitespace).unwrap_or((input, ""));
         let mut text = input;
-        let mut named_agent = false;
+        let mut named_task = false;
         let shortcuts = self.recipient_shortcuts();
         let mut matches = shortcuts
             .iter()
@@ -607,7 +607,11 @@ impl App {
             if text.is_empty() {
                 return Err(invalid("Enter a message after its destination."));
             }
-            named_agent = direct.is_some();
+            named_task = direct.is_some()
+                && !text
+                    .split_whitespace()
+                    .next()
+                    .is_some_and(crate::ongoing::is_worker_command);
             self.channel = Some(channel);
             self.peer = peer;
         }
@@ -615,7 +619,7 @@ impl App {
             .and_then(|peer| self.routes.get(&peer).cloned())
             .unwrap_or_else(|| "-".into());
         let legacy = legacy_mention(text);
-        if named_agent || legacy.is_some() {
+        if named_task || legacy.is_some() {
             let peer = peer.ok_or_else(|| invalid("Select an agent before sending a task."))?;
             let (role, task) = legacy.unwrap_or_else(|| (AgentRole::default(), text));
             if task.is_empty() {

@@ -176,6 +176,10 @@ impl WorkTools {
     }
 }
 
+pub(crate) fn is_worker_command(word: &str) -> bool {
+    matches!(word, "/work" | "/steer" | "/cancel")
+}
+
 pub(super) fn command(
     delivery: &DeliveryStore,
     scope: Id,
@@ -183,7 +187,7 @@ pub(super) fn command(
 ) -> io::Result<Option<String>> {
     let mut arguments = text.trim().splitn(3, char::is_whitespace);
     let operation = match arguments.next() {
-        Some(operation @ ("/work" | "/steer" | "/cancel")) => operation,
+        Some(operation) if is_worker_command(operation) => operation,
         _ => return Ok(None),
     };
     let Some((encoded, id)) = arguments
