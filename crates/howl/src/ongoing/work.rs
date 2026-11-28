@@ -28,10 +28,28 @@ struct StartWork {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SendPeer {
-    #[serde(deserialize_with = "decode_id")]
-    peer: Id,
+    peer: String,
     text: String,
     thread: Option<String>,
+}
+
+fn resolve_peer<'a>(peers: &'a [AgentPeer], target: &str) -> io::Result<&'a AgentPeer> {
+    let denied = || io::Error::from(io::ErrorKind::PermissionDenied);
+    if let Ok(id) = parse_id(target) {
+        return peers.iter().find(|peer| peer.id == id).ok_or_else(denied);
+    }
+    let mut matches = peers.iter().filter(|peer| {
+        !target.is_empty()
+            && peer
+                .name
+                .as_ref()
+                .is_some_and(|name| name.eq_ignore_ascii_case(target))
+    });
+    let peer = matches.next().ok_or_else(denied)?;
+    if matches.next().is_some() {
+        return Err(denied());
+    }
+    Ok(peer)
 }
 
 impl WorkTools {
@@ -108,11 +126,7 @@ impl WorkTools {
 
     async fn send_peer(&self, arguments: Value, turn: i64) -> io::Result<String> {
         let request: SendPeer = serde_json::from_value(arguments).map_err(io::Error::other)?;
-        let peer = self
-            .peers
-            .iter()
-            .find(|peer| peer.id == request.peer)
-            .ok_or(io::ErrorKind::PermissionDenied)?;
+        let peer = resolve_peer(&self.peers, &request.peer)?;
         let text = match request.thread {
             Some(name) if super::valid_thread_name(&name) => {
                 format!("/thread {name} {}", request.text)
@@ -136,7 +150,7 @@ impl WorkTools {
         let receipt = node::send(
             &self.state,
             self.thread.channel,
-            request.peer,
+            peer.id,
             peer.route.as_deref().unwrap_or("-"),
             &text,
         )
@@ -150,7 +164,7 @@ impl WorkTools {
             .expect_peer_reply(
                 self.thread.scope,
                 id,
-                request.peer,
+                peer.id,
                 now.saturating_add(300),
                 turn,
             )
@@ -375,4 +389,28 @@ fn control(
         return Err(io::ErrorKind::Interrupted.into());
     }
     Ok(feedback)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolves_only_configured_ids_and_unambiguous_names() {
+        let peers = ["Codex", "Grok", "grok"].map(|name| AgentPeer {
+            id: [name.as_bytes()[0]; 32],
+            name: Some(name.into()),
+            route: None,
+        });
+        assert_eq!(resolve_peer(&peers, "codex").unwrap().id, peers[0].id);
+        for peer in &peers {
+            assert_eq!(
+                resolve_peer(&peers, &hex::encode(peer.id)).unwrap().id,
+                peer.id
+            );
+        }
+        for target in ["Grok", "unknown", "", &hex::encode([9; 32])] {
+            assert!(resolve_peer(&peers, target).is_err());
+        }
+    }
 }
