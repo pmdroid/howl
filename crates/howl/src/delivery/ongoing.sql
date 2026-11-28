@@ -43,3 +43,18 @@ CREATE TABLE IF NOT EXISTS ongoing_peer_requests (
     expires INTEGER NOT NULL,
     PRIMARY KEY (scope, message)
 ) STRICT;
+
+CREATE TABLE IF NOT EXISTS ongoing_turn_context (
+    turn INTEGER PRIMARY KEY REFERENCES ongoing_turns(id),
+    shared BLOB,
+    sender BLOB NOT NULL CHECK(length(sender) = 32),
+    parent INTEGER REFERENCES ongoing_turns(id)
+) STRICT;
+CREATE INDEX IF NOT EXISTS ongoing_shared_history ON ongoing_turn_context(shared, turn);
+CREATE TABLE IF NOT EXISTS ongoing_peer_parents (
+    scope BLOB NOT NULL,
+    message BLOB NOT NULL,
+    turn INTEGER NOT NULL REFERENCES ongoing_turns(id),
+    PRIMARY KEY(scope, message),
+    FOREIGN KEY(scope, message) REFERENCES ongoing_peer_requests(scope, message) ON DELETE CASCADE
+) STRICT;

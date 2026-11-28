@@ -23,6 +23,8 @@ pub(crate) struct Schedule {
 
 pub(crate) struct Input {
     pub id: i64,
+    pub shared: Option<Id>,
+    pub sender: Id,
     pub source: Source,
     pub text: String,
 }
@@ -50,7 +52,8 @@ pub(crate) struct Publication {
 #[derive(Serialize)]
 pub(crate) struct Exchange {
     input: String,
-    reply: String,
+    sender: String,
+    reply: Option<String>,
 }
 
 impl DeliveryStore {
@@ -78,6 +81,7 @@ impl DeliveryStore {
         thread: Thread,
         schedules: &[Schedule],
         work_control_from: &str,
+        shared_thread: Option<(&str, Id)>,
         now: i64,
     ) -> Result<Option<Input>> {
         let tx = self
@@ -88,14 +92,17 @@ impl DeliveryStore {
             [thread.scope], |row| Ok((row.get::<_, Id>(0)?, row.get::<_, String>(1)?)),
         ).optional()?;
         let peer_reply = tx.query_row(
-            "SELECT p.message, i.message, i.body FROM ongoing_peer_requests p
+            "SELECT p.message, i.message, i.body, parent.turn, c.shared, p.peer, original.input FROM ongoing_peer_requests p
+             LEFT JOIN ongoing_peer_parents parent USING(scope,message)
+             LEFT JOIN ongoing_turns original ON original.id = parent.turn
+             LEFT JOIN ongoing_turn_context c ON c.turn = parent.turn
              JOIN agent_replies a ON a.in_reply_to = p.message
              JOIN inbox i ON i.id = a.cursor AND i.kind = 3 AND i.body IS NOT NULL
              JOIN channel_event_addresses e ON e.cursor = i.id AND e.outbound = 0 AND e.recipient = ?2
              WHERE p.scope = ?1 AND substr(i.stream, 1, 32) = ?3 AND substr(i.stream, 65, 32) = p.peer
-                 AND i.epoch = ?4 AND p.expires > ?5
-             ORDER BY i.id LIMIT 1", params![thread.scope, self.local.encode(), thread.channel, thread.epoch.to_be_bytes(), now],
-            |row| Ok((row.get::<_, Id>(0)?, row.get::<_, Id>(1)?, row.get::<_, String>(2)?)),
+                 AND i.epoch = ?4 AND p.expires > ?5 AND (c.shared IS NULL OR c.shared = ?6)
+             ORDER BY i.id LIMIT 1", params![thread.scope, self.local.encode(), thread.channel, thread.epoch.to_be_bytes(), now,shared_thread.map(|(_,id)|id)],
+            |row| Ok((row.get::<_, Id>(0)?, row.get::<_, Id>(1)?, row.get::<_, String>(2)?, row.get::<_, Option<i64>>(3)?, row.get::<_, Option<Id>>(4)?, row.get::<_, Id>(5)?, row.get::<_, Option<String>>(6)?)),
         ).optional()?;
         let mut due = None;
         for schedule in schedules {
@@ -116,10 +123,19 @@ impl DeliveryStore {
                 due = Some((next, schedule));
             }
         }
+        let mut parent = None;
+        let mut shared = None;
+        let mut sender = thread.origin.unwrap_or(thread.peer.device);
         let selected = if let Some((id, result)) = completed {
             tx.execute("UPDATE ongoing_work SET reported = 1 WHERE id = ?1", [id])?;
             Some((id, result, Source::WorkResult))
-        } else if let Some((request, reply, text)) = peer_reply {
+        } else if let Some((request, reply, text, original, context, peer, question)) = peer_reply {
+            sender = peer;
+            parent = original;
+            shared = context;
+            let text =
+                serde_json::json!({"peer":hex::encode(sender), "reply":text, "original_question":question})
+                    .to_string();
             tx.execute(
                 "DELETE FROM ongoing_peer_requests WHERE scope = ?1 AND message = ?2",
                 params![thread.scope, request],
@@ -143,23 +159,27 @@ impl DeliveryStore {
             Some((Id::from(source), schedule.text.clone(), Source::Schedule))
         } else {
             let message = tx.query_row(
-                "SELECT i.id, i.message, i.body FROM inbox i
-                 JOIN channel_event_addresses e ON e.cursor = i.id AND e.outbound = 0 AND e.recipient = ?2
+                "SELECT i.id, i.message, i.body, e.recipient IS NULL FROM inbox i
+                 JOIN channel_event_addresses e ON e.cursor = i.id AND e.outbound = 0
                  LEFT JOIN integration_events g ON g.cursor = i.id
                  WHERE substr(i.stream, 1, 32) = ?3 AND substr(i.stream, 33, 64) = ?4
                    AND i.epoch = ?5 AND i.kind = 1 AND i.body IS NOT NULL
+                   AND (e.recipient = ?2 OR (e.recipient IS NULL AND ?8 IS NOT NULL AND g.actor IS ?6 AND substr(i.body,1,length(?8)) = ?8 AND length(trim(substr(i.body,length(?8)+1))) > 0))
                    AND (g.actor IS ?6 OR (hex(g.actor) IN (SELECT value FROM json_each(?7))
                        AND (trim(i.body) GLOB '/work *' OR trim(i.body) GLOB '/steer *' OR trim(i.body) GLOB '/cancel *')))
                    AND i.id > (SELECT cursor FROM ongoing_threads WHERE scope = ?1)
                  ORDER BY i.id LIMIT 1",
-                params![thread.scope, self.local.encode(), thread.channel, thread.peer.encode(), thread.epoch.to_be_bytes(), thread.origin, work_control_from],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Id>(1)?, row.get::<_, String>(2)?)),
+                params![thread.scope, self.local.encode(), thread.channel, thread.peer.encode(), thread.epoch.to_be_bytes(), thread.origin, work_control_from, shared_thread.map(|(name,_)| format!("@{name} "))],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Id>(1)?, row.get::<_, String>(2)?,row.get::<_,bool>(3)?)),
             ).optional()?;
-            if let Some((cursor, source, text)) = message {
+            if let Some((cursor, source, text, channel_post)) = message {
                 tx.execute(
                     "UPDATE ongoing_threads SET cursor = ?2 WHERE scope = ?1",
                     params![thread.scope, cursor],
                 )?;
+                if channel_post {
+                    shared = shared_thread.map(|(_, id)| id);
+                }
                 Some((source, text, Source::DirectMessage))
             } else {
                 None
@@ -170,8 +190,24 @@ impl DeliveryStore {
                 "INSERT INTO ongoing_turns (scope, source, scheduled, input) VALUES (?1, ?2, ?3, ?4)",
                 params![thread.scope, message, source == Source::Schedule, text],
             )?;
+            let id = tx.last_insert_rowid();
+            if source == Source::DirectMessage
+                && let Some((name, context)) = shared_thread
+                && text
+                    .strip_prefix("/thread ")
+                    .and_then(|body| body.split_once(' '))
+                    .is_some_and(|(topic, question)| topic == name && !question.trim().is_empty())
+            {
+                shared = Some(context);
+            }
+            tx.execute(
+                "INSERT INTO ongoing_turn_context (turn, shared, parent, sender) VALUES (?1, ?2, ?3, ?4)",
+                params![id, shared, parent, sender],
+            )?;
             Some(Input {
-                id: tx.last_insert_rowid(),
+                id,
+                shared,
+                sender,
                 source,
                 text,
             })
@@ -194,16 +230,24 @@ impl DeliveryStore {
         Ok(())
     }
 
-    pub(crate) fn ongoing_history(&self, scope: Id) -> Result<Vec<Exchange>> {
+    pub(crate) fn ongoing_history(
+        &self,
+        scope: Id,
+        before: i64,
+        shared: Option<Id>,
+    ) -> Result<Vec<Exchange>> {
         let mut statement = self.connection.prepare(
-            "SELECT input, result FROM ongoing_turns WHERE scope = ?1 AND result IS NOT NULL AND input <> ''
-             ORDER BY id DESC LIMIT 8",
+            "SELECT t.input, t.result, lower(hex(coalesce(c.sender, substr(s.peer,33,32)))) FROM ongoing_turns t
+             JOIN ongoing_threads s ON s.scope=t.scope LEFT JOIN ongoing_turn_context c ON c.turn=t.id
+             WHERE (t.scope = ?1 OR ?3 IS NOT NULL) AND c.shared IS ?3 AND t.id < ?2 AND t.input <> ''
+             ORDER BY t.id DESC LIMIT 8",
         )?;
         let mut history = statement
-            .query_map([scope], |row| {
+            .query_map(params![scope, before, shared], |row| {
                 Ok(Exchange {
                     input: row.get(0)?,
                     reply: row.get(1)?,
+                    sender: row.get(2)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -213,7 +257,7 @@ impl DeliveryStore {
 
     pub(crate) fn pending_ongoing(&self, scope: Id) -> Result<Option<Publication>> {
         Ok(self.connection.query_row(
-            "SELECT id, source, result FROM ongoing_turns WHERE scope = ?1 AND sent IS NULL AND result IS NOT NULL ORDER BY id LIMIT 1",
+            "SELECT t.id, coalesce(p.source,t.source), t.result FROM ongoing_turns t LEFT JOIN ongoing_turn_context c ON c.turn=t.id LEFT JOIN ongoing_turns p ON p.id=c.parent WHERE t.scope = ?1 AND t.sent IS NULL AND t.result IS NOT NULL ORDER BY t.id LIMIT 1",
             [scope],
             |row| Ok(Publication { id: row.get(0)?, source: row.get(1)?, result: row.get(2)? }),
         ).optional()?)
@@ -232,16 +276,23 @@ impl DeliveryStore {
     }
 
     pub(crate) fn expect_peer_reply(
-        &self,
+        &mut self,
         scope: Id,
         message: Id,
         peer: Id,
         expires: i64,
+        turn: i64,
     ) -> Result<()> {
-        self.connection.execute(
+        let tx = self.connection.transaction()?;
+        tx.execute(
             "INSERT INTO ongoing_peer_requests VALUES (?1, ?2, ?3, ?4)",
             params![scope, message, peer, expires],
         )?;
+        tx.execute(
+            "INSERT INTO ongoing_peer_parents VALUES (?1, ?2, ?3)",
+            params![scope, message, turn],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -370,8 +421,8 @@ pub(super) fn publication(
     reply: howl_envelope::AgentReply<&str>,
 ) -> Result<Option<Id>> {
     tx.query_row(
-        "SELECT t.sent FROM ongoing_turns t JOIN ongoing_threads s ON s.scope = t.scope
-         WHERE t.id = ?1 AND t.source = ?2 AND t.result = ?3
+        "SELECT t.sent FROM ongoing_turns t JOIN ongoing_threads s ON s.scope = t.scope LEFT JOIN ongoing_turn_context c ON c.turn=t.id LEFT JOIN ongoing_turns p ON p.id=c.parent
+         WHERE t.id = ?1 AND coalesce(p.source,t.source) = ?2 AND t.result = ?3
            AND s.channel = ?4 AND s.peer = ?5 AND s.epoch = ?6",
         params![
             id,
@@ -426,7 +477,7 @@ mod tests {
         store.prepare_thread(thread).unwrap();
         assert!(
             store
-                .next_ongoing(thread, &schedules, "[]", 10)
+                .next_ongoing(thread, &schedules, "[]", None, 10)
                 .unwrap()
                 .is_none()
         );
@@ -435,14 +486,14 @@ mod tests {
         let mut store = DeliveryStore::open(&path, &[9; 32], local).unwrap();
         store.prepare_thread(thread).unwrap();
         let turn = store
-            .next_ongoing(thread, &schedules, "[]", 500)
+            .next_ongoing(thread, &schedules, "[]", None, 500)
             .unwrap()
             .unwrap();
         assert!(turn.source == Source::Schedule);
         assert_eq!(turn.text, "Check in");
         assert!(
             store
-                .next_ongoing(thread, &schedules, "[]", 500)
+                .next_ongoing(thread, &schedules, "[]", None, 500)
                 .unwrap()
                 .is_none()
         );
@@ -453,15 +504,106 @@ mod tests {
         );
         assert!(
             store
-                .next_ongoing(thread, &schedules, "[]", 559)
+                .next_ongoing(thread, &schedules, "[]", None, 559)
                 .unwrap()
                 .is_none()
         );
         assert!(
             store
-                .next_ongoing(thread, &schedules, "[]", 560)
+                .next_ongoing(thread, &schedules, "[]", None, 560)
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn delayed_peer_replies_keep_the_original_question_and_audience() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = Device {
+            account: [1; 32],
+            device: [2; 32],
+        };
+        let thread = Thread {
+            scope: [3; 32],
+            channel: [4; 32],
+            peer: local,
+            epoch: 1,
+            origin: None,
+        };
+        let shared = [8; 32];
+        let mut store = DeliveryStore::open(&dir.path().join("test.db"), &[1; 32], local).unwrap();
+        store.prepare_thread(thread).unwrap();
+        for index in 1..=2u8 {
+            let message = [index; 32];
+            store.connection.execute("INSERT INTO ongoing_turns(scope,source,scheduled,input,finished,result,sent) VALUES (?1,?2,0,?3,1,'queued',?2)",params![thread.scope,message,format!("question {index}")]).unwrap();
+            let parent = store.connection.last_insert_rowid();
+            store
+                .connection
+                .execute(
+                    "INSERT INTO ongoing_turn_context(turn,shared,sender) VALUES (?1,?2,?3)",
+                    params![parent, shared, local.device],
+                )
+                .unwrap();
+            store
+                .expect_peer_reply(
+                    thread.scope,
+                    [index + 10; 32],
+                    [index + 20; 32],
+                    100,
+                    parent,
+                )
+                .unwrap();
+        }
+        for index in [2, 1] {
+            let peer = [index + 20; 32];
+            let stream = super::super::Stream {
+                channel: thread.channel,
+                sender: Device {
+                    account: local.account,
+                    device: peer,
+                },
+                signing_key: [0; 32],
+            }
+            .encode();
+            store.connection.execute("INSERT INTO inbox(stream,message,sequence,epoch,received,expires,digest,kind,body) VALUES (?1,?2,x'01',?3,x'00',x'00',x'00',3,'answer')",params![stream,[index+30;32],thread.epoch.to_be_bytes()]).unwrap();
+            let cursor = store.connection.last_insert_rowid();
+            store
+                .connection
+                .execute(
+                    "INSERT INTO channel_event_addresses VALUES (?1,0,?2)",
+                    params![cursor, local.encode()],
+                )
+                .unwrap();
+            store
+                .connection
+                .execute(
+                    "INSERT INTO agent_replies VALUES (?1,?2,1,?3,?2)",
+                    params![cursor, peer, [index + 10; 32]],
+                )
+                .unwrap();
+            assert!(
+                store
+                    .next_ongoing(thread, &[], "[]", Some(("changed", [9; 32])), 50)
+                    .unwrap()
+                    .is_none()
+            );
+            let input = store
+                .next_ongoing(thread, &[], "[]", Some(("review", shared)), 50)
+                .unwrap()
+                .unwrap();
+            assert_eq!(input.sender, peer);
+            assert_eq!(input.shared, Some(shared));
+            assert!(input.text.contains(&format!("question {index}")));
+            store.finish_ongoing(input.id, "answered", true).unwrap();
+            let reply = store.pending_ongoing(thread.scope).unwrap().unwrap();
+            assert_eq!(reply.source, [index; 32]);
+            publish(&store.connection, reply.id, [index + 40; 32]).unwrap();
+        }
+        assert!(
+            store
+                .ongoing_history(thread.scope, i64::MAX, None)
+                .unwrap()
+                .is_empty()
         );
     }
 
@@ -505,12 +647,15 @@ mod tests {
         assert_eq!(store.work_control(id).unwrap(), (false, None));
         assert!(store.cancel_work(thread.scope, id).unwrap());
         store.finish_work(id, "completed", "finished").unwrap();
-        let result = store.next_ongoing(thread, &[], "[]", 100).unwrap().unwrap();
+        let result = store
+            .next_ongoing(thread, &[], "[]", None, 100)
+            .unwrap()
+            .unwrap();
         assert!(result.source == Source::WorkResult);
         assert!(result.text.ends_with("was cancelled."));
         assert!(
             store
-                .next_ongoing(thread, &[], "[]", 100)
+                .next_ongoing(thread, &[], "[]", None, 100)
                 .unwrap()
                 .is_none()
         );

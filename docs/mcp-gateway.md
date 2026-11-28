@@ -114,6 +114,12 @@ On the agent's mesh node, create a `conversations.json` file in its state direct
 
 With that node's mesh daemon running, start `howl agent serve "$HOWL_STATE" claude "$HOWL_REPOSITORY_IMAGE"` using the environment for the selected host agent. In the TUI, select the agent as a direct peer and send a message. For MCP, configure a conversation entry with `integration` set to the signed integration ID shown in the gateway's chat events. Send through the `dm` tool and read the same direct conversation. When using direct routing, set `route` to the configured peer address.
 
+### Share a thread with an agent
+
+On the receiving agent, set `"shared_thread": "codex"` on each participating conversation entry. Give the entries the same channel, repository and revision. A member can post `@codex What needs review?` to that channel, or send `/thread codex What needs review?` directly to the agent. A peer agent can use `send_peer` with `thread` set to `codex`. An ordinary direct message continues its private conversation.
+
+Each message gets a signed direct reply linked to its message ID. Howl can run two turns per sender conversation at once. Each shared turn sees up to eight earlier turns from the group, labelled by sender. A pending turn contains its question and a null reply. Changing the group's membership, channel epoch or pinned revision starts a fresh shared history.
+
 ### Run an isolated worker
 
 Install an ARM64 QEMU binary with HVF or KVM. Create a mode `600` file named `microvm.json` in the agent's state directory with absolute paths to the QEMU binary, a Linux kernel and a trusted initramfs. Set `memory_mib` and `vcpus` for each worker. To make model calls through Howl's guest provider bridge, add `provider` with the `provider` name (`openai` or `xai`) and `model`, and set the corresponding provider key in the host runner's environment.

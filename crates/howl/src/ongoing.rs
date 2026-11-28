@@ -48,6 +48,7 @@ struct Conversation {
     #[serde(deserialize_with = "decode_id")]
     peer: Id,
     integration: Option<String>,
+    shared_thread: Option<String>,
     route: Option<String>,
     repository: PathBuf,
     revision: String,
@@ -78,9 +79,24 @@ struct Schedule {
     instruction: String,
 }
 
+fn valid_thread_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
+}
+
 impl Conversation {
     fn validate(&mut self) -> io::Result<Option<Id>> {
         let origin = self.integration.as_deref().map(parse_id).transpose()?;
+        if self
+            .shared_thread
+            .as_deref()
+            .is_some_and(|name| !valid_thread_name(name))
+        {
+            return Err(invalid("invalid shared thread name"));
+        }
         if self.work_control_from.len() > 4
             || (!self.work_control_from.is_empty() && (!self.work || origin.is_some()))
         {
@@ -152,6 +168,7 @@ struct AgentContext<F> {
     identity: LocalIdentity,
     profile: Id,
     microvm: Option<crate::microvm::Profile>,
+    sending_peer: Arc<tokio::sync::Mutex<()>>,
     harness: F,
 }
 
@@ -200,11 +217,37 @@ where
         identity,
         profile,
         microvm,
+        sending_peer: Default::default(),
         harness,
     });
     let (stop, stopping) = watch::channel(false);
     let mut threads = JoinSet::new();
-    for (conversation, origin) in conversations {
+    let shared_groups: Vec<_> = conversations
+        .iter()
+        .map(|(conversation, _)| {
+            let name = conversation.shared_thread.as_ref()?;
+            let mut members: Vec<_> = conversations
+                .iter()
+                .filter(|(other, _)| {
+                    other.channel == conversation.channel
+                        && other.shared_thread == conversation.shared_thread
+                        && other.repository == conversation.repository
+                        && other.revision == conversation.revision
+                })
+                .map(|(other, origin)| (other.peer, *origin))
+                .collect();
+            members.sort();
+            let bytes = serde_json::to_vec(&(
+                name,
+                members,
+                &conversation.repository,
+                &conversation.revision,
+            ))
+            .ok()?;
+            Some(Id::from(Sha256::digest(bytes)))
+        })
+        .collect();
+    for ((conversation, origin), group) in conversations.into_iter().zip(shared_groups) {
         let conversation = Arc::new(conversation);
         if conversation.work {
             threads.spawn(work::serve(
@@ -214,7 +257,13 @@ where
                 stopping.clone(),
             ));
         }
-        threads.spawn(run(context.clone(), conversation, origin, stopping.clone()));
+        threads.spawn(run(
+            context.clone(),
+            conversation,
+            origin,
+            group,
+            stopping.clone(),
+        ));
     }
     let outcome = tokio::select! {
         signal = tokio::signal::ctrl_c() => signal,
@@ -233,6 +282,7 @@ async fn run<F>(
     context: Arc<AgentContext<F>>,
     conversation: Arc<Conversation>,
     origin: Option<Id>,
+    group: Option<Id>,
     mut stopping: watch::Receiver<bool>,
 ) -> io::Result<()>
 where
@@ -241,6 +291,8 @@ where
     let directory = StateDirectory::open(&context.state)?;
     let mut delivery =
         node::open_delivery(&context.state, &directory, &context.identity.certificate())?;
+    let mut turns: JoinSet<FinishedTurn> = JoinSet::new();
+    let (cancel_turns, _) = watch::channel(());
     let mut active = None;
     let mut session = None;
     let schedules = conversation.schedules();
@@ -251,12 +303,20 @@ where
     loop {
         tokio::select! {
             _ = stopping.changed() => break,
+            Some(done) = turns.join_next() => {
+                let done = done.map_err(io::Error::other)?;
+                delivery.finish_ongoing(done.id, &done.text, done.success).map_err(io::Error::other)?;
+                if done.session.is_some() {
+                    session = done.session;
+                }
+            }
             _ = tick.tick() => {},
         }
         let thread = match authorized(&context, &conversation, origin) {
             Ok(thread) => thread,
             Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
                 close(&mut session).await;
+                stop_turns(&cancel_turns, &mut turns).await?;
                 active = None;
                 continue;
             }
@@ -264,6 +324,7 @@ where
         };
         if active != Some(thread.scope) {
             close(&mut session).await;
+            stop_turns(&cancel_turns, &mut turns).await?;
             delivery.prepare_thread(thread).map_err(io::Error::other)?;
             active = Some(thread.scope);
         }
@@ -280,9 +341,29 @@ where
                 &publication,
             )?;
         }
+        if turns.len() >= 2 {
+            continue;
+        }
+        let shared = group.map(|group| {
+            Id::from(
+                Sha256::new()
+                    .chain_update(b"howl/shared-thread/v1")
+                    .chain_update(context.profile)
+                    .chain_update(thread.channel)
+                    .chain_update(thread.epoch.to_be_bytes())
+                    .chain_update(group)
+                    .finalize(),
+            )
+        });
         let now = i64::try_from(node::unix_time()?).map_err(io::Error::other)?;
         let Some(input) = delivery
-            .next_ongoing(thread, &schedules, &delegates, now)
+            .next_ongoing(
+                thread,
+                &schedules,
+                &delegates,
+                conversation.shared_thread.as_deref().zip(shared),
+                now,
+            )
             .map_err(io::Error::other)?
         else {
             continue;
@@ -296,36 +377,80 @@ where
                 .map_err(io::Error::other)?;
             continue;
         }
-        let result = match turn(
-            &context,
-            &conversation,
-            thread,
-            &input,
-            &mut delivery,
-            &mut session,
-            &mut stopping,
-        )
-        .await
+        if input.source == OngoingSource::DirectMessage
+            && input.text.starts_with("/thread ")
+            && input.shared.is_none()
         {
-            Ok(text) => (text, true),
-            Err(error) => {
-                eprintln!("Howl conversation failed. {error}");
-                close(&mut session).await;
-                (
-                    "Agent turn ended without a reply. Send another message to continue."
-                        .to_owned(),
+            delivery
+                .finish_ongoing(
+                    input.id,
+                    "Use /thread NAME MESSAGE with a configured shared thread.",
                     false,
                 )
-            }
-        };
-        delivery
-            .finish_ongoing(input.id, &result.0, result.1)
-            .map_err(io::Error::other)?;
-        if *stopping.borrow() {
-            break;
+                .map_err(io::Error::other)?;
+            continue;
         }
+        let history = delivery
+            .ongoing_history(thread.scope, input.id, input.shared)
+            .map_err(io::Error::other)?;
+        let reusable = input.shared.is_none() && turns.is_empty();
+        let mut current = if reusable { session.take() } else { None };
+        let context = context.clone();
+        let conversation = conversation.clone();
+        let mut stopping = cancel_turns.subscribe();
+        turns.spawn(async move {
+            let result = turn(
+                &context,
+                &conversation,
+                thread,
+                &input,
+                history,
+                &mut current,
+                &mut stopping,
+            )
+            .await;
+            if !reusable || result.is_err() {
+                close(&mut current).await;
+            }
+            let (text, success) = match result {
+                Ok(text) => (text, true),
+                Err(error) => {
+                    eprintln!("Howl conversation failed. {error}");
+                    (
+                        "Agent turn ended without a reply. Send another message to continue."
+                            .into(),
+                        false,
+                    )
+                }
+            };
+            FinishedTurn {
+                id: input.id,
+                text,
+                success,
+                session: current,
+            }
+        });
     }
+    stop_turns(&cancel_turns, &mut turns).await?;
     close(&mut session).await;
+    Ok(())
+}
+
+struct FinishedTurn {
+    id: i64,
+    text: String,
+    success: bool,
+    session: Option<ManagedSession>,
+}
+
+async fn stop_turns(
+    cancel: &watch::Sender<()>,
+    turns: &mut JoinSet<FinishedTurn>,
+) -> io::Result<()> {
+    cancel.send_replace(());
+    while let Some(done) = turns.join_next().await {
+        close(&mut done.map_err(io::Error::other)?.session).await;
+    }
     Ok(())
 }
 
@@ -375,28 +500,21 @@ async fn turn<F>(
     conversation: &Conversation,
     thread: OngoingThread,
     input: &OngoingInput,
-    delivery: &mut DeliveryStore,
+    mut history: Vec<crate::delivery::OngoingExchange>,
     session: &mut Option<ManagedSession>,
-    stopping: &mut watch::Receiver<bool>,
+    stopping: &mut watch::Receiver<()>,
 ) -> io::Result<String>
 where
     F: Fn() -> io::Result<Harness>,
 {
-    let mut history = if session.is_none() {
-        delivery
-            .ongoing_history(thread.scope)
-            .map_err(io::Error::other)?
-    } else {
-        Vec::new()
-    };
-    let directive = "Continue the Howl conversation. Earlier exchanges are context. Repository tools use the approved read-only snapshot. Use send_peer to ask an available peer and wait for a peer_reply in a later turn. Use start_work for isolated implementation and report its run ID. Share worker results with the requester.";
+    let directive = "Continue the Howl conversation. Answer the current message separately. Earlier exchanges are context. A null reply means that question is already being answered. Repository tools use the approved read-only snapshot. Use send_peer to ask an available peer and wait for a peer_reply in a later turn. Use start_work for isolated implementation and report its run ID. Share worker results with the requester.";
     let peers = conversation
         .peers
         .iter()
         .map(|peer| json!({ "id": hex::encode(peer.id), "name": peer.name }))
         .collect::<Vec<_>>();
     let text = loop {
-        let data = json!({ "source": input.source, "input": input.text, "earlier_exchanges": history,
+        let data = json!({ "source": input.source, "input": input.text, "sender":hex::encode(input.sender), "earlier_exchanges": history,
             "available_peers": peers, "work_enabled": conversation.work });
         let text = format!("{directive}\n{data}");
         if text.len() <= 60 * 1024 {
@@ -418,6 +536,7 @@ where
                     context.state.clone(),
                     thread,
                     conversation,
+                    context.sending_peer.clone(),
                 ));
             }
             *session = Some(
@@ -434,7 +553,7 @@ where
         let session = session
             .as_ref()
             .ok_or_else(|| io::Error::other("ACP session unavailable"))?;
-        session.conversation_source(input.source);
+        session.conversation_source(input.source, input.id);
         prompt(session, text, TURN_LIMIT).await
     };
     tokio::pin!(run);
