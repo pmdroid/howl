@@ -74,6 +74,23 @@ function hint(identity, time) {
   ]);
 }
 
+function routeSet(identity, legacy, relay) {
+  const prefix = Buffer.from(legacy.subarray(0, 81));
+  prefix[0] = 2;
+  const body = Buffer.concat([
+    prefix,
+    Buffer.from([2]),
+    legacy.subarray(81, 100),
+    Buffer.from([4, 192, 168, 8, 4, ...Buffer.alloc(12), 0xa0, 0x3b]),
+    Buffer.from([0, Buffer.byteLength(relay)]),
+    Buffer.from(relay),
+  ]);
+  return Buffer.concat([
+    body,
+    identity.sign(Buffer.concat([Buffer.from("howl/peer-routes/v2\0"), body])),
+  ]);
+}
+
 function signedFrame(sender, recipient, snapshot) {
   const genesis = bytes(snapshot.authority[0]).subarray(0, -128);
   const account = hash(genesis);
@@ -406,6 +423,29 @@ test("Native publishing Worker", async (t) => {
       assert.deepEqual(Buffer.from(await lookup.arrayBuffer()), route);
       await status(
         signed(stranger, path + "/" + alice.id, "discovery-read", undefined, {
+          proofBody: bytes(alice.id),
+        }),
+        401,
+      );
+      const v2 = "/v2/discovery/hints";
+      const routes = routeSet(alice, route, "https://example.test/");
+      const forgedSet = Buffer.from(routes);
+      forgedSet[forgedSet.length - 1] ^= 1;
+      await status(
+        signed(alice, v2, "discovery-write", Buffer.concat([bytes(alice.peer), forgedSet])),
+        401,
+      );
+      await status(
+        signed(alice, v2, "discovery-write", Buffer.concat([bytes(alice.peer), routes])),
+        204,
+      );
+      const found = await signed(bob, v2 + "/" + alice.id, "discovery-read", undefined, {
+        proofBody: bytes(alice.id),
+      });
+      assert.equal(found.status, 200);
+      assert.deepEqual(Buffer.from(await found.arrayBuffer()), routes);
+      await status(
+        signed(stranger, v2 + "/" + alice.id, "discovery-read", undefined, {
           proofBody: bytes(alice.id),
         }),
         401,
