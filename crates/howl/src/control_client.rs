@@ -1,4 +1,7 @@
 mod device_link;
+mod device_name;
+
+pub use device_name::device_name;
 
 use std::{
     env, io,
@@ -106,13 +109,13 @@ pub async fn login(state: &Path) -> io::Result<()> {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LoginMode {
+pub(crate) enum LoginMode<'a> {
     Manual,
-    Hosted,
+    Hosted(Option<&'a str>),
     DeviceCode,
 }
 
-pub(crate) async fn login_device(path: &Path, mode: LoginMode) -> io::Result<()> {
+pub(crate) async fn login_device(path: &Path, mode: LoginMode<'_>) -> io::Result<()> {
     let identity = LocalIdentity::load_or_create(path)?;
     let state = StateDirectory::open(path)?;
     let _lock = crate::identity::retry_state_lock(|| state.lock(LOCK)).await?;
@@ -122,7 +125,13 @@ pub(crate) async fn login_device(path: &Path, mode: LoginMode) -> io::Result<()>
         validate(&stored.credentials, &identity)?;
         match service.resume_login(&state, &identity, stored).await {
             Ok(()) => {
-                println!("Device is already signed in.");
+                if matches!(mode, LoginMode::Hosted(Some(_))) {
+                    println!(
+                        "Device is already signed in. Manage its name in the device dashboard."
+                    );
+                } else {
+                    println!("Device is already signed in.");
+                }
                 return Ok(());
             }
             Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {}
@@ -133,9 +142,10 @@ pub(crate) async fn login_device(path: &Path, mode: LoginMode) -> io::Result<()>
         .as_ref()
         .map(|stored| stored.credentials.session.github_id);
     let credentials = match (mode, browser) {
-        (LoginMode::Hosted, Some(origin)) => {
-            device_link::login(&service, &identity, path, origin, previous_owner).await?
+        (LoginMode::Hosted(name), Some(browser)) => {
+            device_link::login(&service, &identity, path, browser, name, previous_owner).await?
         }
+        (LoginMode::Hosted(Some(_)), None) => return Err(device_link::unsupported_name()),
         _ => github_device_login(&service, &identity, mode != LoginMode::Manual).await?,
     };
     validate_login(&credentials, &identity, previous_owner)?;
@@ -417,7 +427,9 @@ impl Service {
         save(state, self, credentials)
     }
 
-    async fn for_login(existing: Option<&Stored>) -> io::Result<(Self, Option<Url>)> {
+    async fn for_login(
+        existing: Option<&Stored>,
+    ) -> io::Result<(Self, Option<device_link::Browser>)> {
         let (origin, http) = Self::connection(&configured("HOWL_CONTROL_URL")?)?;
         if existing.is_some_and(|stored| stored.origin != origin.as_str()) {
             return Err(io::Error::other(
@@ -449,6 +461,8 @@ impl Service {
         struct PublicConfig {
             audience: String,
             browser_link_origin: Option<String>,
+            #[serde(default)]
+            device_names: bool,
         }
         let config: PublicConfig =
             serde_json::from_slice(&read_response(response, 1024).await?).map_err(|_| refused())?;
@@ -459,7 +473,7 @@ impl Service {
         let browser = config
             .browser_link_origin
             .as_deref()
-            .map(device_link::browser_origin)
+            .map(|origin| device_link::Browser::new(origin, config.device_names))
             .transpose()?;
         Ok((Self::from_parts(origin, http, audience)?, browser))
     }

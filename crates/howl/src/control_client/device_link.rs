@@ -6,12 +6,32 @@ use std::{
 use super::*;
 use crate::enrollment::hosted::{self, Candidate};
 
-pub(super) fn browser_origin(value: &str) -> io::Result<Url> {
-    let url = Url::parse(value).map_err(|_| configuration())?;
-    if value.len() > 512 || url.scheme() != "https" || url.origin().ascii_serialization() != value {
-        return Err(configuration());
+pub(super) struct Browser {
+    origin: Url,
+    device_names: bool,
+}
+
+impl Browser {
+    pub(super) fn new(value: &str, device_names: bool) -> io::Result<Self> {
+        let origin = Url::parse(value).map_err(|_| configuration())?;
+        if value.len() > 512
+            || origin.scheme() != "https"
+            || origin.origin().ascii_serialization() != value
+        {
+            return Err(configuration());
+        }
+        Ok(Self {
+            origin,
+            device_names,
+        })
     }
-    Ok(url)
+}
+
+pub(super) fn unsupported_name() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        "This control plane does not support device names. To continue, run howl control login without --name.",
+    )
 }
 
 #[derive(Deserialize)]
@@ -51,7 +71,12 @@ struct Enrollment {
     digest: Id,
 }
 
-fn show_link(origin: &Url, secret: &str, identity: &LocalIdentity) -> io::Result<()> {
+fn show_link(
+    origin: &Url,
+    secret: &str,
+    identity: &LocalIdentity,
+    name: Option<&str>,
+) -> io::Result<()> {
     let _secret = Zeroizing::new(parse_id(secret)?);
     let link = Zeroizing::new(format!("{}link#{secret}", origin.as_str()));
     println!("Open {}", link.as_str());
@@ -59,6 +84,9 @@ fn show_link(origin: &Url, secret: &str, identity: &LocalIdentity) -> io::Result
         "Fingerprint {}",
         hex::encode(identity.certificate().fingerprint())
     );
+    if let Some(name) = name {
+        println!("Name {name}");
+    }
     io::stdout().flush()?;
     if io::stdout().is_terminal() && env::var_os("HOWL_NO_BROWSER").is_none() {
         let opener = if cfg!(target_os = "macos") {
@@ -135,13 +163,30 @@ pub(super) async fn login(
     service: &Service,
     identity: &LocalIdentity,
     state: &Path,
-    origin: Url,
+    browser: Browser,
+    explicit_name: Option<&str>,
     previous_owner: Option<i64>,
 ) -> io::Result<Credentials> {
     let started = Instant::now();
     let peer = hex::encode(identity.certificate().as_bytes());
+    if explicit_name.is_some() && !browser.device_names {
+        return Err(unsupported_name());
+    }
+    let hostname = rustix::system::uname();
+    let suggested = hostname
+        .nodename()
+        .to_str()
+        .ok()
+        .and_then(|value| device_name(value).ok());
+    let name = explicit_name.or(suggested).filter(|_| browser.device_names);
+    #[derive(Serialize)]
+    struct Start<'a> {
+        peer: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        name: Option<&'a str>,
+    }
     let mut link: Started = service
-        .decode(service.json("/v1/device-links", &serde_json::json!({"peer":peer}))?)
+        .decode(service.json("/v1/device-links", &Start { peer, name })?)
         .await?;
     parse_id(&link.id)?;
     parse_id(&link.nonce)?;
@@ -149,7 +194,7 @@ pub(super) async fn login(
         return Err(refused());
     }
     let secret = Zeroizing::new(std::mem::take(&mut link.secret));
-    show_link(&origin, &secret, identity)?;
+    show_link(&browser.origin, &secret, identity, name)?;
     let deadline = started + Duration::from_secs(link.expires_in);
     let mut nonce = link.nonce;
     let mut enrollment: Option<Enrollment> = None;

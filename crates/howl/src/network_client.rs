@@ -238,15 +238,25 @@ async fn sync(
 }
 
 pub async fn login(state: &Path) -> io::Result<()> {
-    network_login(state, control_client::LoginMode::Hosted).await
+    network_login(state, control_client::LoginMode::Hosted(None)).await
+}
+
+pub async fn login_with_name(state: &Path, name: &str) -> io::Result<()> {
+    let name = control_client::device_name(name)?;
+    network_login(state, control_client::LoginMode::Hosted(Some(name))).await
 }
 
 pub async fn login_with_device_code(state: &Path) -> io::Result<()> {
     network_login(state, control_client::LoginMode::DeviceCode).await
 }
 
-async fn network_login(state: &Path, mode: control_client::LoginMode) -> io::Result<()> {
+async fn network_login(state: &Path, mode: control_client::LoginMode<'_>) -> io::Result<()> {
     if !hosted::can_join(state)? {
+        if matches!(mode, control_client::LoginMode::Hosted(Some(_))) {
+            return Err(io::Error::other(
+                "Device names are available when linking a device to a hosted network.",
+            ));
+        }
         control_client::login(state).await?;
         println!(
             "Existing mesh profile signed in. Use a fresh state directory to join a hosted network."
