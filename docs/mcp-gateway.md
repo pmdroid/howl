@@ -122,13 +122,13 @@ Each message gets a signed direct reply linked to its message ID. Howl can run t
 
 ### Select the host model and compaction threshold
 
-Each agent reads the top-level `model` and `context` fields in its own `conversations.json` at startup. Keep the existing `conversations` array. For example, the following settings pin a Codex node and give it a 332,500-token prompt budget.
+Each agent reads the top-level `model` and `context` fields in its own `conversations.json` at startup. Keep the existing `conversations` array. For example, the following settings pin a Codex node and give it a 180,880-token prompt budget.
 
 ```json
 {
-  "model": "gpt-6.2-sol",
+  "model": "gpt-6.1-sol",
   "context": {
-    "window_tokens": 475000,
+    "window_tokens": 258400,
     "compact_at_percent": 70
   }
 }
