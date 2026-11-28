@@ -40,6 +40,11 @@ CREATE TABLE IF NOT EXISTS peer_hints (
     issued BLOB NOT NULL,
     hint BLOB NOT NULL
 ) STRICT;
+CREATE TABLE IF NOT EXISTS peer_route_sets (
+    device BLOB PRIMARY KEY,
+    issued BLOB NOT NULL,
+    payload BLOB NOT NULL
+) STRICT;
 CREATE INDEX IF NOT EXISTS recipients_due ON recipients(due) WHERE acknowledged = 0;
 CREATE INDEX IF NOT EXISTS recipients_mailbox ON recipients(device, envelope) WHERE acknowledged = 0;
 CREATE TABLE IF NOT EXISTS inbox (

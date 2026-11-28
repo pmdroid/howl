@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     io,
-    net::{IpAddr, SocketAddr},
+    net::SocketAddr,
     path::Path,
     time::{Duration, Instant},
 };
@@ -13,10 +13,11 @@ use sha2::{Digest, Sha256};
 use crate::{
     control_client::{self, ControlClient, read_response},
     delivery::Id,
+    discovery::{self, Routes},
     discovery_client,
     enrollment::hosted::{self, Candidate, Network},
     identity::{LocalIdentity, PeerCertificate, StateDirectory, retry_state_lock},
-    transport::Transport,
+    transport::{Transport, on_link, tailnet_address},
 };
 
 const PIN: &str = "hosted-network-origin";
@@ -496,7 +497,7 @@ async fn refresh_routes(
     transport: &Transport,
     bind: Option<SocketAddr>,
     previous: &mut Option<Id>,
-    published: &mut Option<(SocketAddr, Instant)>,
+    published: &mut Option<(Routes, Instant)>,
     fetched: &mut HashMap<Id, Instant>,
 ) -> io::Result<()> {
     let client = ControlClient::open(state).await?;
@@ -505,30 +506,38 @@ async fn refresh_routes(
         .snapshot
         .ok_or_else(|| invalid("device is awaiting membership"))?;
     let endpoint = transport.address();
-    let address = endpoint
+    let networks = transport.lan_networks();
+    let mut addresses: Vec<_> = endpoint
         .ip_addrs()
         .copied()
-        .filter(|addr| addr.port() > 0 && !addr.ip().is_unspecified() && !addr.ip().is_multicast())
-        .min_by_key(|addr| {
-            let explicit = bind.is_some_and(|bind| bind.ip() == addr.ip());
-            let tailnet = match addr.ip() {
-                IpAddr::V4(ip) => ip.octets()[0] == 100 && ip.octets()[1] >> 6 == 1,
-                IpAddr::V6(ip) => ip.segments()[..3] == [0xfd7a, 0x115c, 0xa1e0],
-            };
-            (
-                !explicit,
-                addr.ip().is_loopback(),
-                !tailnet,
-                !addr.is_ipv4(),
-            )
-        });
-    if let Some(address) = address
+        .filter(|addr| {
+            discovery::validate_address(*addr).is_ok()
+                && (!tailnet_address(addr.ip()) || bind.is_some_and(|bind| bind.ip() == addr.ip()))
+        })
+        .collect();
+    addresses.sort_by_key(|addr| {
+        (
+            !bind.is_some_and(|bind| bind.ip() == addr.ip()),
+            addr.ip().is_loopback(),
+            !on_link(&networks, addr.ip()),
+            !addr.is_ipv4(),
+        )
+    });
+    addresses.truncate(discovery::MAX_ROUTES);
+    let routes = Routes {
+        addresses,
+        relay: endpoint
+            .relay_urls()
+            .find(|url| url.scheme() == "https")
+            .cloned(),
+    };
+    if (!routes.addresses.is_empty() || routes.relay.is_some())
         && published
             .as_ref()
-            .is_none_or(|(last, at)| *last != address || at.elapsed() > Duration::from_secs(3600))
+            .is_none_or(|(last, at)| *last != routes || at.elapsed() > Duration::from_secs(3600))
     {
-        discovery_client::publish_with(&client, address).await?;
-        *published = Some((address, Instant::now()));
+        discovery_client::publish_routes(&client, &routes).await?;
+        *published = Some((routes, Instant::now()));
     }
     let local = *client.identity().certificate().device_id();
     for device in &snapshot.devices {
@@ -537,7 +546,7 @@ async fn refresh_routes(
             && fetched
                 .get(&target)
                 .is_none_or(|at| at.elapsed() >= Duration::from_secs(60))
-            && discovery_client::fetch_with(state, &client, target).await?
+            && discovery_client::fetch_routes(state, &client, target).await?
         {
             fetched.insert(target, Instant::now());
         }

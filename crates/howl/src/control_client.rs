@@ -532,7 +532,7 @@ impl Service {
 
     fn endpoint(&self, path: &str) -> io::Result<Url> {
         let url = self.origin.join(path).map_err(|_| configuration())?;
-        if !path.starts_with("/v1/")
+        if !(path.starts_with("/v1/") || path.starts_with("/v2/"))
             || url.origin() != self.origin.origin()
             || url.query().is_some()
             || url.fragment().is_some()

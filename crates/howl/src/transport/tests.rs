@@ -5,6 +5,16 @@ use super::*;
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 const NO_FRAME: Duration = Duration::from_millis(150);
 
+#[test]
+fn local_candidates_use_interface_prefixes_and_skip_tailnet_addresses() {
+    let networks = ["192.168.8.17/23", "fd00:8::17/64", "100.100.0.1/10"]
+        .map(|network| network.parse().unwrap());
+    assert!(on_link(&networks, "192.168.9.44".parse().unwrap()));
+    assert!(on_link(&networks, "fd00:8::99".parse().unwrap()));
+    assert!(!on_link(&networks, "192.168.10.44".parse().unwrap()));
+    assert!(!on_link(&networks, "100.100.0.2".parse().unwrap()));
+}
+
 fn pair(root: &Path) -> io::Result<((LocalIdentity, PeerTrust), (LocalIdentity, PeerTrust))> {
     let alice = root.join("alice");
     let bob = root.join("bob");
