@@ -230,7 +230,7 @@ HOWL_CONTROL_DATABASE_URL="$owner_url" howl-control-plane --pin-enrollment \
   "$github_numeric_id" "$verified_account" "$verified_head" "$verified_designation"
 ```
 
-For a cohort using GitHub consent, use the signed device client to upload the approved public enrollment after completing device flow. Check that the uploaded enrollment matches the independent pin. Exchange the two candidates' `device` and `enrollment-certificate` files between their private peer-import directories. Run `howl enrollment peer STATE PEER_EXCHANGE` on each recipient. Confirm the relay allowlist contains the two enrolled endpoint IDs.
+For a manually enrolled cohort using GitHub device codes, enable Device Flow on the OAuth app and run `howl control login --device-code "$device_state"` before uploading the approved public enrollment. Check that the uploaded enrollment matches the independent pin. Exchange the two candidates' `device` and `enrollment-certificate` files between their private peer-import directories. Run `howl enrollment peer STATE PEER_EXCHANGE` on each recipient. Confirm the relay allowlist contains the two enrolled endpoint IDs.
 
 Enroll the roster issuer as a device using its operator state. Import both participant certificates into that state. The following example grants send and receive permissions on a new channel. Transfer the channel and proof from the issuer to each participant.
 
@@ -251,7 +251,7 @@ Keep production service logs to aggregate status and operational errors. Device 
 | Location | Data and operator handling |
 | --- | --- |
 | Participant device | Decrypted history, selected repository content, long-lived device keys and local delivery state. Keep state on protected local storage and share only the requested committed files with the authorized model session. |
-| Hosted API and PostgreSQL | Public enrollment and discovery records, GitHub numeric account IDs, session metadata, device credential digests and encrypted pending OAuth device codes. The API uses 60-second request proofs, five-minute access tokens and a 30-day session window. Keep the API state key in the service secret store. |
+| Hosted API and PostgreSQL | Public enrollment and discovery records, numeric GitHub account IDs, session digests and device decisions. The control plane encrypts each account’s delegated signing key and the device credentials available for retry during a ten-minute link. Legacy GitHub device codes are also encrypted. Back up the API state key in the service secret store so restored networks can continue to sign memberships. |
 | Hosted mailbox | Opaque ciphertext plus routing, sequence, message, time and acknowledgment metadata. Mailbox retention is seven days. Monitor expiry cleanup and quotas, and treat metadata as private operational data. |
 | Relay | Connections are admitted by signed endpoint identity. Restrict relay logs and keep the verified allowlist with the deployment configuration. |
 | Backup storage | Database archives include the records and metadata present at dump time. Encrypt archives, restrict restore access, and remove copies on the backup schedule recorded for the cohort. |
