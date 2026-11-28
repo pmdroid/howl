@@ -1,0 +1,33 @@
+#!/bin/sh
+set -eu
+export PATH=/usr/local/bin:/usr/bin:/usr/sbin:/bin:/sbin
+mkdir -p /dev /proc /sys /workspace /scratch /tmp /run
+mount -t devtmpfs devtmpfs /dev
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+modprobe virtio_mmio
+modprobe virtio_blk
+ip link set lo up
+for i in 1 2 3 4 5 6 7 8 9 10; do
+    for port in /sys/class/virtio-ports/vport*; do
+        [ -r "$port/name" ] || continue
+        case "$(cat "$port/name")" in
+            howl.acp) acp="/dev/${port##*/}" ;;
+            howl.patch) patch="/dev/${port##*/}" ;;
+            howl.provider) provider="/dev/${port##*/}" ;;
+        esac
+    done
+    [ -b /dev/vda ] && [ -n "${acp:-}" ] && [ -n "${patch:-}" ] && [ -n "${provider:-}" ] && break
+    sleep 1
+done
+test -c "$acp" && test -c "$patch" && test -c "$provider"
+tar -xf /dev/vda --no-same-owner -C /workspace
+chown -R 65532:65532 /workspace /scratch
+chmod 1777 /tmp
+exec 3<>"$acp"
+exec 4<>"$patch"
+exec 5<>"$provider"
+setpriv --reuid=65532 --regid=65532 --clear-groups node /fixture/provider-bridge.cjs <&5 >&5 3<&- 4<&- &
+export HOME=/scratch TMPDIR=/tmp USER=howl LOGNAME=howl LANG=C.UTF-8
+cd /workspace
+exec setpriv --reuid=65532 --regid=65532 --clear-groups node /fixture/worker.cjs <&3 >&3 3<&- 5<&-
