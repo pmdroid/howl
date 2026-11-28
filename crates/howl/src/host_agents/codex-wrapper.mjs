@@ -39,8 +39,8 @@ const environment = {
 const version = spawnSync(executable, ["--version"], {
   cwd: scratch, env: environment, encoding: "utf8", timeout: 5000,
 });
-if (version.status !== 0 || version.stdout.trim() !== "codex-cli 0.159.3") {
-  stop("Host Codex requires the tested Codex CLI 0.159.3.");
+if (version.status !== 0 || !["codex-cli 0.159.3", "codex-cli 0.172.0"].includes(version.stdout.trim())) {
+  stop("Host Codex requires Codex CLI 0.159.3 or 0.172.0.");
 }
 
 const maxPromptBytes = 16 * 1024 * 1024;

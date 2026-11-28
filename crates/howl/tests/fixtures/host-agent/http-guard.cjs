@@ -2,7 +2,7 @@ const assert = require("node:assert/strict");
 const http = require("node:http");
 
 if (process.argv.includes("--version")) {
-  process.stdout.write("codex-cli 0.159.3\n");
+  process.stdout.write("codex-cli 0.172.0\n");
   process.exit(0);
 }
 
