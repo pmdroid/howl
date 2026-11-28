@@ -1,0 +1,13 @@
+name = "howl-control-plane-d1-prototype"
+main = "worker.mjs"
+compatibility_date = "2026-07-30"
+workers_dev = false
+preview_urls = false
+
+[[d1_databases]]
+binding = "DB"
+database_name = "howl-control-plane-d1-prototype"
+database_id = "00000000-0000-4000-8000-000000000001"
+
+[triggers]
+crons = ["*/5 * * * *"]

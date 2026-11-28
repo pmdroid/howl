@@ -1,0 +1,15 @@
+{
+  "name": "howl-control-plane-d1-prototype",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test test.mjs"
+  },
+  "devDependencies": {
+    "miniflare": "4.20260730.0"
+  },
+  "overrides": {
+    "sharp": "0.35.5",
+    "undici": "7.30.2"
+  }
+}
