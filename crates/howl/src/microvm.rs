@@ -338,7 +338,12 @@ mod tests {
 
     #[tokio::test]
     async fn owner_pipe_outlives_startup_polling_and_stops_the_guest_on_close() {
+        let parent = tempfile::tempdir().unwrap();
+        let runtime = parent.path().join("runtime");
+        std::fs::create_dir(&runtime).unwrap();
+        std::fs::write(runtime.join("repo.tar"), "synthetic snapshot").unwrap();
         let mut process = Command::new("/bin/sh")
+            .current_dir(&runtime)
             .args(["-c", WATCH_OWNER, "howl-watchdog-test", "/bin/sleep", "20"])
             .stdin(Stdio::piped())
             .stderr(Stdio::null())
@@ -357,5 +362,6 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(!status.success());
+        assert!(!runtime.exists());
     }
 }
