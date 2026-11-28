@@ -1,9 +1,10 @@
+import { deviceName, fillIdentity, resumeKey } from "./device-identity.js";
+
 const element = id => document.getElementById(id);
 let busy = false;
 let currentView = "";
 const linkPage = location.pathname === "/link";
 const secretKey = "howl.deviceLink";
-const resumeKey = "howl.resumeDeviceLink";
 let linkSecret;
 
 function clearLink() {
@@ -60,13 +61,10 @@ function signedOut() {
 
 function deviceRow(device, decideRequest) {
   const row = element("device").content.firstElementChild.cloneNode(true);
-  row.querySelector(".device-id code").textContent = device.id;
-  const fingerprint = row.querySelector(".fingerprint code");
-  for (const part of device.fingerprint.match(/.{1,8}/g)) {
-    const span = document.createElement("span");
-    span.textContent = part;
-    fingerprint.append(span);
-  }
+  const name = row.querySelector(".device-name");
+  name.textContent = deviceName(device);
+  name.href = "/devices/" + device.id;
+  fillIdentity(row, device);
   const actions = row.querySelector(".actions");
   if (decideRequest) {
     actions.setAttribute("aria-label", "Decision for device " + device.id);
@@ -153,7 +151,7 @@ async function loadLink() {
   element("network").querySelector("code").textContent = view.network;
   const serialized = JSON.stringify(view);
   if (currentView !== serialized) {
-    element("pending").replaceChildren(deviceRow({id: view.device, fingerprint: view.fingerprint}, decideLink));
+    element("pending").replaceChildren(deviceRow({id: view.device, name: view.name, fingerprint: view.fingerprint}, decideLink));
     currentView = serialized;
   }
 }
@@ -232,9 +230,12 @@ if (linkPage) {
   });
   prepareLink();
   if (linkSecret) run(refresh);
-} else if (location.pathname === "/devices" && sessionStorage.getItem(resumeKey) && sessionStorage.getItem(secretKey)) {
+} else if (location.pathname === "/devices" && sessionStorage.getItem(resumeKey)) {
+  const resume = sessionStorage.getItem(resumeKey);
   sessionStorage.removeItem(resumeKey);
-  location.replace("/link");
+  if (resume === "1" && sessionStorage.getItem(secretKey)) location.replace("/link");
+  else if (/^[0-9a-f]{64}$/.test(resume)) location.replace("/devices/" + resume);
+  else run(refresh);
 } else {
   run(refresh);
 }
