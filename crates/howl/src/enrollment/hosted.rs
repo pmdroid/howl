@@ -327,6 +327,28 @@ pub fn reserve(state: &Path, channel: Id) -> io::Result<()> {
 }
 
 pub fn candidate(state: &Path, records: &[String], designation: &str) -> io::Result<Candidate> {
+    let (candidate, digest) = link_candidate(state, records, designation)?;
+    pin_designation(state, &digest)?;
+    Ok(candidate)
+}
+
+pub(crate) fn pin_designation(state: &Path, digest: &Id) -> io::Result<()> {
+    let directory = StateDirectory::open(state)?;
+    if !directory.write("hosted-designation", digest)?
+        && directory.read_bounded("hosted-designation", 32)? != *digest
+    {
+        return Err(invalid(
+            "network designation changed after device registration",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn link_candidate(
+    state: &Path,
+    records: &[String],
+    designation: &str,
+) -> io::Result<(Candidate, Id)> {
     let (authority, designation) = authority(records, designation)?;
     let directory = StateDirectory::open(state)?;
     match AuthorityStore::open(state)?.current() {
@@ -337,20 +359,25 @@ pub fn candidate(state: &Path, records: &[String], designation: &str) -> io::Res
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
-    if !directory.write("hosted-designation", &designation.digest())?
-        && directory.read_bounded("hosted-designation", 32)? != designation.digest()
-    {
-        return Err(invalid(
-            "network designation changed after device registration",
-        ));
+    match directory.read_bounded("hosted-designation", 32) {
+        Ok(current) if current != designation.digest() => {
+            return Err(invalid(
+                "network designation changed after device registration",
+            ));
+        }
+        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+        _ => {}
     }
     let identity = LocalIdentity::load_or_create(state)?;
     let peer = identity.certificate();
     let body = DeviceCertificate::body(&designation, &peer, 1);
-    Ok(Candidate {
-        peer: hex::encode(peer.as_bytes()),
-        proof: hex::encode(identity.sign(&body)),
-    })
+    Ok((
+        Candidate {
+            peer: hex::encode(peer.as_bytes()),
+            proof: hex::encode(identity.sign(&body)),
+        },
+        designation.digest(),
+    ))
 }
 
 pub fn bootstrap(state: &Path, channel: Id) -> io::Result<Network> {
@@ -608,7 +635,12 @@ mod tests {
         let channel = [42; 32];
         let network = bootstrap(&first, channel).unwrap();
         let foreign = bootstrap(&unrelated, [5; 32]).unwrap();
+        let (_, abandoned) =
+            link_candidate(&second, &foreign.authority, &foreign.designation).unwrap();
+        assert!(!second.join("hosted-designation").exists());
         let mut join = candidate(&second, &network.authority, &network.designation).unwrap();
+        assert!(pin_designation(&second, &abandoned).is_err());
+        assert!(link_candidate(&second, &foreign.authority, &foreign.designation).is_err());
         assert!(candidate(&second, &foreign.authority, &foreign.designation).is_err());
         join.peer.clone_from(&network.devices[0].peer);
         assert!(

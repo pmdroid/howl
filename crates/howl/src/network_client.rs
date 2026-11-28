@@ -238,6 +238,14 @@ async fn sync(
 }
 
 pub async fn login(state: &Path) -> io::Result<()> {
+    network_login(state, control_client::LoginMode::Hosted).await
+}
+
+pub async fn login_with_device_code(state: &Path) -> io::Result<()> {
+    network_login(state, control_client::LoginMode::DeviceCode).await
+}
+
+async fn network_login(state: &Path, mode: control_client::LoginMode) -> io::Result<()> {
     if !hosted::can_join(state)? {
         control_client::login(state).await?;
         println!(
@@ -245,7 +253,7 @@ pub async fn login(state: &Path) -> io::Result<()> {
         );
         return Ok(());
     }
-    control_client::login_device(state, true).await?;
+    control_client::login_device(state, mode).await?;
     devices(state).await
 }
 
