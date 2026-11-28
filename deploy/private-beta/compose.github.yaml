@@ -1,6 +1,7 @@
 services:
   api:
     environment:
+      HOWL_CONTROL_WEB_ORIGIN: ${HOWL_CONTROL_WEB_ORIGIN:-}
       HOWL_BETA_GITHUB_FILES: "1"
     secrets:
       - github-client-id

@@ -22,6 +22,7 @@ mod mailbox_http;
 mod network;
 mod proof;
 mod sessions;
+mod web_login;
 
 pub use enrollment::{EnrollmentPin, TrustedDevice, pin_enrollment};
 pub use github::GitHub;
@@ -70,6 +71,7 @@ pub struct ControlPlane {
     github: GitHub,
     audience: Id,
     state_key: Zeroizing<Id>,
+    web_origin: Option<String>,
 }
 
 impl ControlPlane {
@@ -82,12 +84,32 @@ impl ControlPlane {
             github,
             audience,
             state_key,
+            web_origin: None,
         })
     }
 
+    pub fn with_web_origin(mut self, value: &str) -> Result<Self> {
+        let url = reqwest::Url::parse(value).map_err(|_| Error::Configuration)?;
+        if url.scheme() != "https"
+            || url.host().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.path() != "/"
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(Error::Configuration);
+        }
+        self.web_origin = Some(url.origin().ascii_serialization());
+        Ok(self)
+    }
+
     pub fn router(self: Arc<Self>) -> Router {
-        Router::new()
-            .route("/healthz", get(health))
+        let mut app = Router::new();
+        if self.web_origin.is_some() {
+            app = app.merge(web_login::routes());
+        }
+        app.route("/healthz", get(health))
             .merge(enrollment::routes())
             .merge(network::routes())
             .merge(discovery::routes())
@@ -125,6 +147,8 @@ pub async fn migrate(pool: &Pool) -> Result<()> {
     tx.batch_execute(include_str!("../migrations/006_network_login.sql"))
         .await?;
     tx.batch_execute(include_str!("../migrations/007_device_denial.sql"))
+        .await?;
+    tx.batch_execute(include_str!("../migrations/008_web_login.sql"))
         .await?;
     tx.commit().await?;
     Ok(())

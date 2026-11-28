@@ -75,7 +75,13 @@ async fn run() -> Result<()> {
     )?;
     let audience = configured_id("HOWL_CONTROL_AUDIENCE")?;
     let state_key = configured_id("HOWL_CONTROL_STATE_KEY")?;
-    let control = Arc::new(ControlPlane::new(pool, github, *audience, state_key)?);
+    let mut control = ControlPlane::new(pool, github, *audience, state_key)?;
+    match env::var("HOWL_CONTROL_WEB_ORIGIN") {
+        Ok(origin) if !origin.is_empty() => control = control.with_web_origin(&origin)?,
+        Err(env::VarError::NotUnicode(_)) => return Err(Error::Configuration),
+        _ => {}
+    }
+    let control = Arc::new(control);
     let housekeeping = Arc::clone(&control);
     tokio::spawn(async move { housekeeping.run_mailbox_maintenance().await });
     let listener = tokio::net::TcpListener::bind(bind)

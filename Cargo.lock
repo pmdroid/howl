@@ -1451,6 +1451,7 @@ name = "howl-control-plane"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64 0.22.1",
  "chacha20poly1305",
  "curve25519-dalek 5.0.0",
  "deadpool-postgres",
