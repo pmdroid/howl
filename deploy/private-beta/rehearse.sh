@@ -71,6 +71,7 @@ if [[ "$control" = --onboarding ]]; then
     run_fixture browser_login_binds_callback_and_revokes_owner_session
     run_fixture account_owner_decides_devices_with_all_native_agents_offline
     run_fixture account_transfer_preserves_pins_and_disables_native_decisions
+    run_fixture device_link_redeems_exact_owner_approval_once
     exit 0
 fi
 
