@@ -370,7 +370,8 @@ impl ManagedSession {
 
     pub(crate) async fn guest(
         root: &Path,
-        snapshot: &Snapshot,
+        commit: String,
+        snapshot: [u8; 32],
         link: tokio::net::UnixStream,
     ) -> Result<Self> {
         let mut random = [0; 16];
@@ -380,8 +381,8 @@ impl ManagedSession {
             SessionState {
                 id: hex::encode(random),
                 harness: "microvm".into(),
-                commit: snapshot.commit().into(),
-                snapshot: snapshot.selection(),
+                commit,
+                snapshot,
                 profile: [0; 32],
                 engine: "qemu".into(),
                 remote_session: None,

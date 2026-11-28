@@ -142,6 +142,8 @@ Before each context-managed turn Howl measures the serialized prompt with the lo
 
 Install an ARM64 QEMU binary with HVF or KVM. Create a mode `600` file named `microvm.json` in the agent's state directory with absolute paths to the QEMU binary, a Linux kernel and a trusted initramfs. Set `memory_mib` and `vcpus` for each worker. To make model calls through Howl's guest provider bridge, add `provider` with the `provider` name (`openai` or `xai`) and `model`, and set the corresponding provider key in the host runner's environment.
 
+On Linux the worker needs an ARM64 host with KVM enabled and permission to open `/dev/kvm`. On Apple Silicon it uses Hypervisor.framework. Howl accepts each serial connection only from the QEMU process it started and removes the repository archive and socket paths once the guest is ready. In a two-worker test on Apple Silicon, a 512 MiB, one-vCPU Linux fixture reached its ACP session in 2.2 seconds. Its QEMU process used 257 MiB of resident memory during the test.
+
 The guest init extracts the read-only tar disk at `/dev/vda` into its writable `/workspace`. Identify the serial ports by name in `/sys/class/virtio-ports`. The guest sends `HOWL_ACP_READY` followed by a newline on `howl.acp`, then runs its ACP adapter over that port. At teardown it returns an eight-byte big-endian patch length and the patch bytes on `howl.patch`. Set the length to zero for a worker that produced no patch. For inference, run `crates/howl/src/provider_bridge.cjs` in the guest over `howl.provider`, and configure the guest's agent to use its loopback endpoint.
 
 For an existing Howl ChatGPT plan connection, set the profile's provider to `chatgpt_plan` and choose a model available to that connection. Set `HOWL_CHATGPT_NODE` to the absolute Node executable path, `HOWL_CHATGPT_HELPER` to the path of `tools/chatgpt-auth/chatgpt-auth.mjs`, and `HOWL_CHATGPT_STORE` to the existing credential directory. The host broker uses the connection to make requests for the guest. The guest uses the local provider bridge.
@@ -150,7 +152,7 @@ For an existing Howl ChatGPT plan connection, set the profile's provider to `cha
 howl worker run "$HOWL_STATE" /path/to/repo main < instruction.txt
 ```
 
-Worker patches are saved under `worker-patches` in the node's state directory.
+Howl checks a worker patch against the files the session received and the pinned Git commit, then saves it under `worker-patches` in the node's state directory. The patch header records the run ID, base commit, and snapshot digest.
 
 Set `"work": true` on a conversation to give its ongoing agent the `start_work` tool. It launches a separate ACP worker and returns a run ID. Send `/work RUN`, `/steer RUN MESSAGE`, or `/cancel RUN` in the same TUI DM or through MCP `dm` to check status, send feedback, or cancel. To give an integration permission to steer work from a human conversation, add its signed integration ID to that conversation's `work_control_from` list.
 

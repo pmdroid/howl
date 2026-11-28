@@ -1,3 +1,5 @@
+mod patch;
+
 use std::{
     collections::BTreeMap,
     fs::{self, OpenOptions},
@@ -21,6 +23,7 @@ const MAX_FILE: usize = 2 * 1024 * 1024;
 const MAX_SNAPSHOT: usize = 16 * 1024 * 1024;
 
 pub struct Snapshot {
+    repository: PathBuf,
     pub(super) directory: TempDir,
     commit: String,
     selection: [u8; 32],
@@ -90,6 +93,7 @@ impl Snapshot {
 
         let directory = tempfile::Builder::new()
             .prefix("howl-snapshot-")
+            .permissions(fs::Permissions::from_mode(0o700))
             .tempdir()?;
         let tree = directory.path().join("tree");
         fs::create_dir(&tree)?;
@@ -103,6 +107,7 @@ impl Snapshot {
         }
         let selection = selection.finalize().into();
         Ok(Self {
+            repository,
             directory,
             commit,
             selection,
