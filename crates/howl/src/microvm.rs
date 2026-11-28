@@ -284,7 +284,7 @@ impl Guest {
     }
 
     pub(crate) async fn prompt(&self, text: String, limit: Duration) -> io::Result<String> {
-        let reply = crate::ongoing::prompt(&self.session, text, limit).await;
+        let reply = self.session.prompt_text(text, limit).await;
         self.check_handoff()?;
         reply
     }

@@ -26,6 +26,7 @@ pub(super) async fn drive(
     let bind = progress.clone();
     let permission_state = journal.subscribe();
     let notifications = events.clone();
+    let permissions = events.clone();
     Client
         .v2()
         .on_receive_notification(
@@ -44,7 +45,7 @@ pub(super) async fn drive(
                     }
                 });
                 if selected {
-                    let _ = notifications.send(Event::UpdateV2(Box::new(notification)));
+                    notifications.send(Event::UpdateV2(Box::new(notification)));
                 }
                 Ok(())
             },
@@ -79,7 +80,7 @@ pub(super) async fn drive(
                     )
                 };
                 let reply = responder.respond(RequestPermissionResponse::new(outcome));
-                let _ = events.send(Event::PermissionV2 {
+                permissions.send(Event::PermissionV2 {
                     offered: request
                         .options
                         .into_iter()
@@ -106,7 +107,7 @@ pub(super) async fn drive(
                                 session,
                                 updates,
                             };
-                            serve_session(&wire, &journal, requests).await;
+                            serve_session(&wire, &journal, &events, requests).await;
                         }
                     }
                     Err(error) => {

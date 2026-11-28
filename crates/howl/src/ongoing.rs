@@ -13,12 +13,11 @@ use std::{
     time::Duration,
 };
 
-use agent_client_protocol::v1::schema::StopReason;
 use serde::{Deserialize, Deserializer, de};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use tokio::{
-    sync::{broadcast, watch},
+    sync::watch,
     task::JoinSet,
     time::{interval, timeout},
 };
@@ -31,7 +30,6 @@ use crate::{
     managed_acp::{Harness, ManagedSession},
     node,
     observer::{ObserverProvider, Snapshot},
-    workflow::ReplyBuffer,
 };
 
 const TICK: Duration = Duration::from_secs(1);
@@ -601,7 +599,7 @@ where
             .as_ref()
             .ok_or_else(|| io::Error::other("ACP session unavailable"))?;
         session.conversation_source(input.source, input.id);
-        prompt(session, text, TURN_LIMIT).await
+        session.prompt_text(text, TURN_LIMIT).await
     };
     tokio::pin!(run);
     let mut guard = interval(TICK);
@@ -614,34 +612,6 @@ where
                 }
             }
             result = &mut run => return result,
-        }
-    }
-}
-
-pub(crate) async fn prompt(
-    session: &ManagedSession,
-    text: String,
-    limit: Duration,
-) -> io::Result<String> {
-    let mut events = session.subscribe();
-    let mut reply = ReplyBuffer::default();
-    let run = session.prompt(text, limit);
-    tokio::pin!(run);
-    loop {
-        tokio::select! {
-            event = events.recv() => reply.receive(event.map_err(io::Error::other)?)?,
-            result = &mut run => {
-                if !matches!(result.map_err(io::Error::other)?, StopReason::EndTurn) {
-                    return Err(io::Error::other("agent turn did not finish"));
-                }
-                loop {
-                    match events.try_recv() {
-                        Ok(event) => reply.receive(event)?,
-                        Err(broadcast::error::TryRecvError::Empty) => return reply.finish(),
-                        Err(error) => return Err(io::Error::other(error)),
-                    }
-                }
-            }
         }
     }
 }

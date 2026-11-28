@@ -8,10 +8,7 @@ use rustix::{
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tokio::{
-    sync::broadcast,
-    time::{MissedTickBehavior, interval, timeout},
-};
+use tokio::time::{MissedTickBehavior, interval, timeout};
 
 use crate::{
     channel::Channel,
@@ -20,14 +17,11 @@ use crate::{
         WakeClaim, WakeJob, WakeOutcome,
     },
     identity::{LocalIdentity, PeerTrust, StateDirectory},
-    managed_acp::{Event, Harness, ManagedSession},
+    managed_acp::{Harness, ManagedSession},
     node,
     observer::{ObserverProvider, Snapshot},
 };
 
-use agent_client_protocol::v1::schema::{ContentBlock, SessionUpdate, StopReason};
-
-const MAX_REPLY: usize = 16 * 1024;
 const MAX_CONTEXT: usize = 2;
 const MAX_PROMPT: usize = 48 * 1024;
 const BUDGET: BudgetLimits = BudgetLimits {
@@ -457,13 +451,11 @@ async fn execute(
             result.map_err(io::Error::other)?.map_err(io::Error::other)?
         }
     };
-    let mut events = session.subscribe();
-    let mut output = ReplyBuffer::default();
     let remaining = Duration::from_secs(deadline.saturating_sub(node::unix_time()?));
     let result = async {
         control.check()?;
-        {
-            let turn = session.prompt(prompt, remaining);
+        let text = {
+            let turn = session.prompt_text(prompt, remaining);
             tokio::pin!(turn);
             let mut guard = interval(Duration::from_secs(1));
             guard.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -471,24 +463,10 @@ async fn execute(
                 tokio::select! {
                     signal = &mut interrupted => return Err(stopped(signal)),
                     _ = guard.tick() => control.check()?,
-                    event = events.recv() => output.receive(event.map_err(io::Error::other)?)?,
-                    result = &mut turn => {
-                        if !matches!(result.map_err(io::Error::other)?, StopReason::EndTurn) {
-                            return Err(io::Error::other("agent turn did not finish"));
-                        }
-                        loop {
-                            match events.try_recv() {
-                                Ok(event) => output.receive(event)?,
-                                Err(broadcast::error::TryRecvError::Empty) => break,
-                                Err(error) => return Err(io::Error::other(error)),
-                            }
-                        }
-                        break;
-                    }
+                    result = &mut turn => break result?,
                 }
             }
-        }
-        let text = output.finish()?;
+        };
         control.check()?;
         let changes = if editable {
             Some(
@@ -530,84 +508,6 @@ async fn execute(
     let text = result?;
     closed?;
     Ok(text)
-}
-
-#[derive(Default)]
-pub(crate) struct ReplyBuffer {
-    v1: String,
-    v2: Vec<(agent_client_protocol::v2::schema::MessageId, String)>,
-}
-
-impl ReplyBuffer {
-    pub(crate) fn receive(&mut self, event: Event) -> io::Result<()> {
-        use agent_client_protocol::v2::schema as v2;
-
-        match event {
-            Event::Update(update) => {
-                if let SessionUpdate::AgentMessageChunk(chunk) = update.update
-                    && let ContentBlock::Text(text) = chunk.content
-                {
-                    self.v1.push_str(&text.text);
-                }
-            }
-            Event::UpdateV2(update) => match update.update {
-                v2::SessionUpdate::AgentMessageChunk(chunk) => {
-                    if let v2::ContentBlock::Text(text) = chunk.content {
-                        self.message(chunk.message_id)?.push_str(&text.text);
-                    }
-                }
-                v2::SessionUpdate::AgentMessage(message) if !message.content.is_undefined() => {
-                    *self.message(message.message_id)? = message
-                        .content
-                        .take()
-                        .unwrap_or_default()
-                        .into_iter()
-                        .filter_map(|block| match block {
-                            v2::ContentBlock::Text(text) => Some(text.text),
-                            _ => None,
-                        })
-                        .collect();
-                }
-                _ => {}
-            },
-            _ => {}
-        }
-        if self.v1.len() + self.v2.iter().map(|(_, text)| text.len()).sum::<usize>() > MAX_REPLY {
-            return Err(invalid("agent reply exceeds the workflow limit"));
-        }
-        Ok(())
-    }
-
-    fn message(
-        &mut self,
-        id: agent_client_protocol::v2::schema::MessageId,
-    ) -> io::Result<&mut String> {
-        let index = match self.v2.iter().position(|(known, _)| *known == id) {
-            Some(index) => index,
-            None if self.v2.len() < 64 => {
-                self.v2.push((id, String::new()));
-                self.v2.len() - 1
-            }
-            None => return Err(invalid("agent reply contains too many messages")),
-        };
-        Ok(&mut self.v2[index].1)
-    }
-
-    pub(crate) fn finish(self) -> io::Result<String> {
-        let text = if self.v2.is_empty() {
-            self.v1
-        } else {
-            self.v2
-                .into_iter()
-                .map(|(_, text)| text)
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
-        if text.trim().is_empty() || text.len() > MAX_REPLY {
-            return Err(invalid("agent returned an empty or oversized reply"));
-        }
-        Ok(text)
-    }
 }
 
 fn stopped(result: io::Result<()>) -> io::Error {
