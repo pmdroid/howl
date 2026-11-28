@@ -89,6 +89,7 @@ impl Cli {
     }
 }
 
+#[track_caller]
 fn success_text(output: Output) -> String {
     assert!(
         output.status.success(),
@@ -141,6 +142,45 @@ async fn github_login_and_owner_approval_connect_two_devices_over_iroh() {
             })),
     )
     .await;
+    let http = Client::new();
+    let legacy_key = SigningKey::from_bytes(&[11; 32]);
+    let login_url = format!("{}/v1/login/device", server.url);
+    let begin = success(
+        http.post(&login_url)
+            .json(&json!({
+                "device_id": hex::encode(DEVICE),
+                "signing_key": hex::encode(legacy_key.verifying_key().to_bytes()),
+            }))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    let login = string(&begin, "login");
+    allow_poll(&owner, &proof::decode(login).unwrap()).await;
+    let proof = sign(&legacy_key, login, "poll", string(&begin, "nonce"), None);
+    let verified = success(
+        http.post(format!("{login_url}/{login}/poll"))
+            .json(&proof)
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(verified["credentials"]["session"]["github_id"], github_id);
+    assert!(
+        owner
+            .get()
+            .await
+            .unwrap()
+            .query_opt(
+                "SELECT founder FROM howl_control.networks WHERE github_id = $1",
+                &[&github_id]
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
     let cli = Cli {
         binary: std::env::var_os("HOWL_TEST_CONTROL_CLI").unwrap(),
         url: server.url.clone(),
@@ -150,7 +190,7 @@ async fn github_login_and_owner_approval_connect_two_devices_over_iroh() {
     let candidate = root.path().join("candidate");
     let a = success_text(cli.run(&["control", "login"], &founder, &[]).await);
     let b = success_text(cli.run(&["control", "login"], &candidate, &[]).await);
-    assert_eq!(upstream.revoked.load(Ordering::SeqCst), 2);
+    assert_eq!(upstream.revoked.load(Ordering::SeqCst), 3);
     assert_eq!(field(&a, "Membership "), "founder");
     assert_eq!(field(&b, "Membership "), "pending");
     let channel = field(&a, "Network ");
@@ -158,7 +198,13 @@ async fn github_login_and_owner_approval_connect_two_devices_over_iroh() {
     let b_id = field(&b, "Device ");
     assert_ne!(a_id, b_id);
     assert_eq!(field(&b, "Network "), channel);
-    let pending = success_text(cli.run(&["control", "devices"], &founder, &[]).await);
+    let lock = std::fs::File::open(founder.join("control-auth.lock")).unwrap();
+    lock.try_lock().unwrap();
+    let (pending, ()) = tokio::join!(cli.run(&["control", "devices"], &founder, &[]), async {
+        sleep(Duration::from_millis(300)).await;
+        drop(lock);
+    });
+    let pending = success_text(pending);
     assert_eq!(field(&pending, "Pending "), b_id);
     assert!(
         !cli.run(&["control", "approve"], &candidate, &[b_id])
