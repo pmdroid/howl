@@ -88,6 +88,10 @@ async fn named_device_details_stay_with_the_owner() {
     let initial = success(read(&owner, &server, &device).await).await;
     assert_eq!(initial["state"], "pending");
     assert_eq!(initial["name"], "Guest Mac");
+    assert_eq!(initial["network_id"], owner.view(&server).await["network"]);
+    assert_eq!(initial["endpoint_id"], peer.endpoint().to_string());
+    assert!(initial.get("network_name").is_none());
+    assert!(initial.get("route").is_none());
     assert!(string(&initial, "requested_at").ends_with('Z'));
     assert!(initial.get("approved_at").is_none());
     assert!(initial.get("last_route_at").is_none());
@@ -177,7 +181,9 @@ async fn named_device_details_stay_with_the_owner() {
     );
     let published = success(read(&owner, &server, &device).await).await;
     assert!(string(&published, "last_route_at").ends_with('Z'));
-    assert_ne!(published["last_route_at"], Value::Null);
+    assert_eq!(published["route"]["ip"], "192.0.2.1");
+    assert_eq!(published["route"]["port"], 4101);
+    assert!(string(&published["route"], "expires_at").ends_with('Z'));
     assert_eq!(
         owner.view(&server).await["approved"][0]["name"],
         "Studio 🚀"
@@ -190,6 +196,7 @@ async fn named_device_details_stay_with_the_owner() {
     assert_eq!(denied["state"], "denied");
     assert!(denied.get("approved_at").is_none());
     assert!(denied.get("last_route_at").is_none());
+    assert!(denied.get("route").is_none());
     let admin = pool("HOWL_TEST_CONTROL_DATABASE_OWNER");
     admin
         .get()
@@ -206,4 +213,24 @@ async fn named_device_details_stay_with_the_owner() {
     assert!(old.get("requested_at").is_none());
     assert!(old.get("approved_at").is_none());
     assert_eq!(old["last_route_at"], published["last_route_at"]);
+    let past = issued - 60_001;
+    admin
+        .get()
+        .await
+        .unwrap()
+        .execute(
+            "UPDATE howl_control.route_hints
+             SET issued_millis=$2, expires_millis=$3, hint=$4 WHERE device_id=$1",
+            &[
+                &&peer.device_id()[..],
+                &(past as i64),
+                &((past + 60_000) as i64),
+                &&signed_hint(&peer, &key, past, 4101)[..],
+            ],
+        )
+        .await
+        .unwrap();
+    let expired = success(read(&owner, &server, &device).await).await;
+    assert!(string(&expired, "last_route_at").ends_with('Z'));
+    assert!(expired.get("route").is_none());
 }
