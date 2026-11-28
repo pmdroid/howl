@@ -31,6 +31,7 @@ async fn advertised_link_recovers_its_nonce_and_reports_owner_denial() {
     };
     let begin = move |Json(input): Json<Value>| async move {
         assert_eq!(input["peer"], expected_peer);
+        assert!(input.get("name").is_none());
         Json(json!({
             "id": hex::encode([2; 32]),
             "secret": hex::encode([3; 32]),
@@ -147,4 +148,88 @@ async fn web_enabled_servers_keep_manual_and_explicit_device_code_routes() {
         assert_eq!(requests.try_recv().unwrap(), route);
     }
     server.abort();
+}
+
+#[tokio::test]
+async fn named_links_send_the_displayed_name_and_default_to_the_hostname() {
+    let config = || async {
+        Json(json!({
+            "audience":hex::encode([1;32]),
+            "browser_link_origin":"https://howl.test",
+            "device_names":true
+        }))
+    };
+    let (observed, mut requests) = tokio::sync::mpsc::unbounded_channel();
+    let begin = move |Json(input): Json<Value>| {
+        observed.send(input).unwrap();
+        async {
+            Json(json!({
+                "id": hex::encode([2;32]),
+                "secret": hex::encode([3;32]),
+                "nonce": hex::encode([4;32]),
+                "expires_in": 600
+            }))
+        }
+    };
+    let api = Router::new()
+        .route("/v1/auth/config", get(config))
+        .route("/v1/device-links", post(begin))
+        .route(
+            "/v1/device-links/{id}/poll",
+            post(|| async { Json(json!({"state":"denied"})) }),
+        );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async { axum::serve(listener, api).await.unwrap() });
+    let directory = tempfile::tempdir().unwrap();
+    let hostname = rustix::system::uname();
+    let default_name = hostname
+        .nodename()
+        .to_str()
+        .ok()
+        .and_then(|s| howl::control_client::device_name(s).ok());
+    for (flags, expected) in [
+        (&["--name", "  Studio Mac  "][..], Some("Studio Mac")),
+        (&[][..], default_name),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_howl"))
+            .args(["control", "login"])
+            .args(flags)
+            .arg(directory.path().join("device"))
+            .env("HOWL_CONTROL_URL", &origin)
+            .env_remove("HOWL_CONTROL_AUDIENCE")
+            .env("HOWL_NO_BROWSER", "1")
+            .output()
+            .await
+            .unwrap();
+        let body = requests.try_recv().unwrap();
+        assert_eq!(body.get("name").and_then(Value::as_str), expected);
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(text.lines().nth(1).unwrap().starts_with("Fingerprint "));
+        assert_eq!(
+            text.lines().nth(2),
+            expected.map(|n| format!("Name {n}")).as_deref()
+        );
+    }
+    server.abort();
+}
+
+#[tokio::test]
+async fn invalid_device_name_is_refused_before_creating_local_state() {
+    let directory = tempfile::tempdir().unwrap();
+    let device = directory.path().join("invalid");
+    let output = Command::new(env!("CARGO_BIN_EXE_howl"))
+        .args(["control", "login", "--name", "Work\nLaptop"])
+        .arg(&device)
+        .env_remove("HOWL_CONTROL_URL")
+        .output()
+        .await
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("Device names must contain")
+    );
+    assert!(!device.exists());
 }
