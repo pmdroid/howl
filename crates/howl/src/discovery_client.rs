@@ -25,10 +25,22 @@ pub(crate) async fn report_status(state: &Path, transport: &Transport) {
 
 async fn send_status(state: &Path, transport: &Transport) -> io::Result<()> {
     let client = ControlClient::open(state).await?;
-    let body = serde_json::to_vec(&transport.peer_paths().await)?;
-    let response = client
-        .post_json(MESH_STATUS_PATH, MESH_STATUS_OPERATION, &body)
+    let paths = transport.peer_paths().await;
+    let report = serde_json::json!({"paths": &paths, "home_relay": transport.connected_relay()});
+    let body = serde_json::to_vec(&report)?;
+    let mut response = client
+        .post_json("/v2/discovery/status", MESH_STATUS_OPERATION, &body)
         .await?;
+    if response.status() == StatusCode::NOT_FOUND {
+        let legacy: Vec<_> = paths
+            .iter()
+            .map(|path| serde_json::json!({"device":path.device,"kind":path.kind}))
+            .collect();
+        let body = serde_json::to_vec(&legacy)?;
+        response = client
+            .post_json(MESH_STATUS_PATH, MESH_STATUS_OPERATION, &body)
+            .await?;
+    }
     if response.status() != StatusCode::NO_CONTENT {
         return Err(refused());
     }
