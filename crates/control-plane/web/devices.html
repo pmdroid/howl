@@ -13,7 +13,7 @@
     <button id="logout" hidden>Sign out</button>
   </header>
   <main>
-    <h1>Device approvals</h1>
+    <h1>Devices</h1>
     <p id="status" role="status">Loading your network…</p>
     <p id="error" role="alert"></p>
     <button id="retry" hidden>Try again</button>
@@ -34,7 +34,7 @@
         <ul id="pending"></ul>
         <p id="empty">No devices are waiting for approval.</p>
       </section>
-      <details id="members">
+      <details id="members" open>
         <summary>Approved devices</summary>
         <ul id="approved"></ul>
       </details>
@@ -42,6 +42,7 @@
     <a id="leave-link" href="/devices" hidden>Cancel and return to devices</a>
     <template id="device">
       <li>
+        <h3><a class="device-name" dir="auto"></a></h3>
         <dl>
           <dt>Fingerprint</dt><dd class="fingerprint"><code></code></dd>
           <dt>Device ID</dt><dd class="device-id"><code></code></dd>

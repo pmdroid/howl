@@ -58,13 +58,15 @@ docker compose -f deploy/private-beta/compose.yaml -f deploy/private-beta/compos
 
 Open `/devices` at the control-plane origin and choose **Sign in with GitHub**. Your first web sign-in creates your account's network. Returning to the dashboard with the same GitHub account opens that network.
 
-On each device, set `HOWL_CONTROL_URL` to the same HTTPS origin. Run the login command with a fresh private state directory. It prints a private Howl link and the full certificate fingerprint. Keep the command running while you open the link in your browser.
+On each device, set `HOWL_CONTROL_URL` to the same HTTPS origin. Run the login command with a fresh private state directory. To give the device a name, pass `--name` before the state directory. The command prints a private Howl link and the full certificate fingerprint. Keep the command running while you open the link in your browser.
 
 ```sh
-howl control login "$device_state"
+howl control login --name "Work laptop" "$device_state"
 ```
 
 If prompted, sign in with the GitHub account that owns the network. Opening the link while signed in binds the request to that account and adds it to **Pending requests**. Check that the network ID matches your dashboard and compare the full fingerprint on the page with the one printed on the device. Choose **Approve** or **Deny**. The CLI receives the decision from the control plane, even when every previously approved device is offline. Approved devices appear under **Approved devices** on the dashboard after the CLI completes enrollment. On an approved device, run `howl control devices "$device_state"` to see its membership.
+
+Select a device name under **Pending requests** or **Approved devices** to see its membership, full fingerprint and device ID. Choose **Rename** to change its display name. The details page shows request, approval and last address update times when the control plane has recorded them.
 
 Start the mesh on each approved device. Use the network ID shown on the dashboard and the recipient's device ID. The final dash selects the discovered iroh route.
 

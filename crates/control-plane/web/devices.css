@@ -58,3 +58,20 @@ li dd + dt { margin-top: .6rem; }
 summary { cursor: pointer; font-weight: 600; padding: .6rem 0; }
 
 #leave-link:not([hidden]) { display: inline-block; margin-top: 1.5rem; color: var(--green); text-underline-offset: .15em; }
+
+.device-name, .back a { color: var(--green); text-decoration-thickness: 1px; text-underline-offset: .16em; }
+.device-name:hover, .back a:hover { color: #174737; text-decoration-thickness: 2px; }
+li h3 { margin: 0 0 .65rem; font-size: 1.12rem; overflow-wrap: anywhere; }
+.back { margin-bottom: 1rem; }
+.device-heading { display: flex; align-items: baseline; justify-content: space-between; flex-wrap: wrap; gap: .75rem; }
+.device-heading h1 { min-width: 0; overflow-wrap: anywhere; }
+#details { margin-top: 1.6rem; border-bottom: 1px solid var(--line); background: var(--paper); }
+#details > div:not([hidden]) { display: grid; grid-template-columns: 7rem minmax(0, 1fr); gap: .3rem .7rem; border-top: 1px solid var(--line); padding: .95rem 1rem; align-items: baseline; }
+#editor { max-width: 32rem; margin-top: 1.2rem; }
+#editor label { display: block; font-weight: 600; }
+#name { display: block; width: 100%; min-height: 2.75rem; margin-top: .3rem; padding: .45rem .7rem; border: 1px solid #7e9989; border-radius: 5px; font: inherit; color: inherit; background: var(--paper); }
+#name-error { color: #792d26; margin-top: .4rem; }
+#editor .actions { margin-top: .65rem; }
+@media (max-width: 36rem) {
+  #details > div:not([hidden]) { grid-template-columns: minmax(0, 1fr); }
+}
