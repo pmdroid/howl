@@ -1,4 +1,5 @@
 mod context;
+mod github;
 mod tokens;
 mod work;
 
@@ -62,6 +63,8 @@ struct Conversation {
     work_policy: Option<Id>,
     #[serde(default)]
     work_control_from: Vec<String>,
+    #[serde(skip)]
+    forwards_work_commands: bool,
     #[serde(default)]
     peers: Vec<AgentPeer>,
     #[serde(default)]
@@ -80,6 +83,7 @@ struct AgentPeer {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Schedule {
+    github_pull_requests: Option<String>,
     name: String,
     seconds: i64,
     instruction: String,
@@ -132,7 +136,11 @@ impl Conversation {
             || self.revision.trim().is_empty()
             || self.schedules.len() > 8
             || self.schedules.iter().any(|schedule| {
-                schedule.name.is_empty()
+                schedule
+                    .github_pull_requests
+                    .as_deref()
+                    .is_some_and(|name| !github::valid_repository(name))
+                    || schedule.name.is_empty()
                     || !names.insert(&schedule.name)
                     || !(60..=31_536_000).contains(&schedule.seconds)
                     || schedule.instruction.trim().is_empty()
@@ -153,16 +161,24 @@ impl Conversation {
     fn schedules(&self) -> Vec<OngoingSchedule> {
         self.schedules
             .iter()
-            .map(|schedule| OngoingSchedule {
-                id: Sha256::new()
+            .map(|schedule| {
+                let mut hash = Sha256::new()
                     .chain_update(schedule.seconds.to_be_bytes())
                     .chain_update(schedule.name.as_bytes())
                     .chain_update([0])
-                    .chain_update(schedule.instruction.as_bytes())
-                    .finalize()
-                    .into(),
-                seconds: schedule.seconds,
-                text: schedule.instruction.clone(),
+                    .chain_update(schedule.instruction.as_bytes());
+                if let Some(repo) = &schedule.github_pull_requests {
+                    hash = Sha256::new()
+                        .chain_update(b"howl/github-pr-schedule/v1")
+                        .chain_update(hash.finalize())
+                        .chain_update(repo.as_bytes());
+                }
+                OngoingSchedule {
+                    id: hash.finalize().into(),
+                    seconds: schedule.seconds,
+                    text: schedule.instruction.clone(),
+                    github_pull_requests: schedule.github_pull_requests.clone(),
+                }
             })
             .collect()
     }
@@ -199,15 +215,18 @@ where
         }
         conversations.push((conversation, origin));
     }
-    if conversations.iter().any(|(conversation, _)| {
-        conversation.work_control_from.iter().any(|delegate| {
-            parse_id(delegate)
-                .is_ok_and(|id| keys.contains(&(conversation.channel, conversation.peer, Some(id))))
-        })
-    }) {
-        return Err(invalid(
-            "a work control delegate must use its owner's conversation",
-        ));
+    let mut delegates = HashSet::new();
+    for (owner, _) in &conversations {
+        for delegate in &owner.work_control_from {
+            delegates.insert((owner.channel, owner.peer, parse_id(delegate)?));
+        }
+    }
+    for (conversation, origin) in &mut conversations {
+        conversation.forwards_work_commands = origin
+            .is_some_and(|id| delegates.contains(&(conversation.channel, conversation.peer, id)));
+        if conversation.forwards_work_commands && conversation.work {
+            return Err(invalid("a work control delegate cannot also own workers"));
+        }
     }
     if let Some(policy) = &config.context {
         policy.budget()?;
@@ -405,6 +424,7 @@ where
                 thread,
                 &schedules,
                 &delegates,
+                conversation.forwards_work_commands,
                 conversation.shared_thread.as_deref().zip(shared),
                 now,
             )

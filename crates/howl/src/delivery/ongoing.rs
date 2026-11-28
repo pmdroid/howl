@@ -16,12 +16,14 @@ pub(crate) struct Thread {
 }
 
 pub(crate) struct Schedule {
+    pub github_pull_requests: Option<String>,
     pub id: Id,
     pub seconds: i64,
     pub text: String,
 }
 
 pub(crate) struct Input {
+    pub github_pull_requests: Option<String>,
     pub id: i64,
     pub shared: Option<Id>,
     pub sender: Id,
@@ -104,6 +106,7 @@ impl DeliveryStore {
         thread: Thread,
         schedules: &[Schedule],
         work_control_from: &str,
+        forwards_work_commands: bool,
         shared_thread: Option<(&str, Id)>,
         now: i64,
     ) -> Result<Option<Input>> {
@@ -146,6 +149,7 @@ impl DeliveryStore {
                 due = Some((next, schedule));
             }
         }
+        let mut github_pull_requests = None;
         let mut parent = None;
         let mut shared = None;
         let mut sender = thread.origin.unwrap_or(thread.peer.device);
@@ -165,6 +169,7 @@ impl DeliveryStore {
             )?;
             Some((reply, text, Source::PeerReply))
         } else if let Some((due, schedule)) = due {
+            github_pull_requests.clone_from(&schedule.github_pull_requests);
             let source = Sha256::new()
                 .chain_update(b"howl/scheduled-turn/v1\0")
                 .chain_update(thread.scope)
@@ -188,11 +193,12 @@ impl DeliveryStore {
                  WHERE substr(i.stream, 1, 32) = ?3 AND substr(i.stream, 33, 64) = ?4
                    AND i.epoch = ?5 AND i.kind = 1 AND i.body IS NOT NULL
                    AND (e.recipient = ?2 OR (e.recipient IS NULL AND ?8 IS NOT NULL AND g.actor IS ?6 AND substr(i.body,1,length(?8)) = ?8 AND length(trim(substr(i.body,length(?8)+1))) > 0))
-                   AND (g.actor IS ?6 OR (hex(g.actor) IN (SELECT value FROM json_each(?7))
-                       AND (trim(i.body) GLOB '/work *' OR trim(i.body) GLOB '/steer *' OR trim(i.body) GLOB '/cancel *')))
+                   AND CASE WHEN e.recipient = ?2 AND (trim(i.body) GLOB '/work *' OR trim(i.body) GLOB '/steer *' OR trim(i.body) GLOB '/cancel *')
+                       THEN (g.actor IS ?6 AND NOT ?9) OR hex(g.actor) IN (SELECT value FROM json_each(?7))
+                       ELSE g.actor IS ?6 END
                    AND i.id > (SELECT cursor FROM ongoing_threads WHERE scope = ?1)
                  ORDER BY i.id LIMIT 1",
-                params![thread.scope, self.local.encode(), thread.channel, thread.peer.encode(), thread.epoch.to_be_bytes(), thread.origin, work_control_from, shared_thread.map(|(name,_)| format!("@{name} "))],
+                params![thread.scope, self.local.encode(), thread.channel, thread.peer.encode(), thread.epoch.to_be_bytes(), thread.origin, work_control_from, shared_thread.map(|(name,_)| format!("@{name} ")), forwards_work_commands],
                 |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Id>(1)?, row.get::<_, String>(2)?,row.get::<_,bool>(3)?)),
             ).optional()?;
             if let Some((cursor, source, text, channel_post)) = message {
@@ -228,6 +234,7 @@ impl DeliveryStore {
                 params![id, shared, parent, sender],
             )?;
             Some(Input {
+                github_pull_requests,
                 id,
                 shared,
                 sender,
@@ -766,6 +773,7 @@ mod tests {
             origin: None,
         };
         let schedules = [Schedule {
+            github_pull_requests: Some("pallets/click".to_owned()),
             id: [6; 32],
             seconds: 60,
             text: "Check in".into(),
@@ -774,7 +782,7 @@ mod tests {
         store.prepare_thread(thread).unwrap();
         assert!(
             store
-                .next_ongoing(thread, &schedules, "[]", None, 10)
+                .next_ongoing(thread, &schedules, "[]", false, None, 10)
                 .unwrap()
                 .is_none()
         );
@@ -783,14 +791,15 @@ mod tests {
         let mut store = DeliveryStore::open(&path, &[9; 32], local).unwrap();
         store.prepare_thread(thread).unwrap();
         let turn = store
-            .next_ongoing(thread, &schedules, "[]", None, 500)
+            .next_ongoing(thread, &schedules, "[]", false, None, 500)
             .unwrap()
             .unwrap();
         assert!(turn.source == Source::Schedule);
         assert_eq!(turn.text, "Check in");
+        assert_eq!(turn.github_pull_requests.as_deref(), Some("pallets/click"));
         assert!(
             store
-                .next_ongoing(thread, &schedules, "[]", None, 500)
+                .next_ongoing(thread, &schedules, "[]", false, None, 500)
                 .unwrap()
                 .is_none()
         );
@@ -801,13 +810,13 @@ mod tests {
         );
         assert!(
             store
-                .next_ongoing(thread, &schedules, "[]", None, 559)
+                .next_ongoing(thread, &schedules, "[]", false, None, 559)
                 .unwrap()
                 .is_none()
         );
         assert!(
             store
-                .next_ongoing(thread, &schedules, "[]", None, 560)
+                .next_ongoing(thread, &schedules, "[]", false, None, 560)
                 .unwrap()
                 .is_some()
         );
@@ -880,12 +889,12 @@ mod tests {
                 .unwrap();
             assert!(
                 store
-                    .next_ongoing(thread, &[], "[]", Some(("changed", [9; 32])), 50)
+                    .next_ongoing(thread, &[], "[]", false, Some(("changed", [9; 32])), 50)
                     .unwrap()
                     .is_none()
             );
             let input = store
-                .next_ongoing(thread, &[], "[]", Some(("review", shared)), 50)
+                .next_ongoing(thread, &[], "[]", false, Some(("review", shared)), 50)
                 .unwrap()
                 .unwrap();
             assert_eq!(input.sender, peer);
@@ -1026,6 +1035,76 @@ mod tests {
     }
 
     #[test]
+    fn delegated_commands_and_integration_chat_reach_separate_conversations() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = Device {
+            account: [1; 32],
+            device: [2; 32],
+        };
+        let owner = Thread {
+            scope: [3; 32],
+            channel: [4; 32],
+            peer: local,
+            epoch: 1,
+            origin: None,
+        };
+        let actor = [5_u8; 32];
+        let bot = Thread {
+            scope: [6; 32],
+            origin: Some(actor),
+            ..owner
+        };
+        let mut store = DeliveryStore::open(&dir.path().join("db"), &[9; 32], local).unwrap();
+        store.prepare_thread(owner).unwrap();
+        store.prepare_thread(bot).unwrap();
+        let stream = super::super::Stream {
+            channel: owner.channel,
+            sender: local,
+            signing_key: [7; 32],
+        }
+        .encode();
+        for (sequence, body, sender) in [
+            (1u8, "/steer run change", actor),
+            (2, "chat", actor),
+            (3, "/cancel run", [8; 32]),
+        ] {
+            store.connection.execute(
+                "INSERT INTO inbox(stream,message,sequence,epoch,received,expires,digest,kind,body)
+                 VALUES (?1,?2,?3,?4,x'00',x'00',x'00',1,?5)",
+                params![stream,[sequence;32],[sequence],owner.epoch.to_be_bytes(),body],
+            ).unwrap();
+            let cursor = store.connection.last_insert_rowid();
+            store
+                .connection
+                .execute(
+                    "INSERT INTO channel_event_addresses VALUES (?1,0,?2)",
+                    params![cursor, local.encode()],
+                )
+                .unwrap();
+            store
+                .connection
+                .execute(
+                    "INSERT INTO integration_events VALUES (?1,?2)",
+                    params![cursor, sender],
+                )
+                .unwrap();
+        }
+        let delegates = serde_json::to_string(&[hex::encode_upper(actor)]).unwrap();
+        for (thread, delegates, forwarded, expected) in [
+            (bot, "[]", true, "chat"),
+            (owner, delegates.as_str(), false, "/steer run change"),
+        ] {
+            let read = |store: &mut DeliveryStore| {
+                store
+                    .next_ongoing(thread, &[], delegates, forwarded, None, 10)
+                    .unwrap()
+            };
+            assert_eq!(read(&mut store).unwrap().text, expected);
+            assert!(read(&mut store).is_none());
+        }
+    }
+
+    #[test]
     fn work_is_idempotent_control_is_scoped_and_results_deliver_once() {
         let dir = tempfile::tempdir().unwrap();
         let device = Device {
@@ -1080,14 +1159,14 @@ mod tests {
             .finish_work(id, || panic!("cancelled work published"))
             .unwrap();
         let result = store
-            .next_ongoing(thread, &[], "[]", None, 100)
+            .next_ongoing(thread, &[], "[]", false, None, 100)
             .unwrap()
             .unwrap();
         assert!(result.source == Source::WorkResult);
         assert!(result.text.ends_with("was cancelled."));
         assert!(
             store
-                .next_ongoing(thread, &[], "[]", None, 100)
+                .next_ongoing(thread, &[], "[]", false, None, 100)
                 .unwrap()
                 .is_none()
         );
@@ -1110,7 +1189,7 @@ mod tests {
             })
             .unwrap();
         let result = store
-            .next_ongoing(thread, &[], "[]", None, 101)
+            .next_ongoing(thread, &[], "[]", false, None, 101)
             .unwrap()
             .unwrap();
         assert!(result.source == Source::WorkResult);
