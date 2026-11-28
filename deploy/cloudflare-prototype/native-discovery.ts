@@ -35,10 +35,10 @@ function validSet(body: Uint8Array) {
   const claimedLength = (body[relayOffset] << 8) | body[relayOffset + 1];
   if (relay.length !== claimedLength || relay.length > 255) return false;
   if (relay.length === 0) return count > 0;
-  return (
-    relay.every((byte) => byte >= 33 && byte <= 126) &&
-    new TextDecoder().decode(relay).startsWith("https://")
-  );
+  if (!relay.every((byte) => byte >= 33 && byte <= 126)) return false;
+  const address = new TextDecoder().decode(relay);
+  const parsed = URL.parse(address);
+  return parsed?.protocol === "https:" && parsed.href === address;
 }
 
 function routeTable(version: number) {

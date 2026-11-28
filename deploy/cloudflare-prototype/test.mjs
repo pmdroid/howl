@@ -429,6 +429,11 @@ test("Native publishing Worker", async (t) => {
       );
       const v2 = "/v2/discovery/hints";
       const routes = routeSet(alice, route, "https://example.test/");
+      const invalidRelay = routeSet(alice, route, "https://[broken/");
+      await status(
+        signed(alice, v2, "discovery-write", Buffer.concat([bytes(alice.peer), invalidRelay])),
+        400,
+      );
       const forgedSet = Buffer.from(routes);
       forgedSet[forgedSet.length - 1] ^= 1;
       await status(
