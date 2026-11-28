@@ -43,6 +43,7 @@ if (version.status !== 0 || version.stdout.trim() !== "codex-cli 0.159.3") {
   stop("Host Codex requires the tested Codex CLI 0.159.3.");
 }
 
+const maxPromptBytes = 16 * 1024 * 1024;
 const cli = [
   "--ask-for-approval", "never", "exec", "--json", "--ephemeral",
   "--ignore-user-config", "--ignore-rules", "--skip-git-repo-check",
@@ -50,6 +51,7 @@ const cli = [
   "-c", 'forced_login_method="chatgpt"', "-c", "features.skip_host_skill_discovery=true",
   "-c", "mcp_servers.howl_repository.url=" + JSON.stringify(url.href),
 ];
+if (process.env.HOWL_AGENT_MODEL) cli.push("--model", process.env.HOWL_AGENT_MODEL);
 const editable = process.env.HOWL_EDITABLE_WORKSPACE === "1";
 const work = process.env.HOWL_WORK_TOOLS === "1";
 if (editable || work) {
@@ -85,18 +87,26 @@ function fail(id, code, message) {
 }
 
 async function* lines(stream, maxBytes) {
-  let rest = Buffer.alloc(0);
+  let parts = [];
+  let size = 0;
   for await (const chunk of stream) {
-    const data = Buffer.concat([rest, chunk]);
-    let offset = 0;
-    for (let next = data.indexOf(10); next !== -1; next = data.indexOf(10, offset)) {
-      if (next - offset > maxBytes) throw new Error("Oversized frame");
-      yield data.subarray(offset, next).toString("utf8");
-      offset = next + 1;
+    let start = 0;
+    while (start < chunk.length) {
+      const newline = chunk.indexOf(10, start);
+      const end = newline < 0 ? chunk.length : newline;
+      const part = chunk.subarray(start, end);
+      size += part.length;
+      if (size > maxBytes) throw new Error("Oversized frame");
+      parts.push(part);
+      if (newline < 0) break;
+      const line = Buffer.concat(parts, size).toString("utf8");
+      parts = [];
+      size = 0;
+      yield line;
+      start = newline + 1;
     }
-    rest = data.subarray(offset);
-    if (rest.length > maxBytes) throw new Error("Oversized frame");
   }
+  if (size > 0) throw new Error("Incomplete frame");
 }
 
 function cancel(turn) {
@@ -194,7 +204,7 @@ function receive({ id, method, params = {} }) {
       return;
     }
     const text = blocks.map((block) => block.text).join("\n");
-    if (!text.trim() || Buffer.byteLength(text) > 64 * 1024) {
+    if (!text.trim() || Buffer.byteLength(text) > maxPromptBytes) {
       fail(id, -32602, "Codex prompt is empty or too large.");
       return;
     }
@@ -212,7 +222,7 @@ process.once("SIGTERM", () => {
   process.exit(0);
 });
 try {
-  for await (const line of lines(process.stdin, 256 * 1024)) {
+  for await (const line of lines(process.stdin, 6 * maxPromptBytes + 8192)) {
     try {
       receive(JSON.parse(line));
     } catch {

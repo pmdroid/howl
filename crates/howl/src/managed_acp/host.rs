@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 use super::{Error, RepositoryHttp, Result};
 
 pub struct HostClaude {
+    model: Option<String>,
     node: PathBuf,
     adapter: PathBuf,
     claude: PathBuf,
@@ -28,6 +29,7 @@ impl HostClaude {
         Ok(Self {
             node,
             adapter,
+            model: None,
             claude,
             home,
         })
@@ -58,6 +60,9 @@ impl HostClaude {
         )?;
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))?;
         launch(&self.adapter, &self.node, scratch, cwd, &home, |command| {
+            if let Some(model) = &self.model {
+                command.env("HOWL_AGENT_MODEL", model);
+            }
             command
                 .env("HOWL_EDITABLE_WORKSPACE", if editable { "1" } else { "0" })
                 .env("HOWL_WORK_TOOLS", if work { "1" } else { "0" })
@@ -76,6 +81,7 @@ impl HostClaude {
 }
 
 pub struct HostGrok {
+    model: Option<String>,
     node: PathBuf,
     grok: PathBuf,
     auth: PathBuf,
@@ -89,7 +95,12 @@ impl HostGrok {
         {
             return Err(Error::HostAgent);
         }
-        Ok(Self { node, grok, auth })
+        Ok(Self {
+            model: None,
+            node,
+            grok,
+            auth,
+        })
     }
 
     fn fingerprint(&self, hash: &mut Sha256) {
@@ -111,6 +122,9 @@ impl HostGrok {
         let wrapper = scratch_path.join("grok-wrapper.mjs");
         fs::write(&wrapper, include_str!("../host_agents/grok-wrapper.mjs"))?;
         launch(&self.node, &self.node, scratch, cwd, &home, |command| {
+            if let Some(model) = &self.model {
+                command.env("HOWL_AGENT_MODEL", model);
+            }
             command
                 .arg(wrapper)
                 .env("HOWL_EDITABLE_WORKSPACE", if editable { "1" } else { "0" })
@@ -122,6 +136,7 @@ impl HostGrok {
 }
 
 pub struct HostCodex {
+    model: Option<String>,
     node: PathBuf,
     codex: PathBuf,
     home: PathBuf,
@@ -141,6 +156,7 @@ impl HostCodex {
             codex,
             home,
             state_home: None,
+            model: None,
         })
     }
 
@@ -179,6 +195,9 @@ impl HostCodex {
         let wrapper = scratch_path.join("codex-wrapper.mjs");
         fs::write(&wrapper, include_str!("../host_agents/codex-wrapper.mjs"))?;
         launch(&self.node, &self.node, scratch, cwd, &home, |command| {
+            if let Some(model) = &self.model {
+                command.env("HOWL_AGENT_MODEL", model);
+            }
             command
                 .arg(wrapper)
                 .env("HOWL_EDITABLE_WORKSPACE", if editable { "1" } else { "0" })
@@ -333,6 +352,40 @@ pub(super) enum HostAgent {
 }
 
 impl HostAgent {
+    pub(super) fn select_model(&mut self, model: &str) -> io::Result<()> {
+        let id = if matches!(self, Self::OpenCode(_)) {
+            model.strip_prefix("opencode-go/").unwrap_or(model)
+        } else {
+            model
+        };
+        let name = if matches!(self, Self::Claude(_)) {
+            id.strip_suffix("[1m]").unwrap_or(id)
+        } else {
+            id
+        };
+        if id.len() > 128
+            || !name
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphanumeric)
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-._".contains(&b))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid host model identifier",
+            ));
+        }
+        match self {
+            Self::Claude(agent) => agent.model = Some(id.to_owned()),
+            Self::Codex(agent) => agent.model = Some(id.to_owned()),
+            Self::Grok(agent) => agent.model = Some(id.to_owned()),
+            Self::OpenCode(agent) => agent.model = id.to_owned(),
+        }
+        Ok(())
+    }
+
     pub(super) fn node(&self) -> &Path {
         match self {
             Self::Claude(agent) => agent.node(),
@@ -343,6 +396,17 @@ impl HostAgent {
     }
 
     pub(super) fn fingerprint(&self, hash: &mut Sha256) {
+        let pin = match self {
+            Self::Claude(agent) => &agent.model,
+            Self::Codex(agent) => &agent.model,
+            Self::Grok(agent) => &agent.model,
+            Self::OpenCode(_) => &None,
+        };
+        if let Some(pin) = pin {
+            hash.update(b"host-model\0");
+            hash.update((pin.len() as u64).to_be_bytes());
+            hash.update(pin.as_bytes());
+        }
         match self {
             Self::Claude(agent) => agent.fingerprint(hash),
             Self::Grok(agent) => agent.fingerprint(hash),
@@ -426,5 +490,41 @@ impl HostProcess {
 impl Drop for HostProcess {
     fn drop(&mut self) {
         let _ = self.stop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn model_pins_validate_identifiers_and_scope_host_sessions() {
+        let path = PathBuf::from("/fixture");
+        let mut agent = HostAgent::Claude(
+            HostClaude::new(path.clone(), path.clone(), path.clone(), path.clone()).unwrap(),
+        );
+        let fingerprint = |agent: &HostAgent| {
+            let mut hash = Sha256::new();
+            agent.fingerprint(&mut hash);
+            hash.finalize()
+        };
+        let original = fingerprint(&agent);
+        for invalid in ["", "--model", "opus --tools", "provider/opus", "[1m]"] {
+            assert!(agent.select_model(invalid).is_err());
+            assert_eq!(fingerprint(&agent), original);
+        }
+        agent.select_model("opus[1m]").unwrap();
+        let pinned = fingerprint(&agent);
+        assert_ne!(original, pinned);
+        agent.select_model("opus").unwrap();
+        assert_ne!(pinned, fingerprint(&agent));
+
+        let mut opencode = HostAgent::OpenCode(
+            HostOpenCode::new(path.clone(), path.clone(), path, "kimi-k3".into()).unwrap(),
+        );
+        let original = fingerprint(&opencode);
+        opencode.select_model("opencode-go/kimi-k3").unwrap();
+        assert_eq!(fingerprint(&opencode), original);
+        assert!(opencode.select_model("other/kimi-k3").is_err());
     }
 }

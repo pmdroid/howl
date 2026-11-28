@@ -42,6 +42,7 @@ tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process"
 tokio-util = { version = "0.7", features = ["codec"] }
 tempfile = "=3.27.0"
 thiserror = "2"
+tiktoken-rs = "=0.12.1"
 zeroize = "1"
 
 [target.'cfg(target_os = "macos")'.dependencies]

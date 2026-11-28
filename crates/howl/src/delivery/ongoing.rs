@@ -49,11 +49,24 @@ pub(crate) struct Publication {
     pub result: String,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub(crate) struct Exchange {
-    input: String,
-    sender: String,
-    reply: Option<String>,
+    #[serde(skip)]
+    pub(crate) id: i64,
+    pub(crate) input: String,
+    pub(crate) sender: String,
+    pub(crate) reply: Option<String>,
+}
+
+impl Exchange {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get(0)?,
+            input: row.get(1)?,
+            sender: row.get(2)?,
+            reply: row.get(3)?,
+        })
+    }
 }
 
 impl DeliveryStore {
@@ -237,22 +250,76 @@ impl DeliveryStore {
         shared: Option<Id>,
     ) -> Result<Vec<Exchange>> {
         let mut statement = self.connection.prepare(
-            "SELECT t.input, t.result, lower(hex(coalesce(c.sender, substr(s.peer,33,32)))) FROM ongoing_turns t
-             JOIN ongoing_threads s ON s.scope=t.scope LEFT JOIN ongoing_turn_context c ON c.turn=t.id
-             WHERE (t.scope = ?1 OR ?3 IS NOT NULL) AND c.shared IS ?3 AND t.id < ?2 AND t.input <> ''
-             ORDER BY t.id DESC LIMIT 8",
+            "SELECT id, input, sender, result FROM ongoing_history
+             WHERE (scope = ?1 OR ?3 IS NOT NULL) AND shared IS ?3 AND id < ?2
+             ORDER BY id DESC LIMIT 8",
         )?;
         let mut history = statement
-            .query_map(params![scope, before, shared], |row| {
-                Ok(Exchange {
-                    input: row.get(0)?,
-                    reply: row.get(1)?,
-                    sender: row.get(2)?,
-                })
-            })?
+            .query_map(params![scope, before, shared], Exchange::from_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         history.reverse();
         Ok(history)
+    }
+
+    pub(crate) fn ongoing_history_page(
+        &self,
+        scope: Id,
+        shared: Option<Id>,
+        after: i64,
+        before: i64,
+    ) -> Result<Vec<Exchange>> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, input, sender, result FROM ongoing_history
+             WHERE (scope = ?1 OR ?2 IS NOT NULL) AND shared IS ?2 AND id > ?3 AND id < ?4
+             ORDER BY id LIMIT 32",
+        )?;
+        Ok(statement
+            .query_map(params![scope, shared, after, before], Exchange::from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub(crate) fn ongoing_checkpoint(
+        &self,
+        scope: Id,
+        shared: Option<Id>,
+        before: i64,
+    ) -> Result<Option<(i64, String)>> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT through_turn, summary FROM ongoing_checkpoints
+             WHERE audience = ?1 AND is_shared = ?2 AND through_turn < ?3
+             ORDER BY through_turn DESC LIMIT 1",
+                params![shared.unwrap_or(scope), shared.is_some(), before],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    pub(crate) fn save_ongoing_checkpoint(
+        &self,
+        scope: Id,
+        shared: Option<Id>,
+        before: i64,
+        expected: i64,
+        through: i64,
+        summary: &str,
+    ) -> Result<bool> {
+        if through <= expected || through >= before || summary.trim().is_empty() {
+            return Ok(false);
+        }
+        let saved = self.connection.execute(
+            "INSERT INTO ongoing_checkpoints(audience, is_shared, through_turn, summary)
+             SELECT ?1, ?2, ?3, ?4
+             WHERE ?5 = (SELECT coalesce(max(through_turn), 0) FROM ongoing_checkpoints
+                         WHERE audience = ?1 AND is_shared = ?2)
+               AND EXISTS (SELECT 1 FROM ongoing_history WHERE id = ?3
+                           AND (scope = ?6 OR ?7 IS NOT NULL) AND shared IS ?7)
+               AND NOT EXISTS (SELECT 1 FROM ongoing_history WHERE id > ?5 AND id <= ?3
+                               AND (scope = ?6 OR ?7 IS NOT NULL) AND shared IS ?7 AND finished = 0)",
+            params![shared.unwrap_or(scope), shared.is_some(), through, summary, expected, scope, shared],
+        )?;
+        Ok(saved == 1)
     }
 
     pub(crate) fn pending_ongoing(&self, scope: Id) -> Result<Option<Publication>> {
@@ -449,6 +516,150 @@ pub(super) fn publish(tx: &Connection, id: i64, message: Id) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checkpoints_advance_over_finished_turns_in_their_own_audience() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("delivery.db");
+        let local = Device {
+            account: [1; 32],
+            device: [2; 32],
+        };
+        let first = Thread {
+            scope: [3; 32],
+            channel: [4; 32],
+            peer: local,
+            epoch: 1,
+            origin: None,
+        };
+        let second = Thread {
+            scope: [5; 32],
+            ..first
+        };
+        let shared = Some(first.scope);
+        let store = DeliveryStore::open(&path, &[9; 32], local).unwrap();
+        store.prepare_thread(first).unwrap();
+        store.prepare_thread(second).unwrap();
+        let mut shared_turns = Vec::new();
+        for number in 1..=38u8 {
+            let scope = if number % 2 == 0 {
+                first.scope
+            } else {
+                second.scope
+            };
+            let pending = number == 4;
+            store
+                .connection
+                .execute(
+                    "INSERT INTO ongoing_turns(scope, source, scheduled, input, finished, result)
+                 VALUES (?1, ?2, 0, ?3, ?4, ?5)",
+                    params![
+                        scope,
+                        [number; 32],
+                        number.to_string(),
+                        !pending,
+                        (!pending).then_some("answered")
+                    ],
+                )
+                .unwrap();
+            let id = store.connection.last_insert_rowid();
+            if number > 2 {
+                store.connection.execute(
+                    "INSERT INTO ongoing_turn_context(turn, shared, sender) VALUES (?1, ?2, ?3)",
+                    params![id, shared, local.device],
+                ).unwrap();
+                shared_turns.push(id);
+            }
+        }
+        let page = store
+            .ongoing_history_page(first.scope, shared, 0, i64::MAX)
+            .unwrap();
+        assert_eq!(page.len(), 32);
+        assert_eq!(page[0].input, "3");
+        assert_eq!(page[1].reply, None);
+        assert_eq!(page[31].id, shared_turns[31]);
+        let rest = store
+            .ongoing_history_page(second.scope, shared, page[31].id, i64::MAX)
+            .unwrap();
+        assert_eq!(rest.len(), 4);
+        assert_eq!(rest[3].input, "38");
+        assert_eq!(
+            store
+                .ongoing_history_page(first.scope, None, 0, i64::MAX)
+                .unwrap()[0]
+                .input,
+            "2"
+        );
+        let summary = |expected, through, text| {
+            store
+                .save_ongoing_checkpoint(first.scope, shared, i64::MAX, expected, through, text)
+                .unwrap()
+        };
+        assert!(!summary(
+            0,
+            shared_turns[2],
+            "would swallow a pending question"
+        ));
+        assert!(!summary(0, 2, "private endpoint"));
+        let cut = shared_turns[0];
+        assert!(summary(0, cut, "first"));
+        assert!(
+            store
+                .ongoing_checkpoint(first.scope, None, i64::MAX)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .save_ongoing_checkpoint(first.scope, None, i64::MAX, 0, 2, "private")
+                .unwrap()
+        );
+        assert!(
+            store
+                .ongoing_checkpoint(second.scope, None, i64::MAX)
+                .unwrap()
+                .is_none()
+        );
+        store
+            .finish_ongoing(shared_turns[1], "later answer", true)
+            .unwrap();
+        let next = shared_turns[2];
+        assert!(summary(cut, next, "second"));
+        assert!(!summary(cut, shared_turns[3], "stale writer"));
+        assert!(
+            !store
+                .save_ongoing_checkpoint(
+                    first.scope,
+                    shared,
+                    shared_turns[3],
+                    next,
+                    shared_turns[3],
+                    "future"
+                )
+                .unwrap()
+        );
+        drop(store);
+        let reopened = DeliveryStore::open(&path, &[9; 32], local).unwrap();
+        assert_eq!(
+            reopened
+                .ongoing_checkpoint(second.scope, shared, next)
+                .unwrap(),
+            Some((cut, "first".into()))
+        );
+        assert_eq!(
+            reopened
+                .ongoing_checkpoint(second.scope, shared, next + 1)
+                .unwrap(),
+            Some((next, "second".into()))
+        );
+        assert_eq!(
+            reopened
+                .ongoing_history_page(first.scope, shared, 0, next)
+                .unwrap()
+                .len(),
+            2
+        );
+    }
 
     #[test]
     fn due_schedules_survive_restart_and_skip_missed_intervals() {

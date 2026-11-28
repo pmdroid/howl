@@ -1,3 +1,5 @@
+mod context;
+mod tokens;
 mod work;
 
 pub(crate) use work::WorkTools;
@@ -37,6 +39,8 @@ const TURN_LIMIT: Duration = Duration::from_secs(120);
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Configuration {
+    model: Option<String>,
+    context: Option<context::Policy>,
     conversations: Vec<Conversation>,
 }
 
@@ -163,6 +167,7 @@ impl Conversation {
 }
 
 struct AgentContext<F> {
+    context_policy: Option<context::Policy>,
     state: PathBuf,
     observer: ObserverProvider,
     identity: LocalIdentity,
@@ -202,7 +207,19 @@ where
             "a work control delegate must use its owner's conversation",
         ));
     }
+    if let Some(policy) = &config.context {
+        policy.budget()?;
+    }
     let profile = harness()?.fingerprint();
+    let model = config.model;
+    let harness = move || {
+        let agent = harness()?;
+        match &model {
+            Some(model) => agent.with_model(model),
+            None => Ok(agent),
+        }
+    };
+    harness()?;
     let microvm = conversations
         .iter()
         .any(|(conversation, _)| conversation.work)
@@ -212,6 +229,7 @@ where
     ManagedSession::reap_observers(&state.join("ongoing-acp"), &observer)
         .map_err(io::Error::other)?;
     let context = Arc::new(AgentContext {
+        context_policy: config.context,
         state: state.to_owned(),
         observer,
         identity,
@@ -390,10 +408,8 @@ where
                 .map_err(io::Error::other)?;
             continue;
         }
-        let history = delivery
-            .ongoing_history(thread.scope, input.id, input.shared)
-            .map_err(io::Error::other)?;
-        let reusable = input.shared.is_none() && turns.is_empty();
+        let reusable =
+            context.context_policy.is_none() && input.shared.is_none() && turns.is_empty();
         let mut current = if reusable { session.take() } else { None };
         let context = context.clone();
         let conversation = conversation.clone();
@@ -404,7 +420,6 @@ where
                 &conversation,
                 thread,
                 &input,
-                history,
                 &mut current,
                 &mut stopping,
             )
@@ -416,11 +431,14 @@ where
                 Ok(text) => (text, true),
                 Err(error) => {
                     eprintln!("Howl conversation failed. {error}");
-                    (
-                        "Agent turn ended without a reply. Send another message to continue."
-                            .into(),
-                        false,
-                    )
+                    let message = if error.kind() == io::ErrorKind::InvalidInput
+                        && error.to_string().starts_with("Howl context: ")
+                    {
+                        error.to_string()
+                    } else {
+                        "Agent turn ended without a reply. Send another message to continue.".into()
+                    };
+                    (message, false)
                 }
             };
             FinishedTurn {
@@ -500,32 +518,14 @@ async fn turn<F>(
     conversation: &Conversation,
     thread: OngoingThread,
     input: &OngoingInput,
-    mut history: Vec<crate::delivery::OngoingExchange>,
     session: &mut Option<ManagedSession>,
     stopping: &mut watch::Receiver<()>,
 ) -> io::Result<String>
 where
     F: Fn() -> io::Result<Harness>,
 {
-    let directive = "Continue the Howl conversation. Answer the current message separately. Earlier exchanges are context. A null reply means that question is already being answered. Repository tools use the approved read-only snapshot. Use send_peer to ask an available peer and wait for a peer_reply in a later turn. Use start_work for isolated implementation and report its run ID. Share worker results with the requester.";
-    let peers = conversation
-        .peers
-        .iter()
-        .map(|peer| json!({ "id": hex::encode(peer.id), "name": peer.name }))
-        .collect::<Vec<_>>();
-    let text = loop {
-        let data = json!({ "source": input.source, "input": input.text, "sender":hex::encode(input.sender), "earlier_exchanges": history,
-            "available_peers": peers, "work_enabled": conversation.work });
-        let text = format!("{directive}\n{data}");
-        if text.len() <= 60 * 1024 {
-            break text;
-        }
-        if history.is_empty() {
-            return Err(invalid("conversation input is too large"));
-        }
-        history.remove(0);
-    };
     let run = async {
+        let text = context::build(context, conversation, thread, input).await?;
         if session.is_none() {
             let snapshot =
                 Snapshot::from_repository(&conversation.repository, &conversation.revision)
