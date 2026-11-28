@@ -1,5 +1,8 @@
 use super::*;
-use howl::identity::PeerCertificate;
+use howl::{
+    discovery_client::{MESH_STATUS_OPERATION, MESH_STATUS_PATH},
+    identity::PeerCertificate,
+};
 
 async fn named_link(
     owner: &Owner,
@@ -92,6 +95,7 @@ async fn named_device_details_stay_with_the_owner() {
     assert_eq!(initial["endpoint_id"], peer.endpoint().to_string());
     assert!(initial.get("network_name").is_none());
     assert!(initial.get("route").is_none());
+    assert!(initial.get("online").is_none());
     assert!(string(&initial, "requested_at").ends_with('Z'));
     assert!(initial.get("approved_at").is_none());
     assert!(initial.get("last_route_at").is_none());
@@ -151,6 +155,12 @@ async fn named_device_details_stay_with_the_owner() {
     assert!(allowed.get("last_route_at").is_none());
     let key = SigningKey::from_bytes(&[42; 32]);
     let native = Device::login(&control.pool, account, *peer.device_id(), key.clone()).await;
+    assert_eq!(
+        native
+            .post(&server, MESH_STATUS_PATH, MESH_STATUS_OPERATION, &json!([]))
+            .await,
+        StatusCode::UNAUTHORIZED
+    );
     let view = native.view(&server).await;
     let records = serde_json::from_value::<Vec<String>>(view["authority"].clone()).unwrap();
     let candidate = hosted::candidate(&state, &records, string(&view, "designation")).unwrap();
@@ -233,4 +243,93 @@ async fn named_device_details_stay_with_the_owner() {
     let expired = success(read(&owner, &server, &device).await).await;
     assert!(string(&expired, "last_route_at").ends_with('Z'));
     assert!(expired.get("route").is_none());
+    let other_state = temp.path().join("peer");
+    let other = enrollment_identity(&other_state, [51, 52, 53, 54]).certificate();
+    let other_id = hex::encode(other.device_id());
+    let request = success(named_link(&owner, &server, &other, "Peer Mac").await).await;
+    let link = success(claim(&owner, &server, string(&request, "secret")).await).await;
+    assert_eq!(
+        owner
+            .decide(
+                &server,
+                "approve",
+                &json!({"id":other_id,"fingerprint":link["fingerprint"]})
+            )
+            .await,
+        StatusCode::NO_CONTENT
+    );
+    let peer_native = Device::login(
+        &control.pool,
+        account,
+        *other.device_id(),
+        SigningKey::from_bytes(&[52; 32]),
+    )
+    .await;
+    let candidate =
+        hosted::candidate(&other_state, &records, string(&view, "designation")).unwrap();
+    assert_eq!(
+        peer_native
+            .post(
+                &server,
+                "/v1/network/devices",
+                "network-register",
+                &candidate
+            )
+            .await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        native
+            .post(
+                &server,
+                MESH_STATUS_PATH,
+                MESH_STATUS_OPERATION,
+                &json!([{"device":device,"kind":"direct"}])
+            )
+            .await,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        native
+            .post(
+                &server,
+                MESH_STATUS_PATH,
+                MESH_STATUS_OPERATION,
+                &json!([
+                    {"device":other_id,"kind":"direct"},
+                    {"device":other_id,"kind":"relay"},
+                    {"device":other_id,"kind":"relay"},
+                    {"device":unknown,"kind":"direct"}
+                ])
+            )
+            .await,
+        StatusCode::NO_CONTENT
+    );
+    let online = success(read(&owner, &server, &device).await).await;
+    assert_eq!(online["online"], true);
+    assert!(string(&online, "last_seen_at").ends_with('Z'));
+    assert_eq!(
+        online["connections"],
+        json!([
+            {"device":other_id,"name":"Peer Mac","kind":"direct"},
+            {"device":other_id,"name":"Peer Mac","kind":"relay"}
+        ])
+    );
+    let foreign_view = success(read(&foreign, &server, &device).await).await;
+    assert!(foreign_view.get("online").is_none());
+    assert_eq!(foreign_view["connections"], json!([]));
+    admin
+        .get()
+        .await
+        .unwrap()
+        .execute(
+            "UPDATE howl_control.mesh_status SET seen_at=now()-interval '36 seconds' WHERE device_id=$1",
+            &[&&peer.device_id()[..]],
+        )
+        .await
+        .unwrap();
+    let offline = success(read(&owner, &server, &device).await).await;
+    assert_eq!(offline["online"], false);
+    assert!(offline.get("last_seen_at").is_some());
+    assert_eq!(offline["connections"], json!([]));
 }

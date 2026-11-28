@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use axum::{
     Json, Router,
@@ -10,6 +10,7 @@ use howl::{
     discovery::{RouteHint, now},
     enrollment::hosted::Candidate,
     identity::PeerCertificate,
+    transport::{PathKind, PeerPath},
 };
 use serde::{Deserialize, Serialize};
 use tokio_postgres::Transaction;
@@ -82,6 +83,11 @@ struct Details {
     network_name: Option<String>,
     endpoint_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    online: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_seen_at: Option<String>,
+    connections: Vec<Connection>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     requested_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     approved_at: Option<String>,
@@ -96,6 +102,53 @@ struct Route {
     ip: String,
     port: u16,
     expires_at: String,
+}
+
+#[derive(Serialize)]
+struct Connection {
+    device: String,
+    name: String,
+    kind: PathKind,
+}
+
+async fn peer_connections(
+    tx: &Transaction<'_>,
+    github: i64,
+    snapshot: &howl::enrollment::hosted::Network,
+    paths: Vec<PeerPath>,
+) -> Result<Vec<Connection>> {
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut names = HashMap::new();
+    for member in &snapshot.devices {
+        let identity = member.identity().map_err(|_| Error::Internal)?;
+        names.insert(
+            hex::encode(identity.device_id()),
+            default_name(identity.device_id()),
+        );
+    }
+    let devices: Vec<_> = paths.iter().map(|path| path.device.as_str()).collect();
+    for row in tx.query(
+        "SELECT encode(device_id,'hex'),name FROM howl_control.device_details
+         WHERE github_id=$1 AND name IS NOT NULL AND device_id IN (SELECT decode(unnest($2::text[]),'hex'))",
+        &[&github, &devices],
+    ).await? {
+        if let Some(name) = names.get_mut(row.get::<_, &str>(0)) {
+            *name = row.get(1);
+        }
+    }
+    Ok(paths
+        .into_iter()
+        .filter_map(|path| {
+            let name = names.get(&path.device)?.clone();
+            Some(Connection {
+                device: path.device,
+                name,
+                kind: path.kind,
+            })
+        })
+        .collect())
 }
 
 async fn details(tx: &Transaction<'_>, github: i64, device: &Id) -> Result<Details> {
@@ -164,7 +217,9 @@ async fn details(tx: &Transaction<'_>, github: i64, device: &Id) -> Result<Detai
          to_char(COALESCE(d.approved_at,CASE WHEN NOT $8 THEN l.approved_at END) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),
          to_char(to_timestamp(h.issued_millis / 1000.0) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),
          h.hint,
-         to_char(to_timestamp(h.expires_millis / 1000.0) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')
+         to_char(to_timestamp(h.expires_millis / 1000.0) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),
+         to_char(m.seen_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),
+         m.seen_at > clock_timestamp() - interval '35 seconds', m.paths
          FROM (VALUES (1)) AS anchor(x)
          LEFT JOIN howl_control.device_details d ON d.github_id=$1 AND d.device_id=$2
          LEFT JOIN howl_control.device_link_requests l ON l.github_id=$1 AND l.device_id=$2 AND l.peer=$3
@@ -172,7 +227,9 @@ async fn details(tx: &Transaction<'_>, github: i64, device: &Id) -> Result<Detai
          LEFT JOIN howl_control.enrolled_devices e ON $8 AND e.account_id=$4 AND e.device_id=$2
              AND e.authority_head=$5 AND e.designation_digest=$6 AND e.signing_key=$7
          LEFT JOIN howl_control.route_hints h ON h.account_id=e.account_id AND h.device_id=e.device_id
-             AND h.authority_head=e.authority_head AND h.designation_digest=e.designation_digest AND h.device_sequence=e.sequence",
+             AND h.authority_head=e.authority_head AND h.designation_digest=e.designation_digest AND h.device_sequence=e.sequence
+         LEFT JOIN howl_control.mesh_status m ON m.account_id=e.account_id AND m.device_id=e.device_id
+             AND m.authority_head=e.authority_head AND m.designation_digest=e.designation_digest AND m.device_sequence=e.sequence",
         &[&github, &&device[..], &&peer.as_bytes()[..], &&account[..], &&head[..], &&designation[..], &&peer.signing_public()[..], &admitted],
     ).await?;
     if row
@@ -193,6 +250,13 @@ async fn details(tx: &Transaction<'_>, github: i64, device: &Id) -> Result<Detai
     } else {
         None
     };
+    let online = row.get(8);
+    let connections = if online == Some(true) {
+        let paths = serde_json::from_value(row.get(9)).map_err(|_| Error::Internal)?;
+        peer_connections(tx, github, &snapshot, paths).await?
+    } else {
+        Vec::new()
+    };
     Ok(Details {
         id: hex::encode(device),
         fingerprint: hex::encode(peer.fingerprint()),
@@ -203,6 +267,9 @@ async fn details(tx: &Transaction<'_>, github: i64, device: &Id) -> Result<Detai
         network_id: hex::encode(network.channel),
         network_name: network.github_login,
         endpoint_id: peer.endpoint().to_string(),
+        online,
+        last_seen_at: row.get(7),
+        connections,
         requested_at: row.get(2),
         approved_at: row.get(3),
         last_route_at: row.get(4),

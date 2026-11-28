@@ -171,6 +171,8 @@ pub async fn migrate(pool: &Pool) -> Result<()> {
         .await?;
     tx.batch_execute(include_str!("../migrations/012_network_display_name.sql"))
         .await?;
+    tx.batch_execute(include_str!("../migrations/013_mesh_status.sql"))
+        .await?;
     tx.commit().await?;
     Ok(())
 }
