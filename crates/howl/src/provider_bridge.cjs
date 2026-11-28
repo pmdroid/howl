@@ -1,8 +1,12 @@
 const http = require("node:http");
 const readline = require("node:readline");
 const { once } = require("node:events");
+const { createReadStream, createWriteStream } = require("node:fs");
 
-const lines = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+const vsock = process.env.HOWL_GUEST_VSOCK === "1";
+const input = vsock ? createReadStream(null, { fd: 0, autoClose: false }) : process.stdin;
+const output = vsock ? createWriteStream(null, { fd: 1, autoClose: false }) : process.stdout;
+const lines = readline.createInterface({ input, crlfDelay: Infinity });
 const replies = lines[Symbol.asyncIterator]();
 let queue = Promise.resolve();
 let pending = 0;
@@ -24,7 +28,7 @@ const server = http.createServer((request, response) => {
   const id = ++nextId;
   let active = false;
   response.on("close", () => {
-    if (active && !response.writableEnded) process.stdout.write(JSON.stringify({ cancel: id }) + "\n");
+    if (active && !response.writableEnded) output.write(JSON.stringify({ cancel: id }) + "\n");
   });
   const body = readBody(request);
   body.catch(() => {});
@@ -39,7 +43,7 @@ const server = http.createServer((request, response) => {
     if (response.destroyed) return;
     active = true;
     const frame = JSON.stringify({ id, method: request.method, path: request.url, body: payload });
-    if (!process.stdout.write(frame + "\n")) await once(process.stdout, "drain");
+    if (!output.write(frame + "\n")) await once(output, "drain");
     const header = await receive();
     if (header.end) return;
     if (!response.destroyed) response.writeHead(header.status, { "content-type": header.content_type });
@@ -79,7 +83,7 @@ async function readBody(request) {
 
 server.requestTimeout = 15_000;
 server.headersTimeout = 10_000;
-server.listen(17861, "127.0.0.1", () => process.stdout.write("ready\n"));
+server.listen(17861, "127.0.0.1", () => output.write("ready\n"));
 lines.on("close", () => {
   server.close();
   queue.finally(() => process.exit(0));

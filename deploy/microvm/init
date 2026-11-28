@@ -3,6 +3,7 @@ set -eu
 export PATH=/usr/local/bin:/usr/bin:/usr/sbin:/bin:/sbin
 if [ "${1:-}" = "--worker" ]; then
     inference=$2
+    export HOWL_GUEST_VSOCK=1
 else
     mkdir -p /dev /proc /sys /workspace /scratch /tmp /run
     mount -t devtmpfs devtmpfs /dev
@@ -42,6 +43,7 @@ else
     test -b /dev/vda
     tar -xf /dev/vda --no-same-owner -C /workspace
     chown -R 65532:65532 /workspace /scratch
+    chmod -R u+w /workspace /scratch
     chmod 1777 /tmp
     if [ "$transport" = vsock ]; then
         case " $cmdline " in
