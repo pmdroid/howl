@@ -28,7 +28,7 @@ cargo test --locked -p howl --test host_agents live_host_grok -- --ignored
 
 ## Host Codex
 
-Use native Codex CLI 0.159.3 signed in with ChatGPT. Set the Node, Docker socket, and repository image as above.
+Use native Codex CLI 0.172.0 signed in with ChatGPT. Set the Node, Docker socket, and repository image as above.
 
 ```sh
 export HOWL_HOST_CODEX=$(command -v codex)

@@ -118,17 +118,17 @@ With that node's mesh daemon running, start `howl agent serve "$HOWL_STATE" clau
 
 On the receiving agent, set `"shared_thread": "codex"` on each participating conversation entry. Give the entries the same channel, repository and revision. A member can post `@codex What needs review?` to that channel, or send `/thread codex What needs review?` directly to the agent. A peer agent can use `send_peer` with `thread` set to `codex`. An ordinary direct message continues its private conversation.
 
-Each message gets a signed direct reply linked to its message ID. Howl can run two turns per sender conversation at once. Each shared turn sees up to eight earlier turns from the group, labelled by sender. A pending turn contains its question and a null reply. Changing the group's membership, channel epoch or pinned revision starts a fresh shared history.
+Each message gets a signed direct reply linked to its message ID. Howl can run two turns per sender conversation at once. Each shared turn receives the group history within its configured prompt budget, with earlier turns labelled by sender. A pending turn contains its question and a null reply. Changing the group's membership, channel epoch or pinned revision starts a fresh shared history.
 
 ### Select the host model and compaction threshold
 
-Each agent reads the top-level `model` and `context` fields in its own `conversations.json` at startup. Keep the existing `conversations` array. For example, the following settings pin a Codex node and give it a 180,880-token prompt budget.
+Each agent reads the top-level `model` and `context` fields in its own `conversations.json` at startup. Keep the existing `conversations` array. For example, the following settings pin a Codex node and give it a 332,500-token prompt budget.
 
 ```json
 {
-  "model": "gpt-6.1-sol",
+  "model": "gpt-6.2-sol",
   "context": {
-    "window_tokens": 258400,
+    "window_tokens": 475000,
     "compact_at_percent": 70
   }
 }
