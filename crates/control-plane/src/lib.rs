@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use tokio_postgres::Row;
 use zeroize::Zeroizing;
 
+mod account_network;
 mod discovery;
 mod enrollment;
 mod github;
@@ -35,6 +36,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub enum Error {
     Configuration,
     Invalid,
+    NotFound,
+    Conflict,
     Unauthorized,
     Wait,
     Upstream,
@@ -57,6 +60,8 @@ impl IntoResponse for Error {
     fn into_response(self) -> Response {
         let (status, code) = match self {
             Self::Configuration | Self::Internal => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
+            Self::NotFound => (StatusCode::NOT_FOUND, "not_found"),
+            Self::Conflict => (StatusCode::CONFLICT, "conflict"),
             Self::Invalid => (StatusCode::BAD_REQUEST, "invalid_request"),
             Self::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized"),
             Self::Wait => (StatusCode::TOO_MANY_REQUESTS, "wait_for_poll_interval"),
@@ -107,7 +112,9 @@ impl ControlPlane {
     pub fn router(self: Arc<Self>) -> Router {
         let mut app = Router::new();
         if self.web_origin.is_some() {
-            app = app.merge(web_login::routes());
+            app = app
+                .merge(web_login::routes())
+                .merge(account_network::routes());
         }
         app.route("/healthz", get(health))
             .merge(enrollment::routes())
@@ -150,6 +157,8 @@ pub async fn migrate(pool: &Pool) -> Result<()> {
         .await?;
     tx.batch_execute(include_str!("../migrations/008_web_login.sql"))
         .await?;
+    tx.batch_execute(include_str!("../migrations/009_account_network.sql"))
+        .await?;
     tx.commit().await?;
     Ok(())
 }
@@ -191,6 +200,9 @@ async fn no_cache(request: axum::extract::Request, next: middleware::Next) -> Re
     response
         .headers_mut()
         .insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
+    response
+        .headers_mut()
+        .insert(header::REFERRER_POLICY, "no-referrer".parse().unwrap());
     response
 }
 

@@ -166,6 +166,17 @@ async fn upload(
     }
     material.designation.make_ascii_lowercase();
     material.certificate.make_ascii_lowercase();
+    if let Some(network) = crate::network::hosted(&tx, session.github_id).await?
+        && network.signer.is_some()
+        && !network.snapshot.as_ref().is_some_and(|snapshot| {
+            snapshot
+                .devices
+                .iter()
+                .any(|member| member.certificate == material.certificate)
+        })
+    {
+        return Err(Error::Unauthorized);
+    }
     store(&tx, &pin, &certificate, &material).await?;
     tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)

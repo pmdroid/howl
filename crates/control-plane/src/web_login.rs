@@ -12,7 +12,7 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::Deserialize;
 use zeroize::Zeroizing;
 
-use crate::{ControlPlane, Error, Id, Result, credential_digest, proof, random};
+use crate::{ControlPlane, Error, Id, Result, account_network, credential_digest, proof, random};
 
 const LOGIN: &str = "__Host-howl-login";
 const OWNER: &str = "__Host-howl-owner";
@@ -144,6 +144,7 @@ async fn callback(
     let github_id = control.github.web_user(&code, &redirect, verifier).await?;
     let mut connection = control.pool.get().await?;
     let tx = connection.transaction().await?;
+    account_network::ensure(&control, &tx, github_id).await?;
     if let Ok(old) = session_digest(&headers) {
         tx.execute(
             "DELETE FROM howl_control.web_sessions WHERE token_digest=$1",
