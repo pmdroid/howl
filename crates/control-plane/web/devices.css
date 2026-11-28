@@ -70,6 +70,10 @@ li h3 { margin: 0 0 .65rem; font-size: 1.12rem; overflow-wrap: anywhere; }
 .detail-section h2 { margin-bottom: .65rem; }
 .detail-list { border-bottom: 1px solid var(--line); background: var(--paper); }
 .detail-list > div:not([hidden]) { display: grid; grid-template-columns: 9rem minmax(0, 1fr); gap: .3rem .7rem; border-top: 1px solid var(--line); padding: .95rem 1rem; align-items: baseline; }
+#peer-connections li { display: flex; justify-content: space-between; gap: .4rem 1rem; flex-wrap: wrap; padding: .45rem 0; border: 0; background: transparent; }
+#peer-connections li:first-child { padding-top: 0; }
+#peer-connections li:last-child { padding-bottom: 0; }
+#peer-connections li + li { border-top: 1px solid var(--line); }
 #editor { max-width: 32rem; margin-top: 1.2rem; }
 #editor label { display: block; font-weight: 600; }
 #name { display: block; width: 100%; min-height: 2.75rem; margin-top: .3rem; padding: .45rem .7rem; border: 1px solid #7e9989; border-radius: 5px; font: inherit; color: inherit; background: var(--paper); }

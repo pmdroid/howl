@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::BTreeSet, sync::Arc};
 
 use axum::{
     Router,
@@ -10,7 +10,9 @@ use axum::{
 };
 use howl::{
     discovery::{HINT_LEN, RouteHint, now},
+    discovery_client::{MESH_STATUS_OPERATION, MESH_STATUS_PATH},
     identity::{CERTIFICATE_LEN, PeerCertificate},
+    transport::{MAX_REPORTED_PATHS, PeerPath},
 };
 
 use crate::{ControlPlane, Error, Result, bearer, enrollment, proof, request_proof};
@@ -26,6 +28,62 @@ pub(crate) fn routes() -> Router<Arc<ControlPlane>> {
             post(publish).layer(DefaultBodyLimit::max(PUBLISH_LEN)),
         )
         .route("/v1/discovery/hints/{device}", get(lookup))
+        .route(
+            MESH_STATUS_PATH,
+            post(report_status).layer(DefaultBodyLimit::max(8192)),
+        )
+}
+
+async fn report_status(
+    State(control): State<Arc<ControlPlane>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<StatusCode> {
+    let reports: Vec<PeerPath> = serde_json::from_slice(&body).map_err(|_| Error::Invalid)?;
+    if reports.len() > MAX_REPORTED_PATHS {
+        return Err(Error::Invalid);
+    }
+    let mut connection = control.pool.get().await?;
+    let tx = connection.transaction().await?;
+    let device = control
+        .authorize_enrolled_in(
+            &tx,
+            MESH_STATUS_OPERATION,
+            bearer(&headers)?,
+            &request_proof(&headers)?,
+            &body,
+        )
+        .await?;
+    let mut paths = BTreeSet::new();
+    for mut report in reports {
+        let peer = proof::decode::<32>(&report.device)?;
+        if peer == device.device_id() {
+            return Err(Error::Invalid);
+        }
+        report.device = hex::encode(peer);
+        paths.insert(report);
+    }
+    let value = serde_json::to_value(paths).map_err(|_| Error::Internal)?;
+    let updated = tx.execute(
+        "INSERT INTO howl_control.mesh_status
+         (account_id, device_id, device_sequence, authority_head, designation_digest, seen_at, paths)
+         SELECT e.account_id,e.device_id,e.sequence,e.authority_head,e.designation_digest,clock_timestamp(),$6
+         FROM howl_control.enrolled_devices e JOIN howl_control.enrollment_pins p ON p.account_id=e.account_id
+            AND p.authority_head=e.authority_head AND p.designation_digest=e.designation_digest
+         WHERE e.account_id=$1 AND e.device_id=$2 AND e.authority_head=$3 AND e.designation_digest=$4 AND e.signing_key=$5
+         ON CONFLICT (account_id,device_id) DO UPDATE SET
+            device_sequence=EXCLUDED.device_sequence, authority_head=EXCLUDED.authority_head,
+            designation_digest=EXCLUDED.designation_digest, seen_at=EXCLUDED.seen_at, paths=EXCLUDED.paths
+         WHERE mesh_status.seen_at <= EXCLUDED.seen_at",
+        &[&&device.account_id()[..], &&device.device_id()[..], &&device.authority_head()[..],
+          &&device.designation_digest()[..], &&device.signing_key()[..], &value],
+    ).await?;
+    tx.commit().await?;
+    if updated == 1 {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(Error::Conflict)
+    }
 }
 
 async fn publish(

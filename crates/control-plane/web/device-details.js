@@ -6,6 +6,8 @@ const id = location.pathname.split("/").pop();
 const path = "/api/devices/" + id;
 let device;
 let busy = false;
+let checkingMesh = false;
+let renderedConnections;
 const dateFormat = new Intl.DateTimeFormat(undefined, {
   dateStyle: "medium", timeStyle: "long",
 });
@@ -28,10 +30,38 @@ function hideDevice() {
   element("rename").hidden = true;
   element("editor").hidden = true;
   element("name").value = "";
+  element("peer-connections").replaceChildren();
+  renderedConnections = undefined;
   for (const value of element("details").querySelectorAll("dd code, dd time, dd[id]")) {
     value.replaceChildren();
     value.removeAttribute("datetime");
   }
+}
+
+function renderMesh(view) {
+  const status = view.online === true ? "Online" : view.online === false ? "Offline" : "Unknown";
+  element("mesh-status").textContent = status;
+  timestamp(element("last-seen"), view.last_seen_at);
+  const connections = view.connections ?? [];
+  const serialized = JSON.stringify(connections);
+  if (serialized !== renderedConnections) {
+    const items = connections.map(connection => {
+      const item = document.createElement("li");
+      const peer = document.createElement("a");
+      peer.href = "/devices/" + connection.device;
+      peer.className = "device-name";
+      peer.dir = "auto";
+      peer.textContent = connection.name;
+      const kind = document.createElement("span");
+      kind.textContent = connection.kind === "direct" ? "Direct" : "Relay";
+      item.append(peer, kind);
+      return item;
+    });
+    element("peer-connections").replaceChildren(...items);
+    renderedConnections = serialized;
+  }
+  element("peer-status").textContent = connections.length ? "" :
+    view.online === true ? "No active peer connections reported" : "No recent connection report";
 }
 
 function render(view) {
@@ -59,6 +89,7 @@ function render(view) {
   timestamp(element("admitted"), view.approved_at);
   timestamp(element("last-route"), view.last_route_at);
   timestamp(element("route-expires"), view.route?.expires_at);
+  renderMesh(view);
 }
 
 async function request(resource, options) {
@@ -86,6 +117,27 @@ async function load() {
   if (!response) return;
   if (!response.ok) throw new Error("Could not load the device. Try again.");
   render(await response.json());
+}
+
+async function refreshMesh() {
+  if (document.hidden || busy || checkingMesh || !device) return;
+  checkingMesh = true;
+  try {
+    const response = await request(path);
+    if (response?.ok) {
+      const view = await response.json();
+      if (device) {
+        device.last_seen_at = view.last_seen_at;
+        renderMesh(view);
+      }
+    } else if (device) {
+      renderMesh({last_seen_at: device.last_seen_at});
+    }
+  } catch {
+    if (device) renderMesh({last_seen_at: device.last_seen_at});
+  } finally {
+    checkingMesh = false;
+  }
 }
 
 function editName() {
@@ -178,4 +230,5 @@ window.addEventListener("pageshow", event => {
 document.addEventListener("visibilitychange", () => {
   if (!document.hidden && element("editor").hidden) run(load);
 });
+setInterval(refreshMesh, 10000);
 run(load);
