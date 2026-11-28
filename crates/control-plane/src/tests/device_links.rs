@@ -115,7 +115,8 @@ async fn device_link_redeems_exact_owner_approval_once() {
         success(duplicate.browser(&owner, &server, None).await).await,
         claimed
     );
-    let pending = json!({"id":claimed["device"],"fingerprint":claimed["fingerprint"]});
+    let pending =
+        json!({"id":claimed["device"],"fingerprint":claimed["fingerprint"],"name":claimed["name"]});
     assert_eq!(owner.view(&server).await["pending"], json!([pending]));
     assert_eq!(outsider.view(&server).await["pending"], json!([]));
     for action in [None, Some("approve"), Some("deny")] {
