@@ -8,7 +8,32 @@ use crate::{
     discovery::{self, HINT_LEN, RouteHint},
     identity::PeerTrust,
     node,
+    transport::Transport,
 };
+
+pub const MESH_STATUS_OPERATION: &str = "mesh-status";
+pub const MESH_STATUS_PATH: &str = "/v1/discovery/status";
+
+pub(crate) async fn report_status(state: &Path, transport: &Transport) {
+    let mut timer = tokio::time::interval(std::time::Duration::from_secs(10));
+    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        timer.tick().await;
+        let _ = send_status(state, transport).await;
+    }
+}
+
+async fn send_status(state: &Path, transport: &Transport) -> io::Result<()> {
+    let client = ControlClient::open(state).await?;
+    let body = serde_json::to_vec(&transport.peer_paths().await)?;
+    let response = client
+        .post_json(MESH_STATUS_PATH, MESH_STATUS_OPERATION, &body)
+        .await?;
+    if response.status() != StatusCode::NO_CONTENT {
+        return Err(refused());
+    }
+    Ok(())
+}
 
 pub async fn publish(state: &Path, address: SocketAddr) -> io::Result<()> {
     let client = ControlClient::open(state).await?;
