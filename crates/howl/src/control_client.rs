@@ -102,7 +102,7 @@ struct Proof {
 pub async fn login(state: &Path) -> io::Result<()> {
     let identity = LocalIdentity::load_or_create(state)?;
     let state = StateDirectory::open(state)?;
-    let _lock = state.lock(LOCK)?;
+    let _lock = crate::identity::retry_state_lock(|| state.lock(LOCK)).await?;
     let existing = load(&state)?;
     let service = Service::for_login(existing.as_ref()).await?;
     if let Some(existing) = &existing
@@ -229,7 +229,7 @@ impl ControlClient {
     pub async fn open(state: &Path) -> io::Result<Self> {
         let identity = LocalIdentity::load_or_create(state)?;
         let state = StateDirectory::open(state)?;
-        let _lock = state.lock(LOCK)?;
+        let _lock = crate::identity::retry_state_lock(|| state.lock(LOCK)).await?;
         let Some(mut stored) = load(&state)? else {
             let token = Zeroizing::new(configured("HOWL_CONTROL_ACCESS_TOKEN")?);
             let _decoded = Zeroizing::new(parse_id(&token)?);
