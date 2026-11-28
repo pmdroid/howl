@@ -69,6 +69,8 @@ if [[ "$control" = --onboarding ]]; then
     run_fixture github_login_and_owner_approval_connect_two_devices_over_iroh
     run_fixture approvals_bind_the_registered_device_and_isolate_other_accounts
     run_fixture browser_login_binds_callback_and_revokes_owner_session
+    run_fixture account_owner_decides_devices_with_all_native_agents_offline
+    run_fixture account_transfer_preserves_pins_and_disables_native_decisions
     exit 0
 fi
 
