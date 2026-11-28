@@ -1,6 +1,5 @@
 [workspace]
 members = [
-    "crates/control-plane",
     "crates/envelope",
     "crates/howl",
     "crates/local-mcp",

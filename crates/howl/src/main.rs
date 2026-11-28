@@ -37,7 +37,6 @@ async fn main() -> ExitCode {
             println!("howl {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
-        [group, args @ ..] if group == "cloudflare-beta" => howl::cloudflare_beta::run(args).await,
         [group, action, state, driver, image] if group == "agent" && action == "serve" => {
             serve_agent(Path::new(state), driver, image).await
         }
