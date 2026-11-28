@@ -8,6 +8,20 @@ const hintDomain = new TextEncoder().encode("howl/peer-address/v1\0");
 const setDomain = new TextEncoder().encode("howl/peer-routes/v2\0");
 const setLimit = 82 + 8 * 19 + 2 + 255 + 64;
 
+export type MeshPath = {
+  device: string;
+  kind: "direct" | "relay";
+  direct_rtt_us?: number;
+  relay_rtt_us?: number;
+  relay?: string;
+};
+
+function relayUrl(value: unknown): value is string {
+  if (typeof value !== "string" || value.length > 255) return false;
+  const parsed = URL.parse(value);
+  return parsed?.protocol === "https:" && parsed.href === value;
+}
+
 function validAddress(bytes: Uint8Array) {
   const ip = bytes.slice(1, 17);
   const v4 =
@@ -24,21 +38,44 @@ function validAddress(bytes: Uint8Array) {
   return (v4 || v6) && (bytes[17] !== 0 || bytes[18] !== 0);
 }
 
-function validSet(body: Uint8Array) {
+function readSet(body: Uint8Array): { addresses: Uint8Array[]; relay?: string } | undefined {
+  if (body.length < 84) return;
   const count = body[81];
   const relayOffset = 82 + count * 19;
-  if (count > 8 || body.length < relayOffset + 2) return false;
+  if (count > 8 || body.length < relayOffset + 2) return;
+  const addresses = [];
   for (let offset = 82; offset < relayOffset; offset += 19) {
-    if (!validAddress(body.slice(offset, offset + 19))) return false;
+    const address = body.subarray(offset, offset + 19);
+    if (!validAddress(address)) return;
+    addresses.push(address);
   }
-  const relay = body.slice(relayOffset + 2);
+  const relay = body.subarray(relayOffset + 2);
   const claimedLength = (body[relayOffset] << 8) | body[relayOffset + 1];
-  if (relay.length !== claimedLength || relay.length > 255) return false;
-  if (relay.length === 0) return count > 0;
-  if (!relay.every((byte) => byte >= 33 && byte <= 126)) return false;
+  if (relay.length !== claimedLength || relay.length > 255) return;
+  if (relay.length === 0) return count > 0 ? { addresses } : undefined;
+  if (!relay.every((byte) => byte >= 33 && byte <= 126)) return;
   const address = new TextDecoder().decode(relay);
-  const parsed = URL.parse(address);
-  return parsed?.protocol === "https:" && parsed.href === address;
+  if (relayUrl(address)) return { addresses, relay: address };
+}
+
+function decodeAddress(bytes: Uint8Array) {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const port = view.getUint16(17);
+  if (bytes[0] === 4) return { ip: bytes.subarray(1, 5).join("."), port };
+  const words = Array.from({ length: 8 }, (_, i) => view.getUint16(1 + 2 * i).toString(16));
+  const ip = new URL(`http://[${words.join(":")}]/`).hostname.slice(1, -1);
+  return { ip, port };
+}
+
+export function decodeDiscovery(payload: number[]) {
+  const body = Uint8Array.from(payload).subarray(0, -64);
+  if (payload[0] === 1 && payload.length === hintLength && validAddress(body.subarray(81))) {
+    return { addresses: [decodeAddress(body.subarray(81))] };
+  }
+  if (payload[0] === 2 && payload.length <= setLimit) {
+    const set = readSet(body);
+    if (set) return { addresses: set.addresses.map(decodeAddress), relay: set.relay };
+  }
 }
 
 function routeTable(version: number) {
@@ -85,7 +122,7 @@ async function publish(env: Env, request: Request, version: number) {
       expires - issued <= 86400000,
   );
   const body = hint.slice(0, -64);
-  requireValue(version === 1 ? validAddress(body.slice(81)) : validSet(body));
+  requireValue(version === 1 ? validAddress(body.slice(81)) : readSet(body));
   requireValue(
     await checkSignature(
       caller.signing_key,
@@ -122,26 +159,47 @@ async function lookup(env: Env, request: Request, target: string, version: numbe
   });
 }
 
-async function status(env: Env, request: Request) {
-  const { raw, parsed } = await jsonBody<{ device: string; kind: string }[]>(request, 8192, true);
+function validRtt(value: number | undefined) {
+  return value === undefined || (Number.isInteger(value) && value >= 1 && value <= 0xffffffff);
+}
+
+async function status(env: Env, request: Request, legacy: boolean) {
+  const { raw, parsed } = await jsonBody<
+    MeshPath[] | { paths: MeshPath[]; home_relay?: string | null }
+  >(request, legacy ? 8192 : 32768, legacy);
   const caller = await authorizeNative(env, request, "mesh-status", raw);
   await requireMember(env, caller);
+  const paths = Array.isArray(parsed) ? parsed : parsed.paths;
+  const homeRelay = Array.isArray(parsed) ? undefined : (parsed.home_relay ?? undefined);
   requireValue(
-    Array.isArray(parsed) &&
-      parsed.length <= 64 &&
-      parsed.every(
+    (homeRelay === undefined || relayUrl(homeRelay)) &&
+      Array.isArray(paths) &&
+      paths.length <= 64 &&
+      paths.every(
         (peer) =>
           peer &&
-          word.test(peer.device ?? "") &&
+          typeof peer.device === "string" &&
+          word.test(peer.device) &&
           peer.device !== caller.device_id &&
-          (peer.kind === "direct" || peer.kind === "relay"),
+          (peer.kind === "direct" || peer.kind === "relay") &&
+          validRtt(peer.direct_rtt_us) &&
+          validRtt(peer.relay_rtt_us) &&
+          (peer.relay === undefined || relayUrl(peer.relay)),
       ),
   );
+  const report = paths.map(({ device, kind, direct_rtt_us, relay_rtt_us, relay }) => ({
+    device,
+    kind,
+    direct_rtt_us,
+    relay_rtt_us,
+    relay,
+  }));
   await env.DB.prepare(`
-    INSERT INTO control_mesh_status (github_id, device, seen_at, paths) VALUES (?, ?, unixepoch(), ?)
-    ON CONFLICT (github_id, device) DO UPDATE SET seen_at = excluded.seen_at, paths = excluded.paths
+    INSERT INTO control_mesh_status (github_id, device, seen_at, paths, home_relay) VALUES (?, ?, unixepoch(), ?, ?)
+    ON CONFLICT (github_id, device) DO UPDATE SET
+      seen_at = excluded.seen_at, paths = excluded.paths, home_relay = excluded.home_relay
   `)
-    .bind(caller.github_id, caller.device_id, JSON.stringify(parsed))
+    .bind(caller.github_id, caller.device_id, JSON.stringify(report), homeRelay ?? null)
     .run();
   return reply(null, 204);
 }
@@ -150,7 +208,8 @@ export async function nativeDiscoveryRoute(route: string, request: Request, env:
   if (!env.CONTROL_AUDIENCE) return null;
   if (route === "POST /v1/discovery/hints") return publish(env, request, 1);
   if (route === "POST /v2/discovery/hints") return publish(env, request, 2);
-  if (route === "POST /v1/discovery/status") return status(env, request);
+  if (route === "POST /v1/discovery/status") return status(env, request, true);
+  if (route === "POST /v2/discovery/status") return status(env, request, false);
   const match = /^GET \/v([12])\/discovery\/hints\/([0-9a-f]{64})$/.exec(route);
   if (match) return lookup(env, request, match[2], Number(match[1]));
   return null;

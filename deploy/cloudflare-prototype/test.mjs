@@ -74,14 +74,22 @@ function hint(identity, time) {
   ]);
 }
 
-function routeSet(identity, legacy, relay) {
+function routeSet(
+  identity,
+  legacy,
+  relay,
+  addresses = [
+    legacy.subarray(81, 100),
+    Buffer.from([4, 192, 168, 8, 4, ...Buffer.alloc(12), 0xa0, 0x3b]),
+    Buffer.from("0620010db8000000000000000000000007d76d", "hex"),
+  ],
+) {
   const prefix = Buffer.from(legacy.subarray(0, 81));
   prefix[0] = 2;
   const body = Buffer.concat([
     prefix,
-    Buffer.from([2]),
-    legacy.subarray(81, 100),
-    Buffer.from([4, 192, 168, 8, 4, ...Buffer.alloc(12), 0xa0, 0x3b]),
+    Buffer.from([addresses.length]),
+    ...addresses,
     Buffer.from([0, Buffer.byteLength(relay)]),
     Buffer.from(relay),
   ]);
@@ -465,6 +473,75 @@ test("Native publishing Worker", async (t) => {
       assert.deepEqual(view.connections, [
         { device: bob.id, kind: "direct", name: "Linux device" },
       ]);
+      assert.deepEqual(view.discovery.addresses, [
+        { ip: "100.64.1.5", port: 41019 },
+        { ip: "192.168.8.4", port: 41019 },
+        { ip: "2001:db8::7", port: 55149 },
+      ]);
+      assert.equal(view.discovery.relay, "https://example.test/");
+      const details = (device, headers = ownerHeaders) =>
+        http("/api/devices/" + device.id, { headers });
+      await status(details(alice, anotherHeaders), 404);
+
+      const stats = {
+        home_relay: "https://home.example.test/",
+        paths: [
+          {
+            device: bob.id,
+            kind: "direct",
+            direct_rtt_us: 875,
+            relay_rtt_us: 246000,
+            relay: "https://peer.example.test/",
+          },
+        ],
+      };
+      const statusPath = "/v2/discovery/status";
+      await status(
+        signed(alice, statusPath, "mesh-status", { ...stats, home_relay: "http://example.test/" }),
+        400,
+      );
+      await status(
+        signed(alice, statusPath, "mesh-status", {
+          ...stats,
+          paths: [{ ...stats.paths[0], direct_rtt_us: -1 }],
+        }),
+        400,
+      );
+      await status(signed(alice, statusPath, "mesh-status", stats), 204);
+      const measured = await status(details(alice), 200);
+      assert.equal(measured.home_relay, stats.home_relay);
+      assert.deepEqual(measured.connections, [{ ...stats.paths[0], name: "Linux device" }]);
+      await db
+        .prepare("UPDATE control_mesh_status SET seen_at = unixepoch() - 36 WHERE device = ?")
+        .bind(alice.id)
+        .run();
+      const offline = await status(details(alice), 200);
+      assert.equal(offline.home_relay, undefined);
+      assert.deepEqual(offline.connections, []);
+      assert.deepEqual(offline.discovery, view.discovery);
+
+      const relayOnly = routeSet(bob, hint(bob, Date.now()), "https://only.example.test/", []);
+      await status(
+        signed(bob, v2, "discovery-write", Buffer.concat([bytes(bob.peer), relayOnly])),
+        204,
+      );
+      const routeOnly = await status(details(bob), 200);
+      assert.deepEqual(routeOnly.discovery.addresses, []);
+      assert.equal(routeOnly.discovery.relay, "https://only.example.test/");
+
+      await db
+        .prepare("UPDATE control_route_sets SET expires_at = 0 WHERE device = ?")
+        .bind(alice.id)
+        .run();
+      const legacy = await status(details(alice), 200);
+      assert.deepEqual(legacy.discovery.addresses, [{ ip: "100.64.1.5", port: 41019 }]);
+      await db
+        .prepare("UPDATE control_route_hints SET expires_at = 0 WHERE device = ?")
+        .bind(alice.id)
+        .run();
+      const expired = await status(details(alice), 200);
+      assert.equal(expired.discovery, undefined);
+      assert.ok(expired.last_route_at);
       assert.equal(
         await db.prepare("SELECT COUNT(*) AS n FROM control_mailbox_envelopes").first("n"),
         0,

@@ -1,3 +1,4 @@
+import type { MeshPath } from "../native-discovery.ts";
 import {
   type DeviceIdentity,
   deviceName,
@@ -6,15 +7,20 @@ import {
   resumeKey,
 } from "./device-identity.js";
 
-type Connection = { device: string; name: string; kind: "direct" | "relay" };
-type Mesh = { online?: boolean; last_seen_at?: string; connections?: Connection[] };
+type Connection = MeshPath & { name: string };
+type Mesh = {
+  online?: boolean;
+  last_seen_at?: string;
+  connections?: Connection[];
+  home_relay?: string;
+};
 type Detail = DeviceIdentity &
   Mesh & {
     state: "pending" | "approved" | "denied";
     network_name?: string;
     network_id: string;
     endpoint_id: string;
-    route?: { ip: string; port: number; expires_at: string };
+    discovery?: { addresses: { ip: string; port: number }[]; relay?: string; expires_at: string };
     last_route_at?: string;
     requested_at?: string;
     approved_at?: string;
@@ -26,10 +32,13 @@ let device: Detail | null = null;
 let busy = false;
 let checkingMesh = false;
 let renderedConnections: string | undefined;
+let renderedDiscovery: string | undefined;
 const dateFormat = new Intl.DateTimeFormat(undefined, {
   dateStyle: "medium",
   timeStyle: "long",
 });
+const shortRtt = new Intl.NumberFormat(undefined, { maximumFractionDigits: 3 });
+const longRtt = new Intl.NumberFormat(undefined, { maximumFractionDigits: 1 });
 
 function timestamp(row: HTMLElement, value?: string) {
   const date = new Date(value ?? "");
@@ -50,20 +59,50 @@ function hideDevice() {
   element("editor").hidden = true;
   element<HTMLInputElement>("name").value = "";
   element("peer-connections").replaceChildren();
+  element("published-addresses").replaceChildren();
   renderedConnections = undefined;
+  renderedDiscovery = undefined;
   for (const value of element("details").querySelectorAll("dd code, dd time, dd[id]")) {
     value.replaceChildren();
     value.removeAttribute("datetime");
   }
 }
 
-function renderMesh(view: Mesh) {
+function metric(label: string, text: string, code = false) {
+  const item = document.createElement("div");
+  const name = document.createElement("dt");
+  const value = document.createElement("dd");
+  name.textContent = label;
+  if (code) {
+    item.className = "path-relay";
+    const address = document.createElement("code");
+    address.dir = "ltr";
+    address.textContent = text;
+    value.append(address);
+  } else value.textContent = text;
+  item.append(name, value);
+  return item;
+}
+
+function rtt(microseconds?: number) {
+  if (microseconds === undefined) return "Not measured";
+  const format = microseconds < 1000 ? shortRtt : longRtt;
+  return `${format.format(microseconds / 1000)} ms`;
+}
+
+function renderMesh(view: Mesh, publishedRelay?: string) {
   const status = view.online === true ? "Online" : view.online === false ? "Offline" : "Unknown";
   element("mesh-status").textContent = status;
   timestamp(element("last-seen"), view.last_seen_at);
+  const connectedToPublished = !!publishedRelay && view.home_relay === publishedRelay;
+  element("published-relay-connected").hidden = !connectedToPublished;
+  element("home-relay-row").hidden = !view.home_relay || connectedToPublished;
+  element("home-relay").textContent = view.home_relay ?? "";
   const connections = view.connections ?? [];
   const serialized = JSON.stringify(connections);
   if (serialized !== renderedConnections) {
+    const list = element("peer-connections");
+    const focused = document.activeElement;
     const items = connections.map((connection) => {
       const item = document.createElement("li");
       const peer = document.createElement("a");
@@ -73,10 +112,34 @@ function renderMesh(view: Mesh) {
       peer.textContent = connection.name;
       const kind = document.createElement("span");
       kind.textContent = connection.kind === "direct" ? "Direct" : "Relay";
-      item.append(peer, kind);
+      const heading = document.createElement("div");
+      heading.className = "peer-path-heading";
+      heading.append(peer, kind);
+      item.append(heading);
+      if (
+        connection.direct_rtt_us !== undefined ||
+        connection.relay_rtt_us !== undefined ||
+        connection.relay
+      ) {
+        const metrics = document.createElement("dl");
+        metrics.className = "peer-path-metrics";
+        metrics.append(
+          metric("Direct RTT", rtt(connection.direct_rtt_us)),
+          metric("Relay RTT", rtt(connection.relay_rtt_us)),
+        );
+        if (connection.relay) metrics.append(metric("Peer path relay", connection.relay, true));
+        item.append(metrics);
+      }
       return item;
     });
-    element("peer-connections").replaceChildren(...items);
+    const restoreFocus =
+      focused instanceof HTMLAnchorElement && list.contains(focused)
+        ? items
+            .flatMap((item) => [...item.querySelectorAll("a")])
+            .find((link) => link.href === focused.href)
+        : undefined;
+    list.replaceChildren(...items);
+    restoreFocus?.focus({ preventScroll: true });
     renderedConnections = serialized;
   }
   element("peer-status").textContent = connections.length
@@ -84,6 +147,31 @@ function renderMesh(view: Mesh) {
     : view.online === true
       ? "No active peer connections reported"
       : "No recent connection report";
+}
+
+function renderDiscovery(view: Detail) {
+  const serialized = JSON.stringify([view.discovery, view.last_route_at]);
+  if (serialized === renderedDiscovery) return;
+  renderedDiscovery = serialized;
+  const addresses = view.discovery?.addresses ?? [];
+  const items = addresses.map(({ ip, port }) => {
+    const item = document.createElement("li");
+    const address = document.createElement("code");
+    address.dir = "ltr";
+    address.textContent = `${ip.includes(":") ? `[${ip}]` : ip}:${port}`;
+    item.append(address);
+    return item;
+  });
+  element("published-addresses").replaceChildren(...items);
+  element("route-status").textContent = items.length
+    ? ""
+    : !view.discovery && view.last_route_at
+      ? "Published routes expired"
+      : "No UDP addresses published";
+  element("published-relay-row").hidden = !view.discovery?.relay;
+  element("published-relay").textContent = view.discovery?.relay ?? "";
+  timestamp(element("last-route"), view.last_route_at);
+  timestamp(element("route-expires"), view.discovery?.expires_at);
 }
 
 function render(view: Detail) {
@@ -103,19 +191,10 @@ function render(view: Detail) {
   element("network-name").textContent = view.network_name ?? "";
   element("network-id").textContent = view.network_id;
   element("endpoint-id").textContent = view.endpoint_id;
-  element("route-status-row").hidden = Boolean(view.route);
-  element("route-status").textContent = view.last_route_at
-    ? "Address expired"
-    : "No address published";
-  element("route-ip-row").hidden = !view.route;
-  element("route-ip").textContent = view.route?.ip ?? "";
-  element("route-port-row").hidden = !view.route;
-  element("route-port").textContent = String(view.route?.port ?? "");
   timestamp(element("requested"), view.requested_at);
   timestamp(element("admitted"), view.approved_at);
-  timestamp(element("last-route"), view.last_route_at);
-  timestamp(element("route-expires"), view.route?.expires_at);
-  renderMesh(view);
+  renderDiscovery(view);
+  renderMesh(view, view.discovery?.relay);
 }
 
 async function request(resource: string, options?: RequestInit) {
@@ -154,10 +233,11 @@ async function refreshMesh() {
   try {
     const response = await request(path);
     if (response?.ok) {
-      const view = await response.json();
+      const view: Detail = await response.json();
       if (device) {
         device.last_seen_at = view.last_seen_at;
-        renderMesh(view);
+        renderDiscovery(view);
+        renderMesh(view, view.discovery?.relay);
       }
     } else if (device) {
       renderMesh({ last_seen_at: device.last_seen_at });
