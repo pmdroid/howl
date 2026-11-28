@@ -174,7 +174,14 @@ async fn sync(
 }
 
 pub async fn login(state: &Path) -> io::Result<()> {
-    control_client::login(state).await?;
+    if !hosted::can_join(state)? {
+        control_client::login(state).await?;
+        println!(
+            "Existing mesh profile signed in. Use a fresh state directory to join a hosted network."
+        );
+        return Ok(());
+    }
+    control_client::login_device(state, true).await?;
     devices(state).await
 }
 
