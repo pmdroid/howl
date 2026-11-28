@@ -118,20 +118,42 @@ impl Guest {
         };
         let broker = match &profile.provider {
             Some(inference) => {
-                let provider = match inference.provider.as_str() {
-                    "openai" => Provider::OpenAi,
-                    "xai" => Provider::XAi,
-                    _ => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            "unsupported microVM inference provider",
-                        ));
-                    }
-                };
-                Some(
-                    Broker::from_environment(provider, &inference.model)
-                        .map_err(io::Error::other)?,
-                )
+                if inference.provider == "chatgpt_plan" {
+                    let configured = |name| {
+                        std::env::var_os(name).map(PathBuf::from).ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::NotFound,
+                                format!("set {name} for the ChatGPT plan broker"),
+                            )
+                        })
+                    };
+                    let auth = crate::managed_acp::ChatGptPlanAuth::new(
+                        configured("HOWL_CHATGPT_NODE")?,
+                        configured("HOWL_CHATGPT_HELPER")?,
+                        configured("HOWL_CHATGPT_STORE")?,
+                    )
+                    .map_err(io::Error::other)?;
+                    let token = auth.access_token().await.map_err(io::Error::other)?;
+                    Some(
+                        Broker::from_chatgpt_plan(&inference.model, token)
+                            .map_err(io::Error::other)?,
+                    )
+                } else {
+                    let provider = match inference.provider.as_str() {
+                        "openai" => Provider::OpenAi,
+                        "xai" => Provider::XAi,
+                        _ => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "unsupported microVM inference provider",
+                            ));
+                        }
+                    };
+                    Some(
+                        Broker::from_environment(provider, &inference.model)
+                            .map_err(io::Error::other)?,
+                    )
+                }
             }
             None => None,
         };

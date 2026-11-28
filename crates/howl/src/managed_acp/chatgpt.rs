@@ -33,7 +33,7 @@ impl ChatGptPlanAuth {
         &self.store
     }
 
-    pub(super) async fn access_token(&self) -> Result<Zeroizing<String>> {
+    pub(crate) async fn access_token(&self) -> Result<Zeroizing<String>> {
         timeout(Duration::from_secs(25), self.read_token())
             .await
             .map_err(|_| Error::ChatGptAuth)?
