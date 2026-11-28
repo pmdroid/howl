@@ -9,13 +9,7 @@ use std::{
 };
 
 use serde::Deserialize;
-use tokio::{
-    io::AsyncReadExt,
-    net::UnixStream,
-    process::{Child, ChildStdin},
-    task::JoinHandle,
-    time::timeout,
-};
+use tokio::{io::AsyncReadExt, net::UnixStream, task::JoinHandle, time::timeout};
 
 use crate::{
     identity::StateDirectory,
@@ -24,14 +18,21 @@ use crate::{
     provider_broker::{Broker, Provider},
 };
 
+mod firecracker;
+mod process;
 mod qemu;
+
+use process::SandboxProcess;
 
 const RUN_LIMIT: Duration = Duration::from_secs(900);
 pub(crate) const PATCH_LIMIT: usize = 4 * 1024 * 1024;
 #[derive(Clone, Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Profile {
-    qemu: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    qemu: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    firecracker: Option<PathBuf>,
     kernel: PathBuf,
     initramfs: PathBuf,
     memory_mib: u16,
@@ -50,7 +51,11 @@ impl Profile {
     pub(crate) fn load(state: &Path) -> io::Result<Self> {
         let bytes = StateDirectory::open(state)?.read_bounded("microvm.json", 16_384)?;
         let profile: Self = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
-        for path in [&profile.qemu, &profile.kernel, &profile.initramfs] {
+        let binary = match (&profile.qemu, &profile.firecracker) {
+            (Some(path), None) | (None, Some(path)) => path,
+            _ => return Err(hypervisor_required()),
+        };
+        for path in [binary, &profile.kernel, &profile.initramfs] {
             if !path.is_absolute() || !path.metadata()?.is_file() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -66,13 +71,44 @@ impl Profile {
         }
         Ok(profile)
     }
+
+    fn sandbox(&self) -> io::Result<Sandbox<'_>> {
+        match (&self.qemu, &self.firecracker) {
+            (Some(binary), None) => Ok(Sandbox::Qemu(qemu::Qemu::new(self, binary)?)),
+            (None, Some(binary)) => Ok(Sandbox::Firecracker(firecracker::Firecracker::new(
+                self, binary,
+            )?)),
+            _ => Err(hypervisor_required()),
+        }
+    }
+}
+
+fn hypervisor_required() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "microVM profile needs exactly one of qemu or firecracker",
+    )
+}
+
+enum Sandbox<'a> {
+    Qemu(qemu::Qemu<'a>),
+    Firecracker(firecracker::Firecracker<'a>),
+}
+
+impl SandboxProvider for Sandbox<'_> {
+    async fn boot(&self, snapshot: Snapshot, inference: bool) -> io::Result<BootedSandbox> {
+        match self {
+            Self::Qemu(provider) => provider.boot(snapshot, inference).await,
+            Self::Firecracker(provider) => provider.boot(snapshot, inference).await,
+        }
+    }
 }
 
 pub(crate) struct Guest {
     repository: PathBuf,
     pub session: ManagedSession,
     patch: UnixStream,
-    _process: SandboxProcess,
+    process: SandboxProcess,
     broker: Option<JoinHandle<io::Result<()>>>,
     rejected_subagent: Option<Arc<AtomicBool>>,
 }
@@ -92,18 +128,6 @@ struct BootedSandbox {
     process: SandboxProcess,
 }
 
-struct SandboxProcess {
-    process: Child,
-    owner: Option<ChildStdin>,
-}
-
-impl Drop for SandboxProcess {
-    fn drop(&mut self) {
-        drop(self.owner.take());
-        let _ = self.process.start_kill();
-    }
-}
-
 trait SandboxProvider {
     async fn boot(&self, snapshot: Snapshot, inference: bool) -> io::Result<BootedSandbox>;
 }
@@ -114,7 +138,7 @@ impl Guest {
         profile: &Profile,
         snapshot: Snapshot,
     ) -> io::Result<Self> {
-        let sandbox = qemu::Qemu::new(profile)?;
+        let sandbox = profile.sandbox()?;
         let broker = match &profile.provider {
             Some(inference) => {
                 if inference.provider == "chatgpt_plan" {
@@ -170,14 +194,21 @@ impl Guest {
             .as_ref()
             .map(|(broker, _)| broker.rejected_subagent.clone());
         let broker = broker.map(|(broker, link)| tokio::spawn(broker.serve_guest(link)));
-        let session = ManagedSession::guest(&state.join("worker-acp"), commit, selection, acp)
-            .await
-            .map_err(io::Error::other)?;
+        let session =
+            match ManagedSession::guest(&state.join("worker-acp"), commit, selection, acp).await {
+                Ok(session) => session,
+                Err(error) => {
+                    if let Some(task) = broker {
+                        task.abort();
+                    }
+                    return Err(io::Error::other(error));
+                }
+            };
         Ok(Self {
             repository,
             session,
             patch,
-            _process: process,
+            process,
             rejected_subagent,
             broker,
         })
@@ -211,6 +242,7 @@ impl Guest {
         let patch = timeout(Duration::from_secs(10), read_patch(&mut self.patch))
             .await
             .map_err(io::Error::other)??;
+        self.process.stop().await?;
         if patch.is_empty() {
             return Ok(patch);
         }
@@ -244,8 +276,12 @@ async fn read_patch(patch: &mut UnixStream) -> io::Result<Vec<u8>> {
 
 pub fn check(state: &Path) -> io::Result<()> {
     let profile = Profile::load(state)?;
-    let provider = qemu::Qemu::new(&profile)?;
-    println!("Configured QEMU accelerator: {}", provider.accelerator());
+    match profile.sandbox()? {
+        Sandbox::Qemu(provider) => {
+            println!("Configured QEMU accelerator: {}", provider.accelerator())
+        }
+        Sandbox::Firecracker(_) => println!("Configured Firecracker accelerator: kvm"),
+    }
     println!(
         "Guest resources: {} MiB, {} vCPU",
         profile.memory_mib, profile.vcpus
