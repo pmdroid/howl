@@ -66,6 +66,23 @@ fn repository() -> tempfile::TempDir {
 }
 
 #[test]
+fn worker_patch_is_verified_against_the_session_snapshot_without_touching_the_checkout() {
+    let repo = repository();
+    let snapshot = Snapshot::from_repository(repo.path(), "HEAD").unwrap();
+    let index = fs::read(repo.path().join(".git/index")).unwrap();
+    let patch = b"diff --git a/tracked.txt b/tracked.txt\n--- a/tracked.txt\n+++ b/tracked.txt\n@@ -1 +1 @@\n-selected snapshot\n+verified result\n";
+    let verified = snapshot.verify_worker_patch("run-1", patch).unwrap();
+    let artifact = str::from_utf8(&verified).unwrap();
+    assert!(artifact.contains("Howl-Run: run-1"));
+    assert!(artifact.contains(snapshot.commit()));
+    assert!(artifact.contains("+verified result"));
+    let other = str::from_utf8(patch).unwrap().replace("selected snapshot", "different base");
+    assert!(snapshot.verify_worker_patch("run-2", other.as_bytes()).is_err());
+    assert_eq!(fs::read(repo.path().join(".git/index")).unwrap(), index);
+    assert_eq!(fs::read_to_string(repo.path().join("tracked.txt")).unwrap(), "dirty working copy\n");
+}
+
+#[test]
 fn pins_explicit_regular_files_to_a_commit() {
     let repo = repository();
     let commit = git(repo.path(), &["rev-parse", "HEAD"]);
