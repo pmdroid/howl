@@ -125,6 +125,57 @@ struct Verified {
 }
 
 impl Network {
+    pub fn account_owned(
+        root: &SigningKey,
+        recovery: &SigningKey,
+        signer: &SigningKey,
+    ) -> io::Result<Self> {
+        let genesis = AuthorityRecord::genesis(root, recovery);
+        let account = genesis.digest();
+        let authority = Authority::import([genesis.clone()], account, account)?;
+        let designation = Designation::issue(authority.head()?, 1, root, signer, &[])?;
+        Ok(Self {
+            authority: vec![hex::encode(genesis.as_bytes())],
+            designation: hex::encode(designation.as_bytes()),
+            devices: Vec::new(),
+            rosters: Vec::new(),
+        })
+    }
+
+    pub fn signer(&self) -> io::Result<Id> {
+        Ok(authority(&self.authority, &self.designation)?.1.signer())
+    }
+
+    pub fn admit(
+        &self,
+        channel: Id,
+        signer: &SigningKey,
+        candidate: &Candidate,
+    ) -> io::Result<Self> {
+        if self.devices.len() >= MAX_RECIPIENTS || channel == [0; 32] {
+            return Err(invalid("invalid channel or network membership size"));
+        }
+        if self.devices.is_empty() && self.rosters.is_empty() {
+            let (_, designation) = authority(&self.authority, &self.designation)?;
+            return self.add(channel, None, Vec::new(), candidate, &designation, signer);
+        }
+        let verified = self.verified(channel)?;
+        let previous = verified
+            .chain
+            .latest()?
+            .ok_or_else(|| invalid("missing roster"))?;
+        let next = self.add(
+            channel,
+            Some(previous),
+            previous.members().to_vec(),
+            candidate,
+            &verified.designation,
+            signer,
+        )?;
+        self.verify_successor(channel, &next, candidate)?;
+        Ok(next)
+    }
+
     fn verified(&self, channel: Id) -> io::Result<Verified> {
         if channel == [0; 32]
             || self.devices.is_empty()
@@ -339,18 +390,9 @@ pub fn bootstrap(state: &Path, channel: Id) -> io::Result<Network> {
     let signer = SigningKey::from_bytes(&*directory.key(cli::SIGNER)?);
     let recovery_dir = StateDirectory::open(&offline)?;
     let recovery = SigningKey::from_bytes(&*recovery_dir.key(cli::RECOVERY)?);
-    let genesis = AuthorityRecord::genesis(&root, &recovery);
-    let account = genesis.digest();
-    let authority = Authority::import([genesis.clone()], account, account)?;
-    let designation = Designation::issue(authority.head()?, 1, &root, &signer, &[])?;
-    let network = Network {
-        authority: vec![hex::encode(genesis.as_bytes())],
-        designation: hex::encode(designation.as_bytes()),
-        devices: Vec::new(),
-        rosters: Vec::new(),
-    };
+    let network = Network::account_owned(&root, &recovery, &signer)?;
     let candidate = candidate(&state, &network.authority, &network.designation)?;
-    let genesis = network.add(channel, None, Vec::new(), &candidate, &designation, &signer)?;
+    let genesis = network.admit(channel, &signer, &candidate)?;
     cli::write_exact(
         &directory,
         "hosted-genesis",
@@ -449,6 +491,29 @@ pub fn apply(state: &Path, channel: Id, network: &Network) -> io::Result<()> {
 mod tests {
     use super::*;
     use crate::{channel::Channel, enrollment::ChannelPermission, identity::PeerTrust};
+
+    #[test]
+    fn account_authority_admits_devices_with_no_founder_identity() {
+        let root = SigningKey::from_bytes(&[1; 32]);
+        let recovery = SigningKey::from_bytes(&[2; 32]);
+        let signer = SigningKey::from_bytes(&[3; 32]);
+        let network = Network::account_owned(&root, &recovery, &signer).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let channel = [5; 32];
+        assert!(network.devices.is_empty() && network.rosters.is_empty());
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        let a = candidate(&first, &network.authority, &network.designation).unwrap();
+        assert!(network.admit(channel, &root, &a).is_err());
+        let current = network.admit(channel, &signer, &a).unwrap();
+        network.verify_successor(channel, &current, &a).unwrap();
+        std::fs::remove_dir_all(&first).unwrap();
+        let b = candidate(&second, &network.authority, &network.designation).unwrap();
+        let next = current.admit(channel, &signer, &b).unwrap();
+        current.verify_successor(channel, &next, &b).unwrap();
+        assert!(next.admit(channel, &signer, &b).is_err());
+        apply(&second, channel, &next).unwrap();
+    }
 
     #[test]
     fn only_fresh_identities_and_reserved_profiles_join_during_login() {
