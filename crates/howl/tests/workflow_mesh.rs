@@ -333,6 +333,129 @@ async fn ordinary_direct_messages_continue_the_same_acp_session() {
     bob_node.stop(&bob).await;
 }
 
+#[tokio::test]
+#[ignore = "requires a local Linux Docker engine and a pinned image with Node.js"]
+async fn shared_thread_answers_overlapping_senders_and_keeps_dms_private() {
+    let root = tempfile::tempdir().unwrap();
+    let states = ["codex", "claude", "grok"].map(|name| root.path().join(name));
+    let certs = states
+        .each_ref()
+        .map(|path| LocalIdentity::load_or_create(path).unwrap().certificate());
+    for (i, state) in states.iter().enumerate() {
+        for (j, cert) in certs.iter().enumerate() {
+            if i != j {
+                PeerTrust::open(state)
+                    .unwrap()
+                    .pin(cert, &cert.fingerprint())
+                    .unwrap();
+            }
+        }
+    }
+    let devices = certs.each_ref().map(|cert| *cert.device_id());
+    let ids = devices.map(hex::encode);
+    let manifest = stdout(mesh_cli(
+        &["channel", "create"],
+        &states[0],
+        &[&ids[1], &ids[2]],
+    ));
+    let mut lines = manifest.lines();
+    let channel = id(lines.next().unwrap().strip_prefix("Channel ").unwrap());
+    let token = lines.next().unwrap().strip_prefix("Manifest ").unwrap();
+    for state in &states[1..] {
+        stdout(mesh_cli(&["channel", "join"], state, &[token]));
+    }
+    let mut nodes = states.each_ref().map(|state| Node::start(state));
+    let (repo, rev) = repository(root.path(), "shared-repo", "fixture");
+    let conversations = (1..=2)
+        .map(|i| {
+            serde_json::json!({
+                "channel":hex::encode(channel),"peer":ids[i],"route":nodes[i].route,
+                "repository":repo,"revision":rev,"shared_thread":"review"
+            })
+        })
+        .collect::<Vec<_>>();
+    let config = states[0].join("conversations.json");
+    fs::write(
+        &config,
+        serde_json::json!({"conversations":conversations}).to_string(),
+    )
+    .unwrap();
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+    let image = std::env::var("HOWL_MANAGED_FIXTURE_IMAGE").unwrap();
+    let agent = howl::ongoing::serve(&states[0], observer(), move || {
+        Ok(Harness::new(
+            "shared-fixture",
+            image.clone(),
+            "/usr/local/bin/node",
+            &["-e", include_str!("fixtures/acp/ongoing-agent.cjs")],
+        ))
+    });
+    let send = |i: usize, body| node::send(&states[i], channel, devices[0], &nodes[0].route, body);
+    let answer = |i: usize, receipt: String| {
+        let state = states[i].clone();
+        async move {
+            let needle = format!("reply-to={}", receipt.strip_prefix("queued ").unwrap());
+            tokio::time::timeout(WAIT, async {
+                loop {
+                    let history = stdout(mesh_cli(&["read"], &state, &[&hex::encode(channel)]));
+                    if let Some(line) = history.lines().find(|s| s.contains(&needle)) {
+                        break line.to_owned();
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            })
+            .await
+            .expect("expected a reply to this message")
+        }
+    };
+    let exchange = async {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let private = send(1, "private-canary").await.unwrap();
+        answer(1, private).await;
+        let slow = send(1, "/thread review slow-canary").await.unwrap();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let fast = send(1, "/thread review probe-one").await.unwrap();
+        let other = send(2, "/thread review probe-two").await.unwrap();
+        let (one, two) = tokio::join!(answer(1, fast), answer(2, other));
+        for reply in [one, two] {
+            assert!(
+                reply.contains("pending=true") && reply.contains("private=false"),
+                "{reply}"
+            );
+            assert!(reply.contains(&ids[1]), "{reply}");
+        }
+        let history = stdout(mesh_cli(&["read"], &states[1], &[&hex::encode(channel)]));
+        assert!(!history.contains(&format!(
+            "reply-to={}",
+            slow.strip_prefix("queued ").unwrap()
+        )));
+        answer(1, slow).await;
+        let final_reply = answer(2, send(2, "/thread review probe-summary").await.unwrap()).await;
+        assert!(
+            final_reply.contains("completed=3") && final_reply.contains("private=false"),
+            "{final_reply}"
+        );
+        let posted = howl::interaction::LocalInteraction::new(&states[1])
+            .post(channel, "@review probe-channel")
+            .await
+            .unwrap();
+        let channel_reply = answer(1, format!("queued {}", posted.message)).await;
+        assert!(
+            channel_reply.contains("completed=4") && channel_reply.contains("private=false"),
+            "{channel_reply}"
+        );
+        let private_reply = answer(1, send(1, "probe-private").await.unwrap()).await;
+        assert!(
+            private_reply.contains("completed=0") && private_reply.contains("private=true"),
+            "{private_reply}"
+        );
+    };
+    tokio::select! { result=agent=>panic!("agent exited: {result:?}"), ()=exchange=>{} }
+    for (node, state) in nodes.iter_mut().zip(states) {
+        node.stop(&state).await;
+    }
+}
+
 fn native_harness(stage: &str) -> Harness {
     let image = std::env::var("HOWL_HOST_REPOSITORY_IMAGE").expect("set the pinned Docker image");
     let node = configured("HOWL_HOST_NODE");
