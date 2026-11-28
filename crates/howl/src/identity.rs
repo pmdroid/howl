@@ -142,7 +142,7 @@ impl PeerCertificate {
         digest.finalize().into()
     }
 
-    pub(crate) fn signing_public(&self) -> [u8; 32] {
+    pub fn signing_public(&self) -> [u8; 32] {
         *field(&self.bytes, 33)
     }
 

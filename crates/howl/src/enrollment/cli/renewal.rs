@@ -41,7 +41,7 @@ pub(crate) fn peer_records(directory: &StateDirectory, device: Id) -> io::Result
     )))
 }
 
-pub(super) fn accept(
+pub(in crate::enrollment) fn accept(
     state: &Path,
     authority: &Authority,
     designation: &Designation,
@@ -115,7 +115,7 @@ pub(super) fn accept(
     }
 }
 
-pub(super) fn import_peer(
+pub(in crate::enrollment) fn import_peer(
     state: &Path,
     directory: &StateDirectory,
     authority: &Authority,

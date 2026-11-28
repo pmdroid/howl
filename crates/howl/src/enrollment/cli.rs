@@ -1,6 +1,7 @@
 mod recovery;
 mod renewal;
 
+pub(super) use renewal::{accept as accept_records, import_peer as import_records};
 pub(crate) use renewal::{peer_records, profile_records};
 
 use std::{
@@ -22,9 +23,9 @@ use super::{
     Enroll, Id, PairingOffer, PairingResponse, PairingTicket,
 };
 
-const ROOT: &str = "enrollment-root-key";
-const SIGNER: &str = "enrollment-signer-key";
-const RECOVERY: &str = "enrollment-recovery-key";
+pub(super) const ROOT: &str = "enrollment-root-key";
+pub(super) const SIGNER: &str = "enrollment-signer-key";
+pub(super) const RECOVERY: &str = "enrollment-recovery-key";
 const DESIGNATION: &str = "enrollment-designation";
 const CERTIFICATE: &str = "enrollment-certificate";
 const PEER: &str = "device";
@@ -382,7 +383,7 @@ fn load_key(directory: &StateDirectory, name: &str) -> io::Result<SigningKey> {
     Ok(SigningKey::from_bytes(&seed))
 }
 
-fn write_exact(directory: &StateDirectory, name: &str, bytes: &[u8]) -> io::Result<()> {
+pub(super) fn write_exact(directory: &StateDirectory, name: &str, bytes: &[u8]) -> io::Result<()> {
     if directory.write(name, bytes)? {
         return Ok(());
     }
@@ -393,7 +394,7 @@ fn write_exact(directory: &StateDirectory, name: &str, bytes: &[u8]) -> io::Resu
     Ok(())
 }
 
-fn separate(paths: &[&Path]) -> io::Result<()> {
+pub(super) fn separate(paths: &[&Path]) -> io::Result<()> {
     let mut canonical = Vec::with_capacity(paths.len());
     for path in paths {
         StateDirectory::open(path)?;
