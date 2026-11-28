@@ -1,33 +1,65 @@
 #!/bin/sh
 set -eu
 export PATH=/usr/local/bin:/usr/bin:/usr/sbin:/bin:/sbin
-mkdir -p /dev /proc /sys /workspace /scratch /tmp /run
-mount -t devtmpfs devtmpfs /dev
-mount -t proc proc /proc
-mount -t sysfs sysfs /sys
-modprobe virtio_mmio
-modprobe virtio_blk
-ip link set lo up
-for i in 1 2 3 4 5 6 7 8 9 10; do
-    for port in /sys/class/virtio-ports/vport*; do
-        [ -r "$port/name" ] || continue
-        case "$(cat "$port/name")" in
-            howl.acp) acp="/dev/${port##*/}" ;;
-            howl.patch) patch="/dev/${port##*/}" ;;
-            howl.provider) provider="/dev/${port##*/}" ;;
-        esac
+if [ "${1:-}" = "--worker" ]; then
+    inference=$2
+    export HOWL_GUEST_VSOCK=1
+else
+    mkdir -p /dev /proc /sys /workspace /scratch /tmp /run
+    mount -t devtmpfs devtmpfs /dev
+    mount -t proc proc /proc
+    mount -t sysfs sysfs /sys
+    cmdline=$(cat /proc/cmdline)
+    case " $cmdline " in
+        *" howl.transport=vsock "*) transport=vsock ;;
+        *) transport=serial ;;
+    esac
+    if [ "$transport" = vsock ]; then
+        modprobe virtio_mmio 2>/dev/null || :
+        modprobe virtio_blk 2>/dev/null || :
+        modprobe vmw_vsock_virtio_transport 2>/dev/null || :
+        modprobe virtio_rng 2>/dev/null || :
+    else
+        modprobe virtio_mmio
+        modprobe virtio_blk
+    fi
+    ip link set lo up
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        if [ "$transport" = vsock ]; then
+            [ -b /dev/vda ] && break
+        else
+            for port in /sys/class/virtio-ports/vport*; do
+                [ -r "$port/name" ] || continue
+                case "$(cat "$port/name")" in
+                    howl.acp) acp="/dev/${port##*/}" ;;
+                    howl.patch) patch="/dev/${port##*/}" ;;
+                    howl.provider) provider="/dev/${port##*/}" ;;
+                esac
+            done
+            [ -b /dev/vda ] && [ -n "${acp:-}" ] && [ -n "${patch:-}" ] && [ -n "${provider:-}" ] && break
+        fi
+        sleep 1
     done
-    [ -b /dev/vda ] && [ -n "${acp:-}" ] && [ -n "${patch:-}" ] && [ -n "${provider:-}" ] && break
-    sleep 1
-done
-test -c "$acp" && test -c "$patch" && test -c "$provider"
-tar -xf /dev/vda --no-same-owner -C /workspace
-chown -R 65532:65532 /workspace /scratch
-chmod 1777 /tmp
-exec 3<>"$acp"
-exec 4<>"$patch"
-exec 5<>"$provider"
-setpriv --reuid=65532 --regid=65532 --clear-groups node /fixture/provider-bridge.cjs <&5 >&5 3<&- 4<&- &
+    test -b /dev/vda
+    tar -xf /dev/vda --no-same-owner -C /workspace
+    chown -R 65532:65532 /workspace /scratch
+    chmod -R u+w /workspace /scratch
+    chmod 1777 /tmp
+    if [ "$transport" = vsock ]; then
+        case " $cmdline " in
+            *" howl.inference=1 "*) exec /fixture/howl-vsock 1 ;;
+            *) exec /fixture/howl-vsock 0 ;;
+        esac
+    fi
+    test -c "$acp" && test -c "$patch" && test -c "$provider"
+    exec 3<>"$acp"
+    exec 4<>"$patch"
+    exec 5<>"$provider"
+    inference=1
+fi
+if [ "$inference" = 1 ]; then
+    setpriv --reuid=65532 --regid=65532 --clear-groups node /fixture/provider-bridge.cjs <&5 >&5 3<&- 4<&- &
+fi
 export HOME=/scratch TMPDIR=/tmp USER=howl LOGNAME=howl LANG=C.UTF-8
 cd /workspace
 exec setpriv --reuid=65532 --regid=65532 --clear-groups node /fixture/worker.cjs <&3 >&3 3<&- 5<&-

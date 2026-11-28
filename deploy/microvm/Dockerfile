@@ -5,17 +5,23 @@ WORKDIR /fixture
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --ignore-scripts --no-audit --no-fund && npm cache clean --force
 
+FROM debian:bookworm-slim AS vsock
+RUN apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev && rm -rf /var/lib/apt/lists/*
+COPY vsock.c /vsock.c
+RUN gcc -static -Os -Wall -Wextra -Werror -o /howl-vsock /vsock.c
+
 FROM ${CODEX_ROOTFS} AS guest
 COPY --chmod=755 init /init
 COPY howl-model /etc/howl-model
 COPY worker.cjs codex-guest.mjs launch-codex.mjs provider-bridge.cjs /fixture/
+COPY --from=vsock /howl-vsock /fixture/howl-vsock
 
 FROM debian:bookworm-slim AS packer
 RUN apt-get update && apt-get install -y --no-install-recommends cpio gzip && rm -rf /var/lib/apt/lists/*
 SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
 COPY modules.cpio.gz /modules.cpio.gz
 RUN --mount=type=bind,from=guest,target=/guest cd /guest && find . -xdev -print0 | cpio --null -o -H newc | gzip -1 > /initramfs.cpio.gz
-RUN mkdir /modules && cd /modules && gzip -dc /modules.cpio.gz | cpio -id --no-absolute-filenames 'usr/lib/modules/*' './usr/lib/modules/*' 'lib/modules/*' './lib/modules/*' && test -n "$(find . -type f -print -quit)" && find . -print0 | cpio --null -o -H newc | gzip -1 >> /initramfs.cpio.gz
+RUN if test -s /modules.cpio.gz; then mkdir /modules && cd /modules && gzip -dc /modules.cpio.gz | cpio -id --no-absolute-filenames 'usr/lib/modules/*' './usr/lib/modules/*' 'lib/modules/*' './lib/modules/*' && test -n "$(find . -type f -print -quit)" && find . -print0 | cpio --null -o -H newc | gzip -1 >> /initramfs.cpio.gz; fi
 
 FROM scratch
 COPY --from=packer /initramfs.cpio.gz /

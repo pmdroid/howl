@@ -142,16 +142,22 @@ Before each context-managed turn Howl measures the serialized prompt with the lo
 
 ### Run an isolated worker
 
-Install an ARM64 QEMU binary with HVF or KVM. Create a mode `600` file named `microvm.json` in the agent's state directory with absolute paths to the QEMU binary, a Linux kernel and a trusted initramfs. Set `memory_mib` and `vcpus` for each worker. To make model calls through Howl's guest provider bridge, add `provider` with the `provider` name (`openai` or `xai`) and `model`, and set the corresponding provider key in the host runner's environment.
+Create a mode `600` file named `microvm.json` in the agent's state directory. Set `qemu` to an absolute binary path on ARM64 with HVF or KVM, or set `firecracker` to an absolute Firecracker binary path on x86-64 Linux with KVM. Use exactly one of these fields. Set `kernel` and `initramfs` to absolute paths for a matching Linux kernel and trusted guest image. Set `memory_mib` and `vcpus` for each worker. To make model calls through Howl's guest provider bridge, add `provider` with the `provider` name (`openai` or `xai`) and `model`, and set the corresponding provider key in the host runner's environment.
 
-Run `howl worker check STATE_DIR` to validate the configured guest assets and host prerequisites before starting a worker. On Linux the worker needs an ARM64 host with KVM enabled and read/write access to `/dev/kvm`. On Apple Silicon it uses Hypervisor.framework. Howl accepts each serial connection only from the QEMU process it started and removes the repository archive and socket paths once the guest is ready. In a two-worker test on Apple Silicon, a 512 MiB, one-vCPU Linux fixture reached its ACP session in 2.2 seconds. Its QEMU process used 257 MiB of resident memory during the test.
+Run `howl worker check STATE_DIR` to validate the configured guest assets and host prerequisites before starting a worker. Linux workers need read/write access to `/dev/kvm`. Apple Silicon uses Hypervisor.framework. Howl verifies that its own hypervisor process opened each guest connection and removes the repository archive and socket paths once the guest is ready.
 
-The guest init extracts the read-only tar disk at `/dev/vda` into its writable `/workspace`. Identify the serial ports by name in `/sys/class/virtio-ports`. The guest sends `HOWL_ACP_READY` followed by a newline on `howl.acp`, then runs its ACP adapter over that port. At teardown it returns an eight-byte big-endian patch length and the patch bytes on `howl.patch`. Set the length to zero for a worker that produced no patch. For inference, run `crates/howl/src/provider_bridge.cjs` in the guest over `howl.provider`, and configure the guest's agent to use its loopback endpoint.
+The guest init extracts the read-only tar disk at `/dev/vda` into its writable `/workspace`. QEMU uses the named serial ports `howl.acp`, `howl.patch`, and `howl.provider`. The Firecracker guest connects to host CID 2 over vsock ports 7821, 7822, and 7823 for the same channels. The guest sends `HOWL_ACP_READY` followed by a newline on the ACP channel. At teardown it returns an eight-byte big-endian patch length and the patch bytes on the patch channel. A zero length indicates an empty patch. For inference, the guest bridge uses the provider channel and exposes a loopback endpoint to the agent.
 
 To build a writable Codex guest, supply the gzip-compressed newc module archive for your ARM64 kernel, the model ID and a new output directory. The build installs the locked Codex ACP runtime and produces `initramfs.cpio.gz`. Point the profile's `initramfs` field at that file and set its provider model to the same ID.
 
 ```sh
 python3 deploy/microvm/build.py /path/to/kernel-modules.cpio.gz gpt-6.2-sol ./codex-guest
+```
+
+For an x86-64 Firecracker kernel with built-in virtio block, MMIO, vsock, and entropy drivers, build the AMD64 initramfs with the following command. If the kernel needs modules, provide their gzip-compressed newc archive in place of `-`. Set `memory_mib` to at least `3072` for this full guest image. [Firecracker kernel configuration](https://github.com/firecracker-microvm/firecracker/blob/v1.18.0/docs/kernel-policy.md)
+
+```sh
+python3 deploy/microvm/build.py - gpt-6.2-sol ./firecracker-guest --platform linux/amd64
 ```
 
 For an existing Howl ChatGPT plan connection, set the profile's provider to `chatgpt_plan` and choose a model available to that connection. Set `HOWL_CHATGPT_NODE` to the absolute Node executable path, `HOWL_CHATGPT_HELPER` to the path of `tools/chatgpt-auth/chatgpt-auth.mjs`, and `HOWL_CHATGPT_STORE` to the existing credential directory. The host broker uses the connection to make requests for the guest. The guest uses the local provider bridge.
