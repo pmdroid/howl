@@ -1,0 +1,13 @@
+services:
+  api:
+    environment:
+      HOWL_BETA_GITHUB_FILES: "1"
+    secrets:
+      - github-client-id
+      - github-client-secret
+
+secrets:
+  github-client-id:
+    file: ${HOWL_BETA_GITHUB_OAUTH_DIR:?set HOWL_BETA_GITHUB_OAUTH_DIR}/client-id
+  github-client-secret:
+    file: ${HOWL_BETA_GITHUB_OAUTH_DIR:?set HOWL_BETA_GITHUB_OAUTH_DIR}/client-secret
