@@ -44,5 +44,10 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: Tests
         run: cargo test --workspace --all-targets --all-features --locked
+      - name: Verify hosted device approval and iroh connectivity
+        if: runner.os == 'Linux'
+        run: |
+          cargo build --locked -p howl --bin howl
+          bash deploy/private-beta/rehearse.sh --onboarding "$PWD/target/debug/howl"
       - name: Documentation tests
         run: cargo test --workspace --doc --all-features --locked

@@ -1,3 +1,5 @@
+mod network_cli;
+
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -69,12 +71,12 @@ async fn upstream_poll(State(provider): State<Arc<Provider>>, form: String) -> J
     }
 }
 
-async fn user(headers: HeaderMap) -> Json<Value> {
+fn github_user(headers: HeaderMap, id: i64) -> Json<Value> {
     assert_eq!(
         headers["authorization"].to_str().unwrap(),
         format!("Bearer {GH_TOKEN}")
     );
-    Json(json!({"id":1234567,"login":"fixture-renameable"}))
+    Json(json!({"id":id,"login":"fixture-renameable"}))
 }
 
 async fn upstream_revoke(
@@ -91,6 +93,29 @@ async fn upstream_revoke(
     assert_eq!(request, json!({"access_token":GH_TOKEN}));
     provider.revoked.fetch_add(1, Ordering::SeqCst);
     StatusCode::NO_CONTENT
+}
+
+async fn github_fixture(github_id: i64, prior_polls: usize) -> (Server, Arc<Provider>, GitHub) {
+    let upstream = Arc::new(Provider {
+        polls: AtomicUsize::new(prior_polls),
+        ..Provider::default()
+    });
+    let provider = serve(
+        Router::new()
+            .route("/login/device/code", post(start))
+            .route("/login/oauth/access_token", post(upstream_poll))
+            .route(
+                "/user",
+                get(move |headers| async move { github_user(headers, github_id) }),
+            )
+            .route("/applications/fixtureapp/grant", delete(upstream_revoke))
+            .with_state(upstream.clone()),
+    )
+    .await;
+    let github = GitHub::new("fixtureapp".into(), Zeroizing::new("fixture_secret".into()))
+        .unwrap()
+        .fixture(provider.url.clone());
+    (provider, upstream, github)
 }
 
 fn pool(name: &str) -> Pool {
@@ -175,19 +200,7 @@ async fn device_login_rejects_replays_and_rotates_or_revokes_device_bound_creden
             .await
             .is_err()
     );
-    let upstream = Arc::new(Provider::default());
-    let provider = serve(
-        Router::new()
-            .route("/login/device/code", post(start))
-            .route("/login/oauth/access_token", post(upstream_poll))
-            .route("/user", get(user))
-            .route("/applications/fixtureapp/grant", delete(upstream_revoke))
-            .with_state(upstream.clone()),
-    )
-    .await;
-    let github = GitHub::new("fixtureapp".into(), Zeroizing::new("fixture_secret".into()))
-        .unwrap()
-        .fixture(provider.url.clone());
+    let (_provider, upstream, github) = github_fixture(1234567, 0).await;
     let control = Arc::new(
         ControlPlane::new(runtime.clone(), github, AUDIENCE, Zeroizing::new([3; 32])).unwrap(),
     );
@@ -922,22 +935,7 @@ async fn native_login_persists_private_credentials_and_enrolls_through_refresh()
     let owner = pool("HOWL_TEST_CONTROL_DATABASE_OWNER");
     migrate(&owner).await.unwrap();
     let runtime = pool("HOWL_TEST_CONTROL_DATABASE_RUNTIME");
-    let upstream = Arc::new(Provider {
-        polls: AtomicUsize::new(2),
-        revoked: AtomicUsize::new(0),
-    });
-    let provider = serve(
-        Router::new()
-            .route("/login/device/code", post(start))
-            .route("/login/oauth/access_token", post(upstream_poll))
-            .route("/user", get(user))
-            .route("/applications/fixtureapp/grant", delete(upstream_revoke))
-            .with_state(upstream.clone()),
-    )
-    .await;
-    let github = GitHub::new("fixtureapp".into(), Zeroizing::new("fixture_secret".into()))
-        .unwrap()
-        .fixture(provider.url.clone());
+    let (_provider, upstream, github) = github_fixture(1234567, 2).await;
     let control =
         Arc::new(ControlPlane::new(runtime, github, AUDIENCE, Zeroizing::new([3; 32])).unwrap());
     let server = serve(control.router()).await;

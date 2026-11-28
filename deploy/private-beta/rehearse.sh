@@ -1,8 +1,13 @@
 set -euo pipefail
 umask 077
 
-control=${1:?Usage: bash deploy/private-beta/rehearse.sh /absolute/path/to/howl-control-plane}
-[[ "$control" = /* && -x "$control" ]]
+control=${1:?Usage: bash deploy/private-beta/rehearse.sh /absolute/path/to/howl-control-plane or --onboarding /absolute/path/to/howl}
+if [[ "$control" = --onboarding ]]; then
+    export HOWL_TEST_CONTROL_CLI=${2:?Set the path to the Howl CLI}
+    [[ "$HOWL_TEST_CONTROL_CLI" = /* && -x "$HOWL_TEST_CONTROL_CLI" ]]
+else
+    [[ "$control" = /* && -x "$control" ]]
+fi
 host=${DOCKER_HOST:-unix://}
 if [[ -n "${DOCKER_CONTEXT:-}" || -z "${DOCKER_HOST:-}" ]]; then
     host=$(docker context inspect "${DOCKER_CONTEXT:-$(docker context show)}" --format '{{.Endpoints.docker.Host}}')
@@ -55,6 +60,17 @@ port=${BASH_REMATCH[1]}
 owner="postgresql://howl_control_owner:$(<"$scratch/postgres-owner")@127.0.0.1:$port/howl"
 runtime="postgresql://howl_control_runtime:$(<"$scratch/postgres-runtime")@127.0.0.1:$port"
 
+run_fixture() {
+    HOWL_TEST_CONTROL_DATABASE_OWNER="$owner" HOWL_TEST_CONTROL_DATABASE_RUNTIME="$runtime/howl" \
+        cargo test --manifest-path "$directory/../../Cargo.toml" --locked -p howl-control-plane --lib "$1" -- --ignored
+}
+
+if [[ "$control" = --onboarding ]]; then
+    run_fixture github_login_and_owner_approval_connect_two_devices_over_iroh
+    run_fixture approvals_bind_the_registered_device_and_isolate_other_accounts
+    exit 0
+fi
+
 export HOWL_CONTROL_BIND="127.0.0.1:$api_port"
 export HOWL_CONTROL_AUDIENCE
 HOWL_CONTROL_AUDIENCE=$(openssl rand -hex 32)
@@ -105,6 +121,9 @@ restored=$(compose exec -T postgres psql --no-psqlrc --no-password --username=po
 [[ "$restored" = "$account:$head:$designation" ]]
 check_api howl_restore
 if [[ "${HOWL_BETA_TEST_GITHUB_FIXTURE:-0}" = 1 ]]; then
-    HOWL_TEST_CONTROL_DATABASE_OWNER="$owner" HOWL_TEST_CONTROL_DATABASE_RUNTIME="$runtime/howl"         cargo test --manifest-path "$directory/../../Cargo.toml" --locked -p howl-control-plane --lib         device_login_rejects_replays_and_rotates_or_revokes_device_bound_credentials -- --ignored
+    run_fixture device_login_rejects_replays_and_rotates_or_revokes_device_bound_credentials
+    if [[ -n "${HOWL_TEST_CONTROL_CLI:-}" ]]; then
+        run_fixture github_login_and_owner_approval_connect_two_devices_over_iroh
+    fi
 fi
 printf '%s\n' 'Verified loopback API, private PostgreSQL roles, authenticated route rejection and recovery from a database backup.'
