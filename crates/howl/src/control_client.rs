@@ -29,6 +29,7 @@ const CREDENTIALS: &str = "credentials";
 const LOCK: &str = "control-auth.lock";
 const STATE_LIMIT: u64 = 4_096;
 const AUTHORIZATION_URL: &str = "https://github.com/login/device";
+const DEFAULT_CONTROL_URL: &str = "https://howl-control-plane-d1-prototype.pascal.workers.dev";
 
 pub struct ControlClient {
     service: Service,
@@ -430,7 +431,14 @@ impl Service {
     async fn for_login(
         existing: Option<&Stored>,
     ) -> io::Result<(Self, Option<device_link::Browser>)> {
-        let (origin, http) = Self::connection(&configured("HOWL_CONTROL_URL")?)?;
+        let configured_origin = match env::var("HOWL_CONTROL_URL") {
+            Ok(value) => value,
+            Err(env::VarError::NotPresent) => existing
+                .map(|stored| stored.origin.clone())
+                .unwrap_or_else(|| DEFAULT_CONTROL_URL.to_owned()),
+            Err(env::VarError::NotUnicode(_)) => return Err(configuration()),
+        };
+        let (origin, http) = Self::connection(&configured_origin)?;
         if existing.is_some_and(|stored| stored.origin != origin.as_str()) {
             return Err(io::Error::other(
                 "Local credentials belong to a different control plane.",
