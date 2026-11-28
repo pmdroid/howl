@@ -252,3 +252,95 @@ async fn github_login_and_owner_approval_connect_two_devices_over_iroh() {
         );
     }
 }
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL roles and HOWL_TEST_CONTROL_CLI"]
+async fn native_device_joins_from_a_howl_browser_link() {
+    use super::network_api::{Owner, WEB_ORIGIN};
+
+    let admin = pool("HOWL_TEST_CONTROL_DATABASE_OWNER");
+    migrate(&admin).await.unwrap();
+    let github = GitHub::new("fixtureapp".into(), Zeroizing::new("fixture_secret".into()))
+        .unwrap()
+        .fixture("http://127.0.0.1:1".into());
+    let control = Arc::new(
+        ControlPlane::new(
+            pool("HOWL_TEST_CONTROL_DATABASE_RUNTIME"),
+            github,
+            AUDIENCE,
+            Zeroizing::new([3; 32]),
+        )
+        .unwrap()
+        .with_web_origin(WEB_ORIGIN)
+        .unwrap(),
+    );
+    let server = serve(control.clone().router()).await;
+    let account = i64::from_be_bytes(crate::random().unwrap()[..8].try_into().unwrap())
+        .saturating_abs()
+        .max(1);
+    let owner = Owner::sign_in(&control, account).await;
+    let cli = Cli {
+        binary: std::env::var_os("HOWL_TEST_CONTROL_CLI").unwrap(),
+        url: server.url.clone(),
+    };
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("device");
+    let mut login = cli
+        .command(&["control", "login"], &path, &[])
+        .env("HOWL_NO_BROWSER", "1")
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut lines = BufReader::new(login.stdout.take().unwrap()).lines();
+    let (secret, fingerprint) = timeout(Duration::from_secs(10), async {
+        let link = lines.next_line().await.unwrap().unwrap();
+        let secret = link
+            .strip_prefix(&format!("Open {WEB_ORIGIN}/link#"))
+            .expect("expected a private Howl device link");
+        assert_eq!(secret.len(), 64);
+        let fingerprint = lines.next_line().await.unwrap().unwrap();
+        (
+            secret.to_owned(),
+            field(&fingerprint, "Fingerprint ").to_owned(),
+        )
+    })
+    .await
+    .unwrap();
+    let http = Client::new();
+    let request = |operation: &str| {
+        http.post(format!("{}/api/device-links/{operation}", server.url))
+            .header("origin", WEB_ORIGIN)
+            .header("cookie", &owner.cookie)
+    };
+    let view = success(
+        request("view")
+            .json(&json!({"secret":secret}))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(view["fingerprint"], fingerprint);
+    let choice = json!({"secret":secret,"device":view["device"],"fingerprint":fingerprint,"decision":"approve"});
+    assert_eq!(
+        request("decide")
+            .json(&choice)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    assert!(
+        timeout(Duration::from_secs(30), login.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+    let confirmed = success_text(cli.run(&["control", "devices"], &path, &[]).await);
+    assert_eq!(field(&confirmed, "Membership "), "approved");
+    assert_eq!(field(&confirmed, "Device "), string(&view, "device"));
+    let again = success_text(cli.run(&["control", "login"], &path, &[]).await);
+    assert!(!again.contains("/link#"));
+}

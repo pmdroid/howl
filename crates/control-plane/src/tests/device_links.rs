@@ -225,6 +225,55 @@ async fn device_link_redeems_exact_owner_approval_once() {
             .status(),
         StatusCode::CONFLICT
     );
+    let native_rejected = Device::login(
+        &control.pool,
+        account,
+        *reject.peer.device_id(),
+        SigningKey::from_bytes(&[82; 32]),
+    )
+    .await;
+    assert_eq!(native_rejected.view(&server).await["state"], "denied");
+    let legacy_state = states.path().join("pending-native");
+    let mixed_identity = enrollment_identity(&legacy_state, [51, 52, 53, 54]);
+    let mixed = Link::create(&server, &mixed_identity, 52).await;
+    let claim = success(mixed.browser(&owner, &server, None).await).await;
+    let legacy = Device::login(
+        &control.pool,
+        account,
+        *mixed.peer.device_id(),
+        SigningKey::from_bytes(&[52; 32]),
+    )
+    .await;
+    assert_eq!(
+        mixed
+            .browser(&owner, &server, Some("approve"))
+            .await
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    let candidate =
+        hosted::candidate(&legacy_state, &records, string(&bound, "designation")).unwrap();
+    assert_eq!(
+        legacy
+            .post(
+                &server,
+                "/v1/network/devices",
+                "network-register",
+                &candidate
+            )
+            .await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(legacy.view(&server).await["state"], "approved");
+    let after = owner.view(&server).await;
+    assert_eq!(after["pending"], json!([]));
+    assert!(
+        after["approved"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|device| device["id"] == claim["device"])
+    );
     pool("HOWL_TEST_CONTROL_DATABASE_OWNER")
         .get()
         .await
