@@ -47,6 +47,8 @@ impl Membership {
 #[derive(Deserialize)]
 struct Status {
     state: Membership,
+    #[serde(default)]
+    account_managed: bool,
     network: Option<String>,
     founder: Option<String>,
     snapshot: Option<Network>,
@@ -59,7 +61,9 @@ impl Status {
     fn origin(&self, local: &Id) -> io::Result<(Id, Id)> {
         let network = id(self.network.as_deref())?;
         let founder = id(self.founder.as_deref())?;
-        if (self.state == Membership::Founder) != (*local == founder) {
+        if self.account_managed && self.state == Membership::Founder
+            || !self.account_managed && (self.state == Membership::Founder) != (*local == founder)
+        {
             return Err(invalid("network founder identity mismatch"));
         }
         Ok((network, founder))
@@ -70,13 +74,14 @@ impl Status {
             .snapshot
             .as_ref()
             .ok_or_else(|| invalid("missing network membership"))?;
-        if snapshot
-            .devices
-            .first()
-            .ok_or_else(|| invalid("empty network"))?
-            .identity()?
-            .device_id()
-            != founder
+        if !(self.account_managed && snapshot.pin()?.0 == *founder)
+            && snapshot
+                .devices
+                .first()
+                .ok_or_else(|| invalid("empty network"))?
+                .identity()?
+                .device_id()
+                != founder
         {
             return Err(invalid("network certificate does not match the founder"));
         }
@@ -121,9 +126,16 @@ async fn status(client: &ControlClient) -> io::Result<Status> {
     let response = client
         .signed(Method::GET, "/v1/network", "network-read", &[], None)
         .await?;
+    if response.status() == StatusCode::CONFLICT {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "Sign in to your Howl control plane in a browser to create your network, then run howl control devices with this state directory.",
+        ));
+    }
     if response.status() == StatusCode::NOT_FOUND {
         return Ok(Status {
             state: Membership::Legacy,
+            account_managed: false,
             network: None,
             founder: None,
             snapshot: None,
@@ -261,6 +273,39 @@ pub async fn devices(state: &Path) -> io::Result<()> {
 pub async fn approve(state: &Path, device: Id) -> io::Result<()> {
     approve_request(state, device, None).await?;
     println!("Approved {}", hex::encode(device));
+    Ok(())
+}
+
+pub async fn transfer(state: &Path) -> io::Result<()> {
+    let client = ControlClient::open(state).await?;
+    let view = pinned_status(state, &client).await?;
+    let local = client.identity().certificate();
+    if id(view.founder.as_deref())? != *local.device_id() {
+        return Err(invalid("transfer requires the original founding device"));
+    }
+    if view.account_managed {
+        println!("This network already uses GitHub account approvals.");
+        return Ok(());
+    }
+    let snapshot = view.snapshot(local.device_id())?;
+    snapshot.verify(id(view.network.as_deref())?)?;
+    let signer = crate::enrollment::cli::operator_signer(&StateDirectory::open(state)?)?;
+    if signer.verifying_key().to_bytes() != snapshot.signer()? {
+        return Err(invalid("local signing key does not match the network"));
+    }
+    #[derive(Serialize)]
+    struct Transfer<'a> {
+        signer: &'a str,
+    }
+    let seed = zeroize::Zeroizing::new(hex::encode(signer.as_bytes()));
+    post(
+        &client,
+        "/v1/network/transfer",
+        "network-transfer",
+        &Transfer { signer: &seed },
+    )
+    .await?;
+    println!("GitHub account approvals are enabled for this network.");
     Ok(())
 }
 

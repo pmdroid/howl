@@ -163,6 +163,9 @@ async fn main() -> ExitCode {
         [group, command, state] if group == "control" && command == "login" => {
             howl::network_client::login(Path::new(state)).await
         }
+        [group, command, state] if group == "control" && command == "transfer" => {
+            howl::network_client::transfer(Path::new(state)).await
+        }
         [group, command, state] if group == "control" && command == "devices" => {
             howl::network_client::devices(Path::new(state)).await
         }
