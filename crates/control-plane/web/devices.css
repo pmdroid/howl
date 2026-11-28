@@ -1,0 +1,58 @@
+:root {
+  color-scheme: light;
+  font: 100%/1.5 system-ui, sans-serif;
+  color: #222c27;
+  background: #edf2ed;
+  --paper: #fbfdfa;
+  --muted: #4f6157;
+  --line: #bdc9be;
+  --green: #265e4e;
+}
+* { box-sizing: border-box; }
+body, h1, h2, p, dl, dd, ul { margin: 0; }
+[hidden], p:empty { display: none; }
+::selection { background: #c6e5d5; color: #242e27; }
+:focus-visible { outline: 2px solid var(--green); outline-offset: 3px; }
+header, .section-heading, .actions { display: flex; align-items: center; gap: .65rem; }
+header, .section-heading { justify-content: space-between; }
+header { min-height: 4rem; padding: .6rem clamp(1rem, 4vw, 3rem); background: var(--paper); border-bottom: 1px solid var(--line); }
+.wordmark { font: 1.85rem Georgia, serif; letter-spacing: -.035em; text-decoration: none; color: inherit; }
+main { width: min(100%, 54rem); margin: 0 auto; padding: clamp(1.8rem, 5vw, 3.5rem) clamp(1rem, 4vw, 2rem); }
+h1 { font: 500 clamp(2.25rem, 5vw, 3rem)/1.1 Georgia, serif; letter-spacing: -.035em; }
+h2 { font-size: 1.15rem; }
+p, dt { color: var(--muted); }
+dt { font-size: .85rem; }
+dd { overflow-wrap: anywhere; }
+code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-variant-numeric: tabular-nums; }
+button, .button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 2.75rem;
+  padding: .5rem .9rem;
+  border: 1px solid #7e9989;
+  border-radius: 5px;
+  background: var(--paper);
+  color: inherit;
+  font: 600 .95rem/1.4 system-ui, sans-serif;
+  cursor: pointer;
+  text-decoration: none;
+}
+button:hover { background: #e0ebe2; }
+button:disabled { opacity: .6; cursor: wait; }
+.primary { background: var(--green); color: white; border-color: var(--green); }
+.primary:hover { background: #174737; }
+.deny { color: #7a2b23; border-color: #a4675f; }
+#status, #error, #login, #network { margin-top: 1rem; }
+#error { color: #792d26; }
+#retry, #login .button { margin-top: .8rem; }
+#network code, .device-id { font-size: .88rem; }
+#requests, #members, #transfer { margin-top: 2rem; }
+#empty, #instructions { margin: .75rem 0; }
+ul { list-style: none; padding: 0; }
+li { background: var(--paper); padding: 1.25rem; border-block-start: 1px solid var(--line); }
+li:last-child { border-block-end: 1px solid var(--line); }
+li dd + dt { margin-top: .6rem; }
+.fingerprint code { display: flex; flex-wrap: wrap; gap: .1rem .7ch; font-size: 1rem; }
+.actions { margin-top: 1rem; }
+summary { cursor: pointer; font-weight: 600; padding: .6rem 0; }

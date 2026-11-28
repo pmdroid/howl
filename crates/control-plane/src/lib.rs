@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use tokio_postgres::Row;
 use zeroize::Zeroizing;
 
+mod account_dashboard;
 mod account_network;
 mod discovery;
 mod enrollment;
@@ -114,7 +115,8 @@ impl ControlPlane {
         if self.web_origin.is_some() {
             app = app
                 .merge(web_login::routes())
-                .merge(account_network::routes());
+                .merge(account_network::routes())
+                .merge(account_dashboard::routes());
         }
         app.route("/healthz", get(health))
             .merge(enrollment::routes())
