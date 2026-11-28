@@ -22,15 +22,16 @@ impl Drop for Howl {
 }
 
 fn start(state: &Path, args: &[&str], final_line: &str) -> (Howl, Vec<String>) {
-    let mut child = Howl(
-        Command::new(env!("CARGO_BIN_EXE_howl"))
-            .args(args)
-            .arg(state)
-            .args((args[0] == "mesh").then_some("127.0.0.1:0"))
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap(),
-    );
+    let mut command = Command::new(env!("CARGO_BIN_EXE_howl"));
+    command
+        .args(args)
+        .arg(state)
+        .args((args[0] == "mesh").then_some("127.0.0.1:0"));
+    start_command(command, final_line)
+}
+
+fn start_command(mut command: Command, final_line: &str) -> (Howl, Vec<String>) {
+    let mut child = Howl(command.stdout(Stdio::piped()).spawn().unwrap());
     let stdout = child.0.stdout.take().unwrap();
     let (send, receive) = mpsc::channel();
     thread::spawn(move || {
@@ -309,4 +310,67 @@ async fn paired_web_sessions_send_search_inspect_and_wake_through_two_nodes() {
         .api(json!({"action": "search", "channel": channel, "query": "literal"}))
         .await;
     assert_eq!(search["matches"], json!([text]));
+}
+
+#[tokio::test]
+async fn https_approval_origin_serves_only_device_actions() {
+    let directory = tempfile::tempdir().unwrap();
+    let addr = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let origin = "https://founder.example.test:8447";
+    let mut command = Command::new(env!("CARGO_BIN_EXE_howl"));
+    command
+        .arg("web")
+        .arg(directory.path().join("device"))
+        .arg(addr.port().to_string())
+        .env("HOWL_WEB_APPROVAL_ORIGIN", origin);
+    let (_web, lines) = start_command(command, "Open ");
+    let token = lines[0]
+        .strip_prefix(&format!("Open {origin}/devices#"))
+        .unwrap();
+    let client = Client::builder().no_proxy().timeout(WAIT).build().unwrap();
+    let call = |action: &str, authority: &str, origin: &str| {
+        client
+            .post(format!("http://{addr}/api"))
+            .header(header::HOST, authority)
+            .header(header::ORIGIN, origin)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json!({"action":action}).to_string())
+    };
+    let host = "founder.example.test:8447";
+    let list = call("device_requests", host, origin)
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(list.status(), StatusCode::OK);
+    assert_eq!(
+        serde_json::from_str::<Value>(&list.text().await.unwrap()).unwrap()["membership"],
+        "unconfigured"
+    );
+    assert_eq!(
+        call("device_requests", host, origin)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    for (action, host, origin) in [
+        ("overview", host, origin),
+        ("device_requests", "wrong.example.test", origin),
+        ("device_requests", host, "https://wrong.example.test"),
+    ] {
+        assert_eq!(
+            call(action, host, origin)
+                .bearer_auth(token)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+    }
 }

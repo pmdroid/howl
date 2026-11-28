@@ -55,7 +55,18 @@ The device prints a GitHub verification URL and one-time code. After consent it 
 
 Set `HOWL_CONTROL_URL` on each machine to the same HTTPS control-plane URL. Use a fresh private state directory on each machine. The first device to complete GitHub sign-in creates the network and holds its membership signing key. Its login prints the network ID and device ID. Save the founder’s sibling recovery directory on offline storage after setup. Set `HOWL_NETWORK_RECOVERY_DIR` before the first login to choose that location.
 
-On the second machine, run `howl control login "$device_state"` and sign in with the same GitHub account. Match the device ID printed by that machine to the pending entry on the founder, then approve it.
+On the second machine, run `howl control login "$device_state"` and sign in with the same GitHub account. To see its device ID and full certificate fingerprint again, run `howl control devices "$device_state"`.
+
+On the founder, open **Devices** in the Howl web UI. Compare the full fingerprint in the pending request with the one on the second machine. Select **Approve** to admit that device or **Deny** to close its request. The requesting device can check its membership with the same command.
+
+To use the founder's approval page over Tailscale, run these commands on the founder with its own tailnet hostname. Open the private link printed by `howl web` in your browser. Anyone with this link and tailnet access can make decisions as the founder. Restarting the web process rotates the link.
+
+```sh
+tailscale serve --bg --https=8447 http://127.0.0.1:18473
+HOWL_WEB_APPROVAL_ORIGIN=https://founder.example.ts.net:8447 howl web "$founder_state" 18473
+```
+
+For approval from the founder CLI, use the matched device ID.
 
 ```sh
 howl control devices "$founder_state"
