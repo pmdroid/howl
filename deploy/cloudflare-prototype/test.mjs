@@ -1,372 +1,503 @@
 import assert from "node:assert/strict";
+import { createHash, generateKeyPairSync, randomBytes, sign } from "node:crypto";
 import { readdir, readFile } from "node:fs/promises";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { Miniflare } from "miniflare";
 
 const origin = "https://howl.test";
-const fetchPath = "/v1/mailbox/fetch";
-const depositPath = "/v1/mailbox/deposit";
-const ackPath = "/v1/mailbox/ack";
-const encoder = new TextEncoder();
-const firstPage = { after: 0, limit: 16 };
+const audience = randomBytes(32);
+const hash = (data) => createHash("sha256").update(data).digest();
+const randomId = () => randomBytes(32).toString("hex");
+const empty = Buffer.alloc(0);
+const hex = (bytes) => bytes.toString("hex");
+const bytes = (value) => Buffer.from(value, "hex");
 
-function randomId() {
-  return crypto.getRandomValues(Buffer.alloc(32)).toString("hex");
+function u64(number) {
+  const value = Buffer.alloc(8);
+  value.writeBigUInt64BE(BigInt(number));
+  return value;
 }
 
-function epoch() {
-  return Math.floor(Date.now() / 1000);
-}
-
-async function digest(bytes) {
-  return Buffer.from(await crypto.subtle.digest("SHA-256", bytes)).toString("hex");
-}
-
-async function proof({ account, device, signingKey }, path, data, expires = epoch() + 45) {
-  const nonce = randomId();
-  const hash = await digest(encoder.encode(JSON.stringify(data)));
-  const payload = encoder.encode(JSON.stringify(["howl-d1-proof-v1", path, account, device, nonce, expires, hash]));
-  const signature = await crypto.subtle.sign("Ed25519", signingKey, payload);
+function device() {
+  const signing = generateKeyPairSync("ed25519");
+  const endpoint = generateKeyPairSync("ed25519");
+  const encryption = generateKeyPairSync("x25519");
+  const raw = (key) => key.publicKey.export({ type: "spki", format: "der" }).subarray(-32);
+  const id = randomBytes(32);
+  const body = Buffer.concat([Buffer.from([1]), id, raw(signing), raw(endpoint), raw(encryption)]);
+  const payload = Buffer.concat([Buffer.from("howl/manual-peer/v1\0"), body]);
   return {
-    "Howl-Account": account,
-    "Howl-Device": device,
-    "Howl-Nonce": nonce,
-    "Howl-Expires": String(expires),
-    "Howl-Signature": Buffer.from(signature).toString("hex")
+    id: hex(id),
+    peer: hex(
+      Buffer.concat([
+        body,
+        sign(null, payload, signing.privateKey),
+        sign(null, payload, endpoint.privateKey),
+      ]),
+    ),
+    fingerprint: hex(hash(body)),
+    sign: (body) => sign(null, body, signing.privateKey),
   };
 }
 
-async function expectStatus(response, status) {
-  const value = await response;
-  const raw = await value.text();
-  assert.equal(value.status, status, raw);
-  return raw ? JSON.parse(raw) : undefined;
+function proof(identity, subject, operation, nonce, token, body = empty) {
+  return hex(
+    identity.sign(
+      Buffer.concat([
+        Buffer.from("howl/control-proof/v1\0"),
+        audience,
+        bytes(subject),
+        hash(operation),
+        bytes(nonce),
+        token ? hash(bytes(token)) : Buffer.alloc(32),
+        hash(body),
+      ]),
+    ),
+  );
 }
 
-async function migrate(runtime) {
+function hint(identity, time) {
+  const body = Buffer.concat([
+    Buffer.from([1]),
+    bytes(identity.id),
+    bytes(identity.fingerprint),
+    u64(time),
+    u64(time + 3600_000),
+    Buffer.from([4, 100, 64, 1, 5]),
+    Buffer.alloc(12),
+    Buffer.from([0xa0, 0x3b]),
+  ]);
+  return Buffer.concat([
+    body,
+    identity.sign(Buffer.concat([Buffer.from("howl/peer-address/v1\0"), body])),
+  ]);
+}
+
+function signedFrame(sender, recipient, snapshot) {
+  const genesis = bytes(snapshot.authority[0]).subarray(0, -128);
+  const account = hash(genesis);
+  const channel = bytes(snapshot.channel);
+  const now = Math.floor(Date.now() / 1000);
+  const senderKey = bytes(sender.peer.slice(66, 130));
+  const recipientKey = bytes(recipient.peer.slice(194, 258));
+  const keyId = (label, key) =>
+    hash(Buffer.concat([Buffer.from("howl/key/v1/" + label + "\0"), key]));
+  const message = randomBytes(32);
+  const payload = randomBytes(272);
+  const length = Buffer.alloc(4);
+  length.writeUInt32BE(payload.length);
+  const body = Buffer.concat([
+    Buffer.from([1, 1]),
+    channel,
+    account,
+    bytes(sender.id),
+    keyId("device-signing", senderKey),
+    u64(1),
+    u64(1),
+    u64(now),
+    u64(0),
+    message,
+    randomBytes(32),
+    Buffer.from([0, 1]),
+    account,
+    bytes(recipient.id),
+    keyId("device-encryption", recipientKey),
+    randomBytes(80),
+    length,
+    payload,
+  ]);
+  return {
+    ciphertext: hex(
+      Buffer.concat([body, sender.sign(Buffer.concat([Buffer.from("howl/envelope/v1\0"), body]))]),
+    ),
+    message: hex(message),
+  };
+}
+
+async function status(response, expected) {
+  const result = await response;
+  const raw = await result.text();
+  assert.equal(result.status, expected, raw);
+  return raw ? JSON.parse(raw) : null;
+}
+
+test("Native publishing Worker", async (t) => {
+  let githubId = 42;
+  let challenge;
+  let revoked = 0;
+  const runtime = new Miniflare({
+    modules: true,
+    scriptPath: fileURLToPath(new URL("./.build/worker.mjs", import.meta.url)),
+    compatibilityDate: "2026-07-30",
+    d1Databases: { DB: "00000000-0000-4000-8000-000000000001" },
+    bindings: {
+      WEB_ORIGIN: origin,
+      GITHUB_CLIENT_ID: "fixture",
+      GITHUB_CLIENT_SECRET: "fixture-secret",
+      CONTROL_AUDIENCE: hex(audience),
+      CONTROL_STATE_KEY: randomId(),
+    },
+    outboundService: async (request) => {
+      switch (request.url) {
+        case "https://github.com/login/oauth/access_token": {
+          const form = new URLSearchParams(await request.text());
+          assert.equal(form.get("redirect_uri"), origin + "/login/github/callback");
+          assert.equal(hash(form.get("code_verifier")).toString("base64url"), challenge);
+          return Response.json({ access_token: "fixture-token" });
+        }
+        case "https://api.github.com/user":
+          assert.equal(request.headers.get("Authorization"), "Bearer fixture-token");
+          return Response.json({ id: githubId, login: "owner-" + githubId });
+        case "https://api.github.com/applications/fixture/token":
+          assert.equal(request.method, "DELETE");
+          assert.deepEqual(await request.json(), { access_token: "fixture-token" });
+          revoked++;
+          return new Response(null, { status: 204 });
+        default:
+          throw Error("Unexpected upstream " + request.url);
+      }
+    },
+  });
+  t.after(() => runtime.dispose());
+
   const db = await runtime.getD1Database("DB");
   const migrations = new URL("./migrations/", import.meta.url);
   for (const file of (await readdir(migrations)).sort()) {
     const schema = await readFile(new URL(file, migrations), "utf8");
-    await db.batch(schema.split(";").filter(sql => sql.trim()).map(sql => db.prepare(sql)));
+    await db.batch(
+      schema
+        .split(";")
+        .filter((sql) => sql.trim())
+        .map((sql) => db.prepare(sql)),
+    );
   }
-  return db;
-}
 
-test("Cloudflare Worker with D1", async t => {
-  const runtime = new Miniflare({
-    modules: true,
-    scriptPath: fileURLToPath(new URL("./worker.mjs", import.meta.url)),
-    compatibilityDate: "2026-07-30",
-    unsafeTriggerHandlers: true,
-    d1Databases: { DB: "00000000-0000-4000-8000-000000000001" }
-  });
-  t.after(() => runtime.dispose());
+  function http(path, options = {}) {
+    return runtime.dispatchFetch(origin + path, { redirect: "manual", ...options });
+  }
 
-  const db = await migrate(runtime);
-
-  function request(path, data, headers) {
-    return runtime.dispatchFetch(origin + path, {
-      method: data === undefined ? "GET" : "POST",
+  function post(path, data, headers = {}) {
+    return http(path, {
+      method: "POST",
       headers: { "Content-Type": "application/json", ...headers },
-      body: data === undefined ? undefined : JSON.stringify(data)
+      body: JSON.stringify(data),
     });
   }
 
-  async function owner() {
-    const account = randomId();
-    const token = randomId();
-    await db.prepare("INSERT INTO owners (account, token_digest) VALUES (?, ?)")
-      .bind(account, await digest(encoder.encode(token))).run();
-    return { account, headers: { Authorization: "Bearer " + token } };
-  }
-
-  async function link(name) {
-    const keys = await crypto.subtle.generateKey("Ed25519", true, ["sign", "verify"]);
-    const key = Buffer.from(await crypto.subtle.exportKey("raw", keys.publicKey));
-    const enrollment = await expectStatus(request("/v1/device-links", { name, public_key: key.toString("hex") }), 201);
-    assert.equal(enrollment.fingerprint, await digest(key));
-    return { ...enrollment, signingKey: keys.privateKey, name };
-  }
-
-  function claim(owner, { secret }) {
-    return request("/api/device-links/claim", { secret }, owner.headers);
-  }
-
-  function decide(owner, { device, fingerprint }, decision) {
-    return request("/api/devices/decide", { device, fingerprint, decision }, owner.headers);
-  }
-
-  async function signed(device, path, data) {
-    return request(path, data, await proof(device, path, data));
-  }
-
-  const alice = await owner();
-  const bob = await owner();
-  const sender = { ...await link("Laptop"), account: alice.account };
-  const recipient = { ...await link("Mini"), account: alice.account };
-  const outsider = { ...await link("Other account"), account: bob.account };
-  const denied = { ...await link("Unwanted device"), account: alice.account };
-
-  await t.test("owners see fingerprints and decide only for their own devices", async () => {
-    await expectStatus(request("/healthz"), 204);
-    await expectStatus(request("/api/devices"), 401);
-    await expectStatus(decide(alice, recipient, "approve"), 404);
-    const pending = await expectStatus(claim(alice, recipient), 200);
-    assert.deepEqual(pending, {
-      device: recipient.device, name: recipient.name, fingerprint: recipient.fingerprint, state: "pending"
-    });
-    await expectStatus(claim(bob, recipient), 404);
-    assert.deepEqual(await expectStatus(request("/api/devices", undefined, bob.headers), 200), { devices: [] });
-    assert.deepEqual(await expectStatus(request("/api/devices", undefined, alice.headers), 200), { devices: [pending] });
-    await expectStatus(decide(bob, recipient, "approve"), 404);
-    await expectStatus(decide(alice, { ...recipient, fingerprint: randomId() }, "approve"), 404);
-    await expectStatus(signed(recipient, fetchPath, firstPage), 401);
-    for (const [owner, device] of [[alice, sender], [bob, outsider], [alice, denied]]) {
-      await expectStatus(claim(owner, device), 200);
-    }
-    for (const [owner, device] of [[alice, recipient], [alice, sender], [bob, outsider]]) {
-      assert.deepEqual(await expectStatus(decide(owner, device, "approve"), 200), { state: "approved" });
-    }
-    await expectStatus(decide(alice, recipient, "approve"), 200);
-    await expectStatus(decide(alice, recipient, "deny"), 409);
-    assert.deepEqual(await expectStatus(decide(alice, denied, "deny"), 200), { state: "denied" });
-    await expectStatus(signed(denied, fetchPath, firstPage), 401);
-    await expectStatus(signed({ ...recipient, account: bob.account }, fetchPath, firstPage), 401);
-    await expectStatus(signed({ ...recipient, signingKey: outsider.signingKey }, fetchPath, firstPage), 401);
-  });
-
-  await t.test("a concurrent claim and concurrent decisions each have one winner", async () => {
-    const device = await link("Racing enrollment");
-    const claims = await Promise.all([claim(alice, device), claim(bob, device)]);
-    assert.deepEqual(claims.map(r => r.status).sort(), [200, 404]);
-    const winner = claims[0].status === 200 ? alice : bob;
-    const loser = claims[0].status === 200 ? bob : alice;
-    await expectStatus(decide(loser, device, "approve"), 404);
-
-    const decisions = ["approve", "deny"];
-    const results = await Promise.all(decisions.map(decision => decide(winner, device, decision)));
-    assert.deepEqual(results.map(r => r.status).sort(), [200, 409]);
-    const selected = decisions[results.findIndex(r => r.status === 200)];
-    const outcome = await expectStatus(decide(winner, device, selected), 200);
-    assert.equal(outcome.state, selected === "approve" ? "approved" : "denied");
-    const devices = await expectStatus(request("/api/devices", undefined, winner.headers), 200);
-    assert.equal(devices.devices.find(row => row.device === device.device).state, outcome.state);
-  });
-
-  await t.test("encrypted delivery can be retried, read only by the recipient, and acknowledged", async () => {
-    const key = await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
-    const wrongKey = await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, false, ["decrypt"]);
-    const iv = crypto.getRandomValues(Buffer.alloc(12));
-    const plaintext = encoder.encode("Private message for Mini");
-    const encrypted = Buffer.from(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, plaintext));
-    const ciphertext = iv.toString("hex") + encrypted.toString("hex");
-    const body = { recipient: recipient.device, message: randomId(), ciphertext, expires_at: epoch() + 600 };
-
-    await expectStatus(signed(outsider, depositPath, body), 403);
-    await expectStatus(signed(sender, depositPath, { ...body, recipient: denied.device }), 403);
-    const deposits = await Promise.all([signed(sender, depositPath, body), signed(sender, depositPath, body)]);
-    assert.deepEqual(deposits.map(r => r.status).sort(), [201, 204]);
-
-    for (const device of [sender, outsider]) {
-      assert.deepEqual(await expectStatus(signed(device, fetchPath, firstPage), 200), { envelopes: [], next: null });
-    }
-
-    const { envelopes } = await expectStatus(signed(recipient, fetchPath, firstPage), 200);
-    const envelopeDigest = await digest(Buffer.from(ciphertext, "hex"));
-    assert.deepEqual(envelopes, [{ cursor: 1, sender: sender.device, message: body.message, digest: envelopeDigest, ciphertext }]);
-    const stored = await db.prepare("SELECT typeof(ciphertext) AS type, hex(ciphertext) AS data, digest FROM envelopes WHERE message = ?")
-      .bind(body.message).first();
-    assert.deepEqual(stored, { type: "blob", data: ciphertext.toUpperCase(), digest: envelopeDigest });
-
-    const received = Buffer.from(envelopes[0].ciphertext, "hex");
-    const algorithm = { name: "AES-GCM", iv: received.slice(0, 12) };
-    const decrypted = await crypto.subtle.decrypt(algorithm, key, received.slice(12));
-    assert.deepEqual(new Uint8Array(decrypted), plaintext);
-    await assert.rejects(crypto.subtle.decrypt(algorithm, wrongKey, received.slice(12)));
-    received[12] ^= 1;
-    await assert.rejects(crypto.subtle.decrypt(algorithm, key, received.slice(12)));
-
-    await expectStatus(signed(sender, depositPath, { ...body, ciphertext: received.toString("hex") }), 409);
-    const ack = { cursor: 1, message: body.message, digest: envelopeDigest };
-    await expectStatus(signed(sender, ackPath, ack), 404);
-    await expectStatus(signed(outsider, ackPath, ack), 404);
-    await expectStatus(signed(recipient, ackPath, { ...ack, digest: randomId() }), 404);
-    await expectStatus(signed(recipient, ackPath, ack), 204);
-    await expectStatus(signed(recipient, ackPath, ack), 204);
-    await expectStatus(signed(sender, depositPath, body), 204);
-
-    assert.deepEqual(await expectStatus(signed(recipient, fetchPath, firstPage), 200), { envelopes: [], next: null });
-    assert.deepEqual(await db.prepare("SELECT ciphertext, digest FROM envelopes WHERE message = ?").bind(body.message).first(),
-      { ciphertext: null, digest: envelopeDigest });
-  });
-
-  await t.test("signed requests bind the operation and body, and consume each nonce once", async () => {
-    const headers = await proof(recipient, fetchPath, firstPage);
-    await expectStatus(request(fetchPath, { after: 1, limit: 16 }, headers), 401);
-    await expectStatus(request(ackPath, firstPage, headers), 401);
-    const responses = await Promise.all([request(fetchPath, firstPage, headers), request(fetchPath, firstPage, headers)]);
-    assert.deepEqual(responses.map(r => r.status).sort(), [200, 409]);
-    await expectStatus(request(fetchPath, firstPage, await proof(recipient, fetchPath, firstPage, epoch() - 10)), 401);
-  });
-
-  await t.test("Howl encrypted frames survive D1 pagination and expired data is swept", async () => {
-    const fixture = JSON.parse(await readFile(new URL("../../spikes/protocol/wake-v1.json", import.meta.url), "utf8"));
-    const linkToExpire = await link("Expired pending device");
-    await expectStatus(claim(alice, linkToExpire), 200);
-    const frame = { recipient: recipient.device, ciphertext: fixture.frame, expires_at: epoch() + 600 };
-    const messages = [randomId(), randomId()];
-    await Promise.all(messages.map(message => expectStatus(signed(sender, depositPath, { ...frame, message }), 201)));
-    const first = await expectStatus(signed(recipient, fetchPath, { after: 0, limit: 1 }), 200);
-    assert.equal(first.next, 2);
-    const second = await expectStatus(signed(recipient, fetchPath, { after: first.next, limit: 1 }), 200);
-    assert.equal(second.next, 3);
-    const envelopes = [...first.envelopes, ...second.envelopes];
-    assert.deepEqual(envelopes.map(row => row.message).sort(), messages.sort());
-    assert.deepEqual(envelopes.map(row => row.ciphertext), [fixture.frame, fixture.frame]);
-
-    await db.batch([
-      db.prepare("UPDATE envelopes SET expires_at = unixepoch() - 1 WHERE message = ?").bind(second.envelopes[0].message),
-      db.prepare("UPDATE device_links SET expires_at = unixepoch() - 1 WHERE id = ?").bind(linkToExpire.id),
-      db.prepare("UPDATE device_proofs SET expires_at = unixepoch() - 1")
-    ]);
-    const expired = await expectStatus(signed(recipient, fetchPath, { after: 2, limit: 16 }), 200);
-    assert.deepEqual(expired, { envelopes: [], next: null });
-    await expectStatus(decide(alice, linkToExpire, "approve"), 404);
-    await expectStatus(signed(sender, depositPath, { ...frame, message: second.envelopes[0].message }), 410);
-    const cleanup = await runtime.dispatchFetch(origin + "/cdn-cgi/handler/scheduled?cron=" + encodeURIComponent("*/5 * * * *"));
-    assert.equal(cleanup.status, 200, await cleanup.text());
-    assert.equal(await db.prepare("SELECT message FROM envelopes WHERE message = ?").bind(second.envelopes[0].message).first(), null);
-    assert.equal(await db.prepare("SELECT id FROM device_links WHERE id = ?").bind(linkToExpire.id).first(), null);
-    assert.equal(await db.prepare("SELECT COUNT(*) AS count FROM device_proofs WHERE expires_at <= unixepoch()").first("count"), 0);
-    await expectStatus(signed(sender, depositPath, { ...frame, message: randomId() }), 201);
-    const next = await expectStatus(signed(recipient, fetchPath, { after: 2, limit: 16 }), 200);
-    assert.equal(next.next, 4);
-  });
-
-  await t.test("D1 accepts a maximum-size encrypted envelope", async () => {
-    const bytes = crypto.getRandomValues(Buffer.alloc(65536));
-    const tail = crypto.getRandomValues(Buffer.alloc(77112 - bytes.length));
-    const ciphertext = Buffer.concat([bytes, tail]).toString("hex");
-    const frame = { recipient: recipient.device, message: randomId(), ciphertext, expires_at: epoch() + 600 };
-    await expectStatus(signed(sender, depositPath, { ...frame, ciphertext: ciphertext + "00" }), 400);
-    await expectStatus(signed(sender, depositPath, frame), 201);
-    const page = await expectStatus(signed(recipient, fetchPath, { after: 4, limit: 1 }), 200);
-    assert.equal(page.envelopes[0].ciphertext, ciphertext);
-  });
-});
-
-test("GitHub owner login and native device enrollment", async t => {
-  let githubId = 42;
-  let challenge;
-  let exchanges = 0;
-  let revocations = 0;
-  const runtime = new Miniflare({
-    modules: true,
-    scriptPath: fileURLToPath(new URL("./worker.mjs", import.meta.url)),
-    compatibilityDate: "2026-07-30",
-    d1Databases: { DB: "00000000-0000-4000-8000-000000000002" },
-    bindings: { WEB_ORIGIN: origin, GITHUB_CLIENT_ID: "test-app", GITHUB_CLIENT_SECRET: "fixture", GITHUB_OWNER_ID: "42" },
-    outboundService: async request => {
-      const url = new URL(request.url);
-      switch (url.href) {
-        case "https://github.com/login/oauth/access_token": {
-          ++exchanges;
-          const params = new URLSearchParams(await request.text());
-          assert.equal(params.get("redirect_uri"), origin + "/login/github/callback");
-          const pkce = Buffer.from(await digest(encoder.encode(params.get("code_verifier"))), "hex").toString("base64url");
-          assert.equal(pkce, challenge);
-          return Response.json({ access_token: "fixture-access-token" });
-        }
-        case "https://api.github.com/user":
-          assert.equal(request.headers.get("Authorization"), "Bearer fixture-access-token");
-          return Response.json({ id: githubId });
-        case "https://api.github.com/applications/test-app/token":
-          ++revocations;
-          assert.equal(request.method, "DELETE");
-          assert.deepEqual(await request.json(), { access_token: "fixture-access-token" });
-          return new Response(null, { status: 204 });
-        default:
-          throw new Error("unexpected upstream " + url);
-      }
-    }
-  });
-  t.after(() => runtime.dispose());
-  await migrate(runtime);
-
-  function request(path, data, headers = {}) {
-    return runtime.dispatchFetch(origin + path, {
-      redirect: "manual",
-      method: data === undefined ? "GET" : "POST",
-      headers: { "Content-Type": "application/json", ...headers },
-      body: data === undefined ? undefined : JSON.stringify(data)
-    });
-  }
-
-  async function startLogin() {
-    const start = await request("/login/github");
+  async function owner(id) {
+    githubId = id;
+    const start = await http("/login/github");
     assert.equal(start.status, 303);
-    const location = new URL(start.headers.get("Location"));
-    assert.equal(location.origin, "https://github.com");
-    assert.equal(location.searchParams.get("code_challenge_method"), "S256");
-    challenge = location.searchParams.get("code_challenge");
-    const state = location.searchParams.get("state");
-    return {
-      callback: "/login/github/callback?code=fixture-code&state=" + state,
-      verifier: start.headers.get("Set-Cookie").split(";")[0]
-    };
+    const target = new URL(start.headers.get("location"));
+    assert.equal(target.searchParams.get("code_challenge_method"), "S256");
+    challenge = target.searchParams.get("code_challenge");
+    const url = "/login/github/callback?code=fixture&state=" + target.searchParams.get("state");
+    await status(http(url), 401);
+    const finish = await http(url, {
+      headers: { Cookie: start.headers.getSetCookie()[0].split(";")[0] },
+    });
+    assert.equal(finish.status, 303, await finish.text());
+    assert.equal(finish.headers.get("location"), "/devices");
+    await status(
+      http(url, { headers: { Cookie: start.headers.getSetCookie()[0].split(";")[0] } }),
+      401,
+    );
+    const cookie = finish.headers
+      .getSetCookie()
+      .find((value) => value.startsWith("__Host-howl-owner="));
+    assert.match(cookie, /Secure; HttpOnly; SameSite=Strict/);
+    return { Cookie: cookie.split(";")[0], Origin: origin };
   }
 
-  const login = await startLogin();
-  await expectStatus(request(login.callback), 401);
-  await expectStatus(request(login.callback, undefined, { Cookie: "__Host-howl-login=" + randomId() }), 401);
-  assert.equal(exchanges, 0);
-  const authenticated = await request(login.callback, undefined, { Cookie: login.verifier });
-  assert.equal(authenticated.status, 303);
-  const session = authenticated.headers.getSetCookie().find(value => value.startsWith("__Host-howl-owner="));
-  assert.match(session, /Secure; HttpOnly; SameSite=Strict/);
-  const cookie = session.split(";")[0];
-  await expectStatus(request(login.callback, undefined, { Cookie: login.verifier }), 401);
-  assert.equal(exchanges, 1);
-  assert.equal(revocations, 1);
-  const { account } = await expectStatus(request("/api/session", undefined, { Cookie: cookie }), 200);
+  async function link(identity, name, headers) {
+    const link = await status(post("/v1/device-links", { peer: identity.peer, name }), 201);
+    const viewed = await status(
+      post("/api/device-links/view", { secret: link.secret }, headers),
+      200,
+    );
+    assert.equal(viewed.fingerprint, identity.fingerprint);
+    return link;
+  }
 
-  githubId = 43;
-  const stranger = await startLogin();
-  await expectStatus(request(stranger.callback, undefined, { Cookie: stranger.verifier }), 403);
-  assert.equal(revocations, 2);
-  await expectStatus(request("/api/devices"), 401);
+  async function poll(identity, link, state, candidate) {
+    const value = candidate ? Buffer.from(JSON.stringify(candidate)) : empty;
+    const result = await status(
+      post("/v1/device-links/" + link.id + "/poll", {
+        nonce: link.nonce,
+        signature: proof(identity, link.id, "device-link", link.nonce, null, value),
+        candidate,
+      }),
+      200,
+    );
+    assert.equal(result.state, state);
+    link.nonce = result.nonce ?? link.nonce;
+    return result;
+  }
 
-  const signing = await crypto.subtle.generateKey("Ed25519", true, ["sign", "verify"]);
-  const endpoint = await crypto.subtle.generateKey("Ed25519", true, ["sign", "verify"]);
-  const rawSigning = Buffer.from(await crypto.subtle.exportKey("raw", signing.publicKey));
-  const rawEndpoint = Buffer.from(await crypto.subtle.exportKey("raw", endpoint.publicKey));
-  const receiver = await crypto.subtle.generateKey("X25519", true, ["deriveBits"]);
-  const rawReceiver = Buffer.from(await crypto.subtle.exportKey("raw", receiver.publicKey));
-  const device = randomId();
-  const body = Buffer.concat([Buffer.from([1]), Buffer.from(device, "hex"), rawSigning, rawEndpoint, rawReceiver]);
-  const scope = Buffer.concat([Buffer.from("howl/manual-peer/v1\0"), body]);
-  const sign = async key => Buffer.from(await crypto.subtle.sign("Ed25519", key, scope));
-  const peer = Buffer.concat([body, await sign(signing.privateKey), await sign(endpoint.privateKey)]).toString("hex");
-  const name = "Native device";
-  await expectStatus(request("/v1/device-links", { name, peer: peer.slice(0, -2) + (peer.endsWith("ff") ? "00" : "ff") }), 400);
-  const pending = await expectStatus(request("/v1/device-links", { peer, name }), 201);
-  assert.equal(pending.device, device);
-  assert.equal(pending.fingerprint, await digest(body));
-  assert.equal(pending.url, origin + "/link#" + pending.secret);
-  await expectStatus(request("/api/device-links/claim", { secret: pending.secret }, { Cookie: cookie, Origin: "https://elsewhere.test" }), 403);
-  const headers = { Cookie: cookie, Origin: origin };
-  await expectStatus(request("/api/device-links/claim", { secret: pending.secret }, headers), 200);
-  const { state, account: pendingAccount } = await expectStatus(request("/v1/device-links/status", { secret: pending.secret }), 200);
-  assert.deepEqual({ state, pendingAccount }, { state: "pending", pendingAccount: null });
+  async function approve(identity, link, headers) {
+    const waiting = await poll(identity, link, "waiting");
+    const genesis = bytes(waiting.authority[0]).subarray(0, -128);
+    const designation = bytes(waiting.designation).subarray(0, -128);
+    const cert = bytes(identity.peer);
+    const body = Buffer.concat([
+      Buffer.from("howl/identity/v1/device\0"),
+      hash(genesis),
+      hash(designation),
+      bytes(identity.id),
+      u64(1),
+      cert.subarray(33, 129),
+    ]);
+    await status(
+      post(
+        "/api/device-links/decide",
+        {
+          secret: link.secret,
+          device: identity.id,
+          fingerprint: identity.fingerprint,
+          decision: "approve",
+        },
+        headers,
+      ),
+      200,
+    );
+    identity.credentials = (
+      await poll(identity, link, "approved", {
+        peer: identity.peer,
+        proof: hex(identity.sign(body)),
+      })
+    ).credentials;
+  }
 
-  const path = "/v1/devices/lookup";
-  const signed = async () => request(path, { device }, await proof({ device, account, signingKey: signing.privateKey }, path, { device }));
-  await expectStatus(signed(), 401);
-  await expectStatus(request("/api/devices/decide", { device, fingerprint: pending.fingerprint, decision: "approve" }, headers), 200);
-  assert.deepEqual(await expectStatus(request("/v1/device-links/status", { secret: pending.secret }), 200), { state: "approved", account });
-  assert.deepEqual(await expectStatus(signed(), 200), { peer });
-  assert.equal((await request("/logout", {}, headers)).status, 303);
-  await expectStatus(request("/api/session", undefined, { Cookie: cookie }), 401);
+  async function signed(identity, path, operation, params, { token, nonce, proofBody } = {}) {
+    const creds = identity.credentials;
+    const access = token ?? creds.access_token;
+    const auth = { Authorization: "Bearer " + access };
+    const challenge =
+      nonce ?? (await status(post("/v1/auth/challenge", { operation }, auth), 200)).nonce;
+    const raw =
+      params === undefined
+        ? empty
+        : Buffer.isBuffer(params)
+          ? params
+          : Buffer.from(JSON.stringify(params));
+    const sig = proof(identity, creds.session.id, operation, challenge, access, proofBody ?? raw);
+    return http(path, {
+      method: params === undefined ? "GET" : "POST",
+      headers: {
+        ...auth,
+        "Howl-Nonce": challenge,
+        "Howl-Signature": sig,
+        "Content-Type": Buffer.isBuffer(params) ? "application/octet-stream" : "application/json",
+      },
+      ...(params === undefined ? {} : { body: raw }),
+    });
+  }
+
+  const ownerHeaders = await owner(42);
+  const anotherHeaders = await owner(43);
+  assert.equal(revoked, 2);
+  const alice = device();
+  const bob = device();
+  const stranger = device();
+
+  await t.test(
+    "real dashboard routes, scoped approvals and signed network enrollment",
+    async () => {
+      const home = await http("/devices");
+      assert.match(await home.text(), /Pending requests/);
+      assert.equal((await http("/assets/devices.js")).status, 200);
+      const aliceLink = await link(alice, "Mac mini", ownerHeaders);
+      const bobLink = await link(bob, "Agentbox", ownerHeaders);
+      const strangerLink = await link(stranger, "Outside network", anotherHeaders);
+      await status(
+        post("/api/device-links/view", { secret: aliceLink.secret }, anotherHeaders),
+        404,
+      );
+      await status(
+        post(
+          "/api/devices/approve",
+          { device: alice.id, fingerprint: alice.fingerprint },
+          anotherHeaders,
+        ),
+        404,
+      );
+      await status(
+        post(
+          "/api/devices/approve",
+          { device: alice.id, fingerprint: alice.fingerprint },
+          { ...ownerHeaders, Origin: "https://other.test" },
+        ),
+        403,
+      );
+      assert.deepEqual(
+        (await status(http("/api/devices", { headers: ownerHeaders }), 200)).pending
+          .map((device) => device.name)
+          .sort(),
+        ["Agentbox", "Mac mini"],
+      );
+      await approve(alice, aliceLink, ownerHeaders);
+      await approve(bob, bobLink, ownerHeaders);
+      await approve(stranger, strangerLink, anotherHeaders);
+      const { snapshot, network } = await status(signed(alice, "/v1/network", "network-read"), 200);
+      assert.equal(snapshot.devices.length, 2);
+      assert.equal(snapshot.rosters.length, 2);
+      assert.deepEqual(
+        snapshot.devices.map((device) => device.peer),
+        [alice.peer, bob.peer],
+      );
+      alice.network = { ...snapshot, channel: network };
+      const details = await status(http("/api/devices/" + bob.id, { headers: ownerHeaders }), 200);
+      assert.equal(details.endpoint_id, bob.peer.slice(130, 194));
+      assert.equal(details.network_name, "owner-42");
+      await status(http("/api/devices/" + bob.id, { headers: anotherHeaders }), 404);
+      await status(
+        post(
+          "/api/devices/" + bob.id + "/name",
+          { name: "Wrong", fingerprint: alice.fingerprint },
+          ownerHeaders,
+        ),
+        404,
+      );
+      const renamed = await status(
+        post(
+          "/api/devices/" + bob.id + "/name",
+          { name: "Linux device", fingerprint: bob.fingerprint },
+          ownerHeaders,
+        ),
+        200,
+      );
+      assert.equal(renamed.name, "Linux device");
+      const unwanted = device();
+      const rejected = await link(unwanted, "Declined", ownerHeaders);
+      await status(
+        post(
+          "/api/devices/deny",
+          { device: unwanted.id, fingerprint: unwanted.fingerprint },
+          ownerHeaders,
+        ),
+        200,
+      );
+      await poll(unwanted, rejected, "denied");
+      const retry = await link(unwanted, "Declined retry", ownerHeaders);
+      await poll(unwanted, retry, "denied");
+    },
+  );
+
+  await t.test(
+    "iroh hints are signed, account-scoped and reported on the device page",
+    async () => {
+      const route = hint(alice, Date.now());
+      const path = "/v1/discovery/hints";
+      const forged = Buffer.from(route);
+      forged[100] ^= 1;
+      await status(
+        signed(alice, path, "discovery-write", Buffer.concat([bytes(alice.peer), forged])),
+        401,
+      );
+      await status(
+        signed(alice, path, "discovery-write", Buffer.concat([bytes(alice.peer), route])),
+        204,
+      );
+      const lookup = await signed(bob, path + "/" + alice.id, "discovery-read", undefined, {
+        proofBody: bytes(alice.id),
+      });
+      assert.equal(lookup.status, 200);
+      assert.deepEqual(Buffer.from(await lookup.arrayBuffer()), route);
+      await status(
+        signed(stranger, path + "/" + alice.id, "discovery-read", undefined, {
+          proofBody: bytes(alice.id),
+        }),
+        401,
+      );
+      await status(
+        signed(alice, "/v1/discovery/status", "mesh-status", [{ device: bob.id, kind: "direct" }]),
+        204,
+      );
+      const view = await status(http("/api/devices/" + alice.id, { headers: ownerHeaders }), 200);
+      assert.equal(view.online, true);
+      assert.equal(view.route.port, 41019);
+      assert.deepEqual(view.connections, [
+        { device: bob.id, kind: "direct", name: "Linux device" },
+      ]);
+      assert.equal(
+        await db.prepare("SELECT COUNT(*) AS n FROM control_mailbox_envelopes").first("n"),
+        0,
+      );
+    },
+  );
+
+  await t.test("mailbox requires owner opt-in and acknowledges ciphertext once", async () => {
+    const fetchPage = { after: 0, limit: 16 };
+    const frame = signedFrame(alice, bob, alice.network);
+    const deposit = { recipient: bob.id, ciphertext: frame.ciphertext };
+    const endpoint = "/v1/mailbox/settings";
+    await status(signed(alice, "/v1/mailbox/deposit", "mailbox-deposit", deposit), 403);
+    await status(
+      post(
+        "/api/mailbox/settings",
+        { enabled: true },
+        { ...ownerHeaders, Origin: "https://other.test" },
+      ),
+      403,
+    );
+    await status(post("/api" + endpoint, { enabled: true }, ownerHeaders), 404);
+    assert.deepEqual(
+      await status(post("/api/mailbox/settings", { enabled: true }, ownerHeaders), 200),
+      { enabled: true },
+    );
+    await status(signed(alice, "/v1/mailbox/deposit", "mailbox-deposit", deposit), 201);
+    await status(signed(alice, "/v1/mailbox/deposit", "mailbox-deposit", deposit), 204);
+    const mailbox = await status(signed(bob, "/v1/mailbox/fetch", "mailbox-fetch", fetchPage), 200);
+    assert.equal(mailbox.envelopes[0].ciphertext, frame.ciphertext);
+    const ack = { message: frame.message, digest: mailbox.envelopes[0].digest };
+    await status(signed(alice, "/v1/mailbox/ack", "mailbox-ack", ack), 404);
+    await status(signed(bob, "/v1/mailbox/ack", "mailbox-ack", ack), 204);
+    assert.deepEqual(
+      await status(signed(bob, "/v1/mailbox/fetch", "mailbox-fetch", fetchPage), 200),
+      { envelopes: [], next: null },
+    );
+    assert.deepEqual(
+      await status(post("/api/mailbox/settings", { enabled: false }, ownerHeaders), 200),
+      { enabled: false },
+    );
+    await status(signed(bob, "/v1/mailbox/fetch", "mailbox-fetch", fetchPage), 403);
+  });
+
+  await t.test("native challenges are single-use and refresh rotates credentials", async () => {
+    const credential = alice.credentials;
+    const headers = { Authorization: "Bearer " + credential.access_token };
+    const { nonce } = await status(
+      post("/v1/auth/challenge", { operation: "session" }, headers),
+      200,
+    );
+    await status(signed(alice, "/v1/auth/session", "session", undefined, { nonce }), 200);
+    await status(signed(alice, "/v1/auth/session", "session", undefined, { nonce }), 401);
+    const refresh = async (token) => {
+      const bearer = { Authorization: "Bearer " + token };
+      const { nonce } = await status(
+        post("/v1/auth/challenge", { operation: "refresh" }, bearer),
+        200,
+      );
+      return post(
+        "/v1/auth/refresh",
+        {
+          nonce,
+          signature: proof(alice, credential.session.id, "refresh", nonce, token),
+        },
+        bearer,
+      );
+    };
+    const fresh = await status(refresh(credential.refresh_token), 200);
+    assert.notEqual(fresh.refresh_token, credential.refresh_token);
+    await status(refresh(credential.refresh_token), 401);
+    await status(
+      post(
+        "/v1/auth/challenge",
+        { operation: "session" },
+        { Authorization: "Bearer " + fresh.access_token },
+      ),
+      401,
+    );
+  });
 });
