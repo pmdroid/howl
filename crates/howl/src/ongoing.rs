@@ -60,6 +60,8 @@ struct Conversation {
     work: bool,
     #[serde(default)]
     work_control_from: Vec<String>,
+    #[serde(skip)]
+    forwards_work_commands: bool,
     #[serde(default)]
     peers: Vec<AgentPeer>,
     #[serde(default)]
@@ -197,15 +199,18 @@ where
         }
         conversations.push((conversation, origin));
     }
-    if conversations.iter().any(|(conversation, _)| {
-        conversation.work_control_from.iter().any(|delegate| {
-            parse_id(delegate)
-                .is_ok_and(|id| keys.contains(&(conversation.channel, conversation.peer, Some(id))))
-        })
-    }) {
-        return Err(invalid(
-            "a work control delegate must use its owner's conversation",
-        ));
+    let mut delegates = HashSet::new();
+    for (owner, _) in &conversations {
+        for delegate in &owner.work_control_from {
+            delegates.insert((owner.channel, owner.peer, parse_id(delegate)?));
+        }
+    }
+    for (conversation, origin) in &mut conversations {
+        conversation.forwards_work_commands = origin
+            .is_some_and(|id| delegates.contains(&(conversation.channel, conversation.peer, id)));
+        if conversation.forwards_work_commands && conversation.work {
+            return Err(invalid("a work control delegate cannot also own workers"));
+        }
     }
     if let Some(policy) = &config.context {
         policy.budget()?;
@@ -379,6 +384,7 @@ where
                 thread,
                 &schedules,
                 &delegates,
+                conversation.forwards_work_commands,
                 conversation.shared_thread.as_deref().zip(shared),
                 now,
             )
