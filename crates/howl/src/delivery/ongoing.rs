@@ -16,12 +16,14 @@ pub(crate) struct Thread {
 }
 
 pub(crate) struct Schedule {
+    pub github_pull_requests: Option<String>,
     pub id: Id,
     pub seconds: i64,
     pub text: String,
 }
 
 pub(crate) struct Input {
+    pub github_pull_requests: Option<String>,
     pub id: i64,
     pub shared: Option<Id>,
     pub sender: Id,
@@ -136,6 +138,7 @@ impl DeliveryStore {
                 due = Some((next, schedule));
             }
         }
+        let mut github_pull_requests = None;
         let mut parent = None;
         let mut shared = None;
         let mut sender = thread.origin.unwrap_or(thread.peer.device);
@@ -155,6 +158,7 @@ impl DeliveryStore {
             )?;
             Some((reply, text, Source::PeerReply))
         } else if let Some((due, schedule)) = due {
+            github_pull_requests.clone_from(&schedule.github_pull_requests);
             let source = Sha256::new()
                 .chain_update(b"howl/scheduled-turn/v1\0")
                 .chain_update(thread.scope)
@@ -218,6 +222,7 @@ impl DeliveryStore {
                 params![id, shared, parent, sender],
             )?;
             Some(Input {
+                github_pull_requests,
                 id,
                 shared,
                 sender,
@@ -680,6 +685,7 @@ mod tests {
             origin: None,
         };
         let schedules = [Schedule {
+            github_pull_requests: Some("pallets/click".to_owned()),
             id: [6; 32],
             seconds: 60,
             text: "Check in".into(),
@@ -702,6 +708,7 @@ mod tests {
             .unwrap();
         assert!(turn.source == Source::Schedule);
         assert_eq!(turn.text, "Check in");
+        assert_eq!(turn.github_pull_requests.as_deref(), Some("pallets/click"));
         assert!(
             store
                 .next_ongoing(thread, &schedules, "[]", None, 500)
