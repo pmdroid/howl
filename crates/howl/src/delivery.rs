@@ -18,11 +18,11 @@ pub(crate) use integration_runs::{
 };
 pub(crate) use mailbox_outbox::MAILBOX_OUTBOX_BATCH;
 pub use messages::{ChannelEvent, ChannelMessage};
-pub(crate) use ongoing::Work;
 pub(crate) use ongoing::{
     Exchange as OngoingExchange, Input as OngoingInput, Publication as OngoingPublication,
     Schedule as OngoingSchedule, Source as OngoingSource, Thread as OngoingThread,
 };
+pub(crate) use ongoing::{Work, WorkGrant};
 pub use wake::{WakeClaim, WakeJob, WakeState};
 pub(crate) use webhook_queue::{WebhookAttempt, WebhookEventKind, WebhookFilter, WebhookOutcome};
 

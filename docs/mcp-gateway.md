@@ -154,6 +154,8 @@ Worker patches are saved under `worker-patches` in the node's state directory.
 
 Set `"work": true` on a conversation to give its ongoing agent the `start_work` tool. It launches a separate ACP worker and returns a run ID. Send `/work RUN`, `/steer RUN MESSAGE`, or `/cancel RUN` in the same TUI DM or through MCP `dm` to check status, send feedback, or cancel. To give an integration permission to steer work from a human conversation, add its signed integration ID to that conversation's `work_control_from` list.
 
+A worker receives the repository commit and file selection visible to the initiating ACP session. Retrying the same request key and instruction returns its original run ID. Each conversation can have two active requests and start four runs per 15 minutes. A run expires 15 minutes after it enters the queue, including time spent waiting. To revoke the conversation's worker policy locally, disable `work`, remove its `work_control_from` entries, and restart the agent. On restart Howl cancels outstanding grants for removed or changed policies.
+
 To let the agent contact other agents in the signed channel, add a `peers` list to its conversation. Each entry takes an `id` and optional `name` and `route`. The `send_peer` tool sends a signed DM and brings a matching peer reply back into the initiating conversation.
 
 ## Deliver events to a webhook

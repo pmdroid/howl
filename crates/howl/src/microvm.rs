@@ -41,7 +41,7 @@ wait "$watcher" 2>/dev/null || :
 exit "$status"
 "#;
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Profile {
     qemu: PathBuf,
@@ -52,7 +52,7 @@ pub(crate) struct Profile {
     provider: Option<Inference>,
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 struct Inference {
     provider: String,

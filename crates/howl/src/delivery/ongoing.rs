@@ -38,7 +38,17 @@ pub(crate) enum Source {
     PeerReply,
 }
 
+#[derive(Clone)]
+pub(crate) struct WorkGrant {
+    pub policy: Id,
+    pub commit: String,
+    pub selection: Id,
+}
+
 pub(crate) struct Work {
+    pub commit: String,
+    pub selection: Id,
+    pub remaining: u64,
     pub id: Id,
     pub instruction: String,
 }
@@ -363,13 +373,21 @@ impl DeliveryStore {
         Ok(())
     }
 
-    pub(crate) fn queue_work(&mut self, scope: Id, key: &str, instruction: &str) -> Result<Id> {
+    pub(crate) fn queue_work(
+        &mut self,
+        scope: Id,
+        key: &str,
+        instruction: &str,
+        grant: &WorkGrant,
+    ) -> Result<Id> {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let existing = tx.query_row(
-            "SELECT id, instruction = ?3 FROM ongoing_work WHERE scope = ?1 AND request_key = ?2",
-            params![scope, key, instruction], |row| Ok((row.get(0)?, row.get::<_, bool>(1)?)),
+            "SELECT id, instruction = ?3 AND (state IN ('completed','failed','cancelled') OR EXISTS (
+                 SELECT 1 FROM ongoing_work_grants WHERE run = id AND policy = ?4
+             )) FROM ongoing_work WHERE scope = ?1 AND request_key = ?2",
+            params![scope, key, instruction, grant.policy], |row| Ok((row.get(0)?, row.get::<_, bool>(1)?)),
         ).optional()?;
         if let Some((id, same)) = existing {
             return if same { Ok(id) } else { Err(Error::Conflict) };
@@ -398,30 +416,65 @@ impl DeliveryStore {
         getrandom::fill(&mut id).map_err(io::Error::other)?;
         tx.execute("INSERT INTO ongoing_work (id, scope, request_key, instruction, state) VALUES (?1, ?2, ?3, ?4, 'queued')",
             params![id, scope, key, instruction])?;
+        tx.execute("INSERT INTO ongoing_work_grants(run, policy, revision, selection) VALUES (?1, ?2, ?3, ?4)",
+            params![id, grant.policy, grant.commit, grant.selection])?;
         tx.commit()?;
         Ok(id)
     }
 
-    pub(crate) fn recover_work(&self, scope: Id) -> Result<()> {
-        self.connection.execute(
-            "UPDATE ongoing_work SET state = 'failed', result = 'Work ' || lower(hex(id)) || ' was interrupted.'
-             WHERE scope = ?1 AND state = 'running'", [scope],
-        )?;
+    pub(crate) fn recover_work(&mut self, policies: &[Id]) -> Result<()> {
+        let allowed = serde_json::to_string(&policies.iter().map(hex::encode).collect::<Vec<_>>())
+            .map_err(io::Error::other)?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute("UPDATE ongoing_work SET state = 'cancelled', cancelled = 1,
+            result = 'Work ' || lower(hex(id)) || ' authorization was revoked.'
+            WHERE state IN ('queued','running') AND NOT EXISTS (
+                SELECT 1 FROM ongoing_work_grants WHERE run = id AND lower(hex(policy)) IN (SELECT value FROM json_each(?1))
+            )", [allowed])?;
+        tx.execute("UPDATE ongoing_work SET state = CASE WHEN cancelled THEN 'cancelled' ELSE 'failed' END,
+            result = 'Work ' || lower(hex(id)) || CASE WHEN cancelled THEN ' was cancelled.' ELSE ' was interrupted.' END
+            WHERE state = 'running'", [])?;
+        tx.commit()?;
         Ok(())
     }
 
-    pub(crate) fn claim_work(&self, scope: Id) -> Result<Option<Work>> {
-        self.connection.execute(
+    pub(crate) fn claim_work(&mut self, scope: Id, policy: Id) -> Result<Option<Work>> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
             "UPDATE ongoing_work SET state = 'failed', result = 'Work ' || lower(hex(id)) || ' expired in the queue.'
              WHERE scope = ?1 AND state = 'queued' AND queued_at <= unixepoch() - 900",
             [scope],
         )?;
-        Ok(self.connection.query_row(
-            "UPDATE ongoing_work SET state = 'running' WHERE rowid = (
-                SELECT rowid FROM ongoing_work WHERE scope = ?1 AND state = 'queued' ORDER BY rowid LIMIT 1
-             ) RETURNING id, instruction", [scope],
-            |row| Ok(Work { id: row.get(0)?, instruction: row.get(1)? }),
-        ).optional()?)
+        let work = tx
+            .query_row(
+                "SELECT id, instruction, revision, selection, queued_at + 900 - unixepoch()
+             FROM ongoing_work JOIN ongoing_work_grants ON id = run
+             WHERE scope = ?1 AND policy = ?2 AND state = 'queued' AND queued_at + 900 > unixepoch()
+             ORDER BY ongoing_work.rowid LIMIT 1",
+                params![scope, policy],
+                |row| {
+                    Ok(Work {
+                        id: row.get(0)?,
+                        instruction: row.get(1)?,
+                        commit: row.get(2)?,
+                        selection: row.get(3)?,
+                        remaining: u64::from(row.get::<_, u32>(4)?),
+                    })
+                },
+            )
+            .optional()?;
+        if let Some(job) = &work {
+            tx.execute(
+                "UPDATE ongoing_work SET state = 'running' WHERE id = ?1",
+                [job.id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(work)
     }
 
     pub(crate) fn work_status(&self, scope: Id, id: Id) -> Result<Option<String>> {
@@ -456,7 +509,7 @@ impl DeliveryStore {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let response = tx.query_row(
-            "SELECT cancelled, feedback FROM ongoing_work WHERE id = ?1",
+            "SELECT cancelled, feedback FROM ongoing_work WHERE id = ?1 AND state = 'running' AND queued_at + 900 > unixepoch()",
             [id],
             |row| Ok((row.get(0)?, row.get::<_, Option<String>>(1)?)),
         )?;
@@ -470,12 +523,36 @@ impl DeliveryStore {
         Ok(response)
     }
 
-    pub(crate) fn finish_work(&self, id: Id, status: &str, result: &str) -> Result<()> {
-        self.connection.execute(
-            "UPDATE ongoing_work SET state = CASE WHEN cancelled THEN 'cancelled' ELSE ?2 END,
-             result = CASE WHEN cancelled THEN 'Work ' || lower(hex(id)) || ' was cancelled.' ELSE ?3 END
-             WHERE id = ?1 AND state = 'running'", params![id, status, result],
+    pub(crate) fn finish_work(
+        &mut self,
+        id: Id,
+        publish: impl FnOnce() -> io::Result<String>,
+    ) -> Result<()> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let active = tx.query_row(
+            "SELECT cancelled, queued_at + 900 <= unixepoch() FROM ongoing_work WHERE id = ?1 AND state = 'running'",
+            [id], |row| Ok((row.get::<_, bool>(0)?, row.get::<_, bool>(1)?)),
+        ).optional()?;
+        let run = hex::encode(id);
+        let (state, result) = match active {
+            None => return Ok(()),
+            Some((true, _)) => ("cancelled", format!("Work {run} was cancelled.")),
+            Some((false, true)) => ("failed", format!("Work {run} expired.")),
+            Some((false, false)) => match publish() {
+                Ok(reply) => ("completed", format!("Work {run} completed. {reply}")),
+                Err(error) => {
+                    eprintln!("Howl microVM work {run} ended. {error}");
+                    ("failed", format!("Work {run} ended before completion."))
+                }
+            },
+        };
+        tx.execute(
+            "UPDATE ongoing_work SET state = ?2, result = ?3 WHERE id = ?1",
+            params![id, state, result],
         )?;
+        tx.commit()?;
         Ok(())
     }
 }
@@ -819,6 +896,127 @@ mod tests {
     }
 
     #[test]
+    fn worker_grants_survive_matching_policy_and_expire_from_issue_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("delivery.db");
+        let local = Device {
+            account: [1; 32],
+            device: [2; 32],
+        };
+        let thread = Thread {
+            scope: [3; 32],
+            channel: [4; 32],
+            peer: local,
+            epoch: 1,
+            origin: None,
+        };
+        let grant = WorkGrant {
+            policy: [5; 32],
+            commit: "a".repeat(40),
+            selection: [6; 32],
+        };
+        let mut store = DeliveryStore::open(&path, &[9; 32], local).unwrap();
+        store.prepare_thread(thread).unwrap();
+        let id = store
+            .queue_work(thread.scope, "first", "build", &grant)
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE ongoing_work SET queued_at = unixepoch() - 850 WHERE id = ?1",
+                [id],
+            )
+            .unwrap();
+        drop(store);
+        let mut store = DeliveryStore::open(&path, &[9; 32], local).unwrap();
+        store.recover_work(&[grant.policy]).unwrap();
+        let revised = WorkGrant {
+            commit: "b".repeat(40),
+            ..grant.clone()
+        };
+        assert_eq!(
+            store
+                .queue_work(thread.scope, "first", "build", &revised)
+                .unwrap(),
+            id
+        );
+        let work = store
+            .claim_work(thread.scope, grant.policy)
+            .unwrap()
+            .unwrap();
+        assert_eq!(work.id, id);
+        assert_eq!(work.commit, grant.commit);
+        assert_eq!(work.selection, grant.selection);
+        assert!((1..=50).contains(&work.remaining));
+        store
+            .connection
+            .execute(
+                "UPDATE ongoing_work SET queued_at = unixepoch() - 900 WHERE id = ?1",
+                [id],
+            )
+            .unwrap();
+        assert!(store.work_control(id).is_err());
+        store
+            .finish_work(id, || panic!("expired work published"))
+            .unwrap();
+        assert_eq!(
+            store.work_status(thread.scope, id).unwrap().as_deref(),
+            Some("failed")
+        );
+        let id2 = store
+            .queue_work(thread.scope, "second", "build", &grant)
+            .unwrap();
+        let other = store
+            .queue_work(thread.scope, "third", "build", &grant)
+            .unwrap();
+        assert!(
+            store
+                .queue_work(thread.scope, "fourth", "build", &grant)
+                .is_err()
+        );
+        assert!(!store.cancel_work([7; 32], other).unwrap());
+        assert!(store.cancel_work(thread.scope, other).unwrap());
+        let fourth = store
+            .queue_work(thread.scope, "fourth", "build", &grant)
+            .unwrap();
+        assert!(store.cancel_work(thread.scope, fourth).unwrap());
+        let fifth = store
+            .queue_work(thread.scope, "fifth", "build", &grant)
+            .unwrap();
+        assert!(store.cancel_work(thread.scope, fifth).unwrap());
+        assert!(
+            store
+                .queue_work(thread.scope, "sixth", "build", &grant)
+                .is_err()
+        );
+        let legacy = [10; 32];
+        store
+            .connection
+            .execute(
+                "INSERT INTO ongoing_work(id,scope,request_key,instruction,state)
+            VALUES (?1,?2,'legacy','build','queued')",
+                params![legacy, thread.scope],
+            )
+            .unwrap();
+        store.recover_work(&[grant.policy]).unwrap();
+        assert_eq!(
+            store.work_status(thread.scope, legacy).unwrap().as_deref(),
+            Some("cancelled")
+        );
+        store.recover_work(&[[8; 32]]).unwrap();
+        assert_eq!(
+            store.work_status(thread.scope, id2).unwrap().as_deref(),
+            Some("cancelled")
+        );
+        assert!(
+            store
+                .claim_work(thread.scope, grant.policy)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn work_is_idempotent_control_is_scoped_and_results_deliver_once() {
         let dir = tempfile::tempdir().unwrap();
         let device = Device {
@@ -835,29 +1033,43 @@ mod tests {
             origin: None,
         };
         store.prepare_thread(thread).unwrap();
+        let grant = WorkGrant {
+            policy: [7; 32],
+            commit: "a".repeat(40),
+            selection: [8; 32],
+        };
         let id = store
-            .queue_work(thread.scope, "stable-key", "edit a file")
+            .queue_work(thread.scope, "stable-key", "edit a file", &grant)
             .unwrap();
         assert_eq!(
             store
-                .queue_work(thread.scope, "stable-key", "edit a file")
+                .queue_work(thread.scope, "stable-key", "edit a file", &grant)
                 .unwrap(),
             id
         );
         assert!(matches!(
-            store.queue_work(thread.scope, "stable-key", "different"),
+            store.queue_work(thread.scope, "stable-key", "different", &grant),
             Err(Error::Conflict)
         ));
         assert!(!store.ask_work([6; 32], id, "other conversation").unwrap());
         assert!(store.ask_work(thread.scope, id, "keep the API").unwrap());
-        assert_eq!(store.claim_work(thread.scope).unwrap().unwrap().id, id);
+        assert_eq!(
+            store
+                .claim_work(thread.scope, grant.policy)
+                .unwrap()
+                .unwrap()
+                .id,
+            id
+        );
         assert_eq!(
             store.work_control(id).unwrap(),
             (false, Some("keep the API".into()))
         );
         assert_eq!(store.work_control(id).unwrap(), (false, None));
         assert!(store.cancel_work(thread.scope, id).unwrap());
-        store.finish_work(id, "completed", "finished").unwrap();
+        store
+            .finish_work(id, || panic!("cancelled work published"))
+            .unwrap();
         let result = store
             .next_ongoing(thread, &[], "[]", None, 100)
             .unwrap()
