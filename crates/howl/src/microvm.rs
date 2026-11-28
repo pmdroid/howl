@@ -87,7 +87,7 @@ impl Profile {
 }
 
 pub(crate) struct Guest {
-    snapshot: Snapshot,
+    repository: PathBuf,
     pub session: ManagedSession,
     patch: UnixStream,
     process: Child,
@@ -168,6 +168,7 @@ impl Guest {
             .tempdir_in("/tmp")?;
         let archive = directory.path().join("repo.tar");
         snapshot.archive(&archive)?;
+        let repository = snapshot.repository().to_owned();
         let commit = snapshot.commit().to_owned();
         let selection = snapshot.selection();
         drop(snapshot);
@@ -264,7 +265,7 @@ impl Guest {
             .await
             .map_err(io::Error::other)?;
         Ok(Self {
-            snapshot,
+            repository,
             session,
             patch,
             process,
@@ -281,7 +282,18 @@ impl Guest {
         let patch = timeout(Duration::from_secs(10), read_patch(&mut self.patch))
             .await
             .map_err(io::Error::other)??;
-        self.snapshot
+        if patch.is_empty() {
+            return Ok(patch);
+        }
+        let original = self.session.status();
+        let snapshot = Snapshot::from_repository(&self.repository, &original.commit)
+            .map_err(io::Error::other)?;
+        if snapshot.selection() != original.snapshot {
+            return Err(io::Error::other(
+                "worker snapshot no longer matches its selection",
+            ));
+        }
+        snapshot
             .verify_worker_patch(run, &patch)
             .map_err(io::Error::other)
     }
