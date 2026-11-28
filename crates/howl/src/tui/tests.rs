@@ -324,6 +324,34 @@ fn mouse_confirmation_requires_the_confirm_button() {
 }
 
 #[test]
+fn named_worker_controls_are_direct_messages_to_the_completed_recipient() {
+    let mut app = app();
+    app.peer_labels.insert(hex::encode(PEER), "Claude".into());
+    app.routes.insert(PEER, "127.0.0.1:3000".into());
+    app.set_focus(Focus::Compose);
+    for body in [
+        "/work run",
+        "/steer run keep both names",
+        "/cancel run",
+        "/work",
+    ] {
+        app.peer = None;
+        app.draft = "@cl".into();
+        assert!(app.complete());
+        app.draft.push_str(body);
+        assert!(
+            matches!(app.submit().unwrap(), Some(Action::Direct { channel: CHANNEL, peer: PEER, route, text })
+            if route == "127.0.0.1:3000" && text == body)
+        );
+    }
+    app.draft = "@claude /workflow example".into();
+    assert!(matches!(
+        app.submit().unwrap(),
+        Some(Action::Wake { peer: PEER, .. })
+    ));
+}
+
+#[test]
 fn completes_agent_names_for_tasks_and_channel_names_for_chat() {
     let mut app = App::new();
     let channel = [2; 32];
