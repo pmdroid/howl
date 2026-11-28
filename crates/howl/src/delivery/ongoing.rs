@@ -819,6 +819,35 @@ mod tests {
     }
 
     #[test]
+    fn worker_grants_survive_matching_policy_and_expire_from_issue_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("delivery.db");
+        let local = Device { account: [1; 32], device: [2; 32] };
+        let thread = Thread { scope: [3; 32], channel: [4; 32], peer: local, epoch: 1, origin: None };
+        let grant = WorkGrant { policy: [5; 32], commit: "a".repeat(40), selection: [6; 32] };
+        let mut store = DeliveryStore::open(&path, &[9; 32], local).unwrap();
+        store.prepare_thread(thread).unwrap();
+        let id = store.queue_work(thread.scope, "first", "build", &grant).unwrap();
+        store.connection.execute("UPDATE ongoing_work SET queued_at = unixepoch() - 850 WHERE id = ?1", [id]).unwrap();
+        drop(store);
+        let mut store = DeliveryStore::open(&path, &[9; 32], local).unwrap();
+        store.recover_work(&[grant.policy]).unwrap();
+        let revised = WorkGrant { commit: "b".repeat(40), ..grant.clone() };
+        assert_eq!(store.queue_work(thread.scope, "first", "build", &revised).unwrap(), id);
+        let work = store.claim_work(thread.scope, grant.policy).unwrap().unwrap();
+        assert_eq!(work.id, id);
+        assert_eq!(work.commit, grant.commit);
+        assert_eq!(work.selection, grant.selection);
+        assert!((1..=50).contains(&work.remaining));
+        store.connection.execute("UPDATE ongoing_work SET queued_at = unixepoch() - 900 WHERE id = ?1", [id]).unwrap();
+        assert!(store.work_control(id).is_err());
+        let id2 = store.queue_work(thread.scope, "second", "build", &grant).unwrap();
+        store.recover_work(&[[8; 32]]).unwrap();
+        assert_eq!(store.work_status(thread.scope, id2).unwrap().as_deref(), Some("cancelled"));
+        assert!(store.claim_work(thread.scope, grant.policy).unwrap().is_none());
+    }
+
+    #[test]
     fn work_is_idempotent_control_is_scoped_and_results_deliver_once() {
         let dir = tempfile::tempdir().unwrap();
         let device = Device {
