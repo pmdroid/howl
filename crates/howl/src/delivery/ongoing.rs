@@ -544,7 +544,16 @@ impl DeliveryStore {
                 Ok(reply) => ("completed", format!("Work {run} completed. {reply}")),
                 Err(error) => {
                     eprintln!("Howl microVM work {run} ended. {error}");
-                    ("failed", format!("Work {run} ended before completion."))
+                    let reason = match error
+                        .get_ref()
+                        .and_then(|err| err.downcast_ref::<crate::provider_broker::Error>())
+                    {
+                        Some(crate::provider_broker::Error::NativeSubagent) => {
+                            format!("failed. {error}")
+                        }
+                        _ => "ended before completion.".to_owned(),
+                    };
+                    ("failed", format!("Work {run} {reason}"))
                 }
             },
         };
@@ -1081,6 +1090,34 @@ mod tests {
                 .next_ongoing(thread, &[], "[]", None, 100)
                 .unwrap()
                 .is_none()
+        );
+        let id = store
+            .queue_work(thread.scope, "child-run", "delegate", &grant)
+            .unwrap();
+        assert_eq!(
+            store
+                .claim_work(thread.scope, grant.policy)
+                .unwrap()
+                .unwrap()
+                .id,
+            id
+        );
+        store
+            .finish_work(id, || {
+                Err(std::io::Error::other(
+                    crate::provider_broker::Error::NativeSubagent,
+                ))
+            })
+            .unwrap();
+        let result = store
+            .next_ongoing(thread, &[], "[]", None, 101)
+            .unwrap()
+            .unwrap();
+        assert!(result.source == Source::WorkResult);
+        assert!(
+            result
+                .text
+                .ends_with("ChatGPT subscription sharing rejected the native sub-agent handoff.")
         );
     }
 }

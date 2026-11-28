@@ -335,7 +335,7 @@ async fn execute(
         None => work.instruction.clone(),
     };
     let reply = loop {
-        let turn = prompt(&guest.session, instruction, LIMIT);
+        let turn = guest.prompt(instruction, LIMIT);
         tokio::pin!(turn);
         let result = loop {
             tokio::select! {
