@@ -28,7 +28,7 @@ function hideDevice() {
   element("rename").hidden = true;
   element("editor").hidden = true;
   element("name").value = "";
-  for (const value of element("details").querySelectorAll("dd code, dd time, #state")) {
+  for (const value of element("details").querySelectorAll("dd code, dd time, dd[id]")) {
     value.replaceChildren();
     value.removeAttribute("datetime");
   }
@@ -45,9 +45,20 @@ function render(view) {
   element("details").hidden = false;
   element("state").textContent = {pending: "Pending", approved: "Approved", denied: "Denied"}[view.state];
   fillIdentity(element("details"), view);
+  element("network-name-row").hidden = !view.network_name;
+  element("network-name").textContent = view.network_name ?? "";
+  element("network-id").textContent = view.network_id;
+  element("endpoint-id").textContent = view.endpoint_id;
+  element("route-status-row").hidden = Boolean(view.route);
+  element("route-status").textContent = view.last_route_at ? "Address expired" : "No address published";
+  element("route-ip-row").hidden = !view.route;
+  element("route-ip").textContent = view.route?.ip ?? "";
+  element("route-port-row").hidden = !view.route;
+  element("route-port").textContent = view.route?.port ?? "";
   timestamp(element("requested"), view.requested_at);
   timestamp(element("admitted"), view.approved_at);
   timestamp(element("last-route"), view.last_route_at);
+  timestamp(element("route-expires"), view.route?.expires_at);
 }
 
 async function request(resource, options) {

@@ -6,7 +6,11 @@ use axum::{
     http::HeaderMap,
     routing::{get, post},
 };
-use howl::{enrollment::hosted::Candidate, identity::PeerCertificate};
+use howl::{
+    discovery::{RouteHint, now},
+    enrollment::hosted::Candidate,
+    identity::PeerCertificate,
+};
 use serde::{Deserialize, Serialize};
 use tokio_postgres::Transaction;
 
@@ -73,19 +77,30 @@ struct Details {
     fingerprint: String,
     name: String,
     state: &'static str,
+    network_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    network_name: Option<String>,
+    endpoint_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     requested_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     approved_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     last_route_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    route: Option<Route>,
+}
+
+#[derive(Serialize)]
+struct Route {
+    ip: String,
+    port: u16,
+    expires_at: String,
 }
 
 async fn details(tx: &Transaction<'_>, github: i64, device: &Id) -> Result<Details> {
-    let snapshot = network::hosted(tx, github)
-        .await?
-        .and_then(|network| network.snapshot)
-        .ok_or(Error::NotFound)?;
+    let network = network::hosted(tx, github).await?.ok_or(Error::NotFound)?;
+    let snapshot = network.snapshot.ok_or(Error::NotFound)?;
     let mut member = None;
     for entry in &snapshot.devices {
         let peer = entry.identity().map_err(|_| Error::Internal)?;
@@ -147,12 +162,14 @@ async fn details(tx: &Transaction<'_>, github: i64, device: &Id) -> Result<Detai
          to_char(COALESCE(d.requested_at,CASE WHEN NOT $8 THEN LEAST(l.requested_at,n.requested_at) END) AT TIME ZONE 'UTC',
                  'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),
          to_char(COALESCE(d.approved_at,CASE WHEN NOT $8 THEN l.approved_at END) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),
-         to_char(to_timestamp(h.issued_millis / 1000.0) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')
+         to_char(to_timestamp(h.issued_millis / 1000.0) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),
+         h.hint,
+         to_char(to_timestamp(h.expires_millis / 1000.0) AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')
          FROM (VALUES (1)) AS anchor(x)
          LEFT JOIN howl_control.device_details d ON d.github_id=$1 AND d.device_id=$2
          LEFT JOIN howl_control.device_link_requests l ON l.github_id=$1 AND l.device_id=$2 AND l.peer=$3
          LEFT JOIN howl_control.network_requests n ON n.github_id=$1 AND n.device_id=$2
-         LEFT JOIN howl_control.enrolled_devices e ON e.account_id=$4 AND e.device_id=$2
+         LEFT JOIN howl_control.enrolled_devices e ON $8 AND e.account_id=$4 AND e.device_id=$2
              AND e.authority_head=$5 AND e.designation_digest=$6 AND e.signing_key=$7
          LEFT JOIN howl_control.route_hints h ON h.account_id=e.account_id AND h.device_id=e.device_id
              AND h.authority_head=e.authority_head AND h.designation_digest=e.designation_digest AND h.device_sequence=e.sequence",
@@ -164,6 +181,18 @@ async fn details(tx: &Transaction<'_>, github: i64, device: &Id) -> Result<Detai
     {
         return Err(Error::Conflict);
     }
+    let route = if let Some(bytes) = row.get::<_, Option<&[u8]>>(5) {
+        let hint = RouteHint::from_bytes(bytes.try_into().map_err(|_| Error::Internal)?);
+        hint.address(&peer, now().map_err(|_| Error::Internal)?)
+            .map_err(|_| Error::Internal)?
+            .map(|address| Route {
+                ip: address.ip().to_string(),
+                port: address.port(),
+                expires_at: row.get(6),
+            })
+    } else {
+        None
+    };
     Ok(Details {
         id: hex::encode(device),
         fingerprint: hex::encode(peer.fingerprint()),
@@ -171,13 +200,13 @@ async fn details(tx: &Transaction<'_>, github: i64, device: &Id) -> Result<Detai
             .get::<_, Option<String>>(0)
             .unwrap_or_else(|| default_name(device)),
         state,
+        network_id: hex::encode(network.channel),
+        network_name: network.github_login,
+        endpoint_id: peer.endpoint().to_string(),
         requested_at: row.get(2),
         approved_at: row.get(3),
-        last_route_at: if state == "approved" {
-            row.get(4)
-        } else {
-            None
-        },
+        last_route_at: row.get(4),
+        route,
     })
 }
 
