@@ -1,4 +1,5 @@
 pub mod cli;
+pub mod hosted;
 
 mod authority;
 mod store;
