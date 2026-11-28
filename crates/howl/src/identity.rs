@@ -238,6 +238,23 @@ fn field<const N: usize>(bytes: &[u8], offset: usize) -> &[u8; N] {
     bytes[offset..].first_chunk().expect("fixed record layout")
 }
 
+pub(crate) async fn retry_state_lock<T>(
+    mut operation: impl FnMut() -> io::Result<T>,
+) -> io::Result<T> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match operation() {
+            Err(error)
+                if error.kind() == io::ErrorKind::WouldBlock
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            result => return result,
+        }
+    }
+}
+
 pub(crate) struct StateDirectory {
     path: PathBuf,
     handle: File,

@@ -15,7 +15,7 @@ use crate::{
     delivery::Id,
     discovery_client,
     enrollment::hosted::{self, Candidate, Network},
-    identity::StateDirectory,
+    identity::{StateDirectory, retry_state_lock},
     transport::Transport,
 };
 
@@ -129,10 +129,10 @@ async fn sync(
     if (view.state == Membership::Founder) != (local == founder) {
         return Err(invalid("network founder identity mismatch"));
     }
-    pin(state, network, founder)?;
+    retry_state_lock(|| pin(state, network, founder)).await?;
     match view.state {
         Membership::Founder if view.snapshot.is_none() => {
-            let bootstrap = hosted::bootstrap(state, network)?;
+            let bootstrap = retry_state_lock(|| hosted::bootstrap(state, network)).await?;
             post(client, "/v1/network/approve", "network-approve", &bootstrap).await?;
             view = status(client).await?;
             if view.state != Membership::Founder
@@ -167,7 +167,7 @@ async fn sync(
     }
     let digest: Id = Sha256::digest(serde_json::to_vec(snapshot)?).into();
     if *previous != Some(digest) {
-        hosted::apply(state, network, snapshot)?;
+        retry_state_lock(|| hosted::apply(state, network, snapshot)).await?;
         *previous = Some(digest);
     }
     Ok(view)
@@ -238,7 +238,7 @@ pub async fn approve(state: &Path, device: Id) -> io::Result<()> {
         if candidate.identity()?.device_id() == &device {
             let next = hosted::approve(state, network, &current, candidate)?;
             post(&client, "/v1/network/approve", "network-approve", &next).await?;
-            hosted::apply(state, network, &next)?;
+            retry_state_lock(|| hosted::apply(state, network, &next)).await?;
             println!("Approved {}", hex::encode(device));
             return Ok(());
         }
