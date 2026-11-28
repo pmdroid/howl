@@ -1,76 +1,12 @@
+import { HttpError, decodeHex, digest, encodeHex, jsonBody, randomId, reply, requireValue } from "./http.mjs";
+import { authenticateOwner, webRoute } from "./web.mjs";
+
 const encoder = new TextEncoder();
-const decoder = new TextDecoder("utf-8", { fatal: true });
 const envelopeLimit = 77112;
 const mailboxLifetime = 86400;
 const word = /^[0-9a-f]{64}$/;
 const signature = /^[0-9a-f]{128}$/;
 const hasProof = "EXISTS (SELECT 1 FROM device_proofs WHERE attempt = ?)";
-const hex = Array.from({ length: 256 }, (_, byte) => byte.toString(16).padStart(2, "0"));
-
-class HttpError extends Error {
-  constructor(status) {
-    super(String(status));
-    this.status = status;
-  }
-}
-
-function requireValue(valid, status = 400) {
-  if (!valid) throw new HttpError(status);
-}
-
-function encodeHex(bytes) {
-  let encoded = "";
-  for (const byte of bytes) encoded += hex[byte];
-  return encoded;
-}
-
-function decodeHex(encoded) {
-  const bytes = new Uint8Array(encoded.length / 2);
-  for (let i = 0; i < bytes.length; i++) bytes[i] = Number.parseInt(encoded.slice(i * 2, i * 2 + 2), 16);
-  return bytes;
-}
-
-function randomId() {
-  return encodeHex(crypto.getRandomValues(new Uint8Array(32)));
-}
-
-async function digest(value) {
-  const bytes = typeof value === "string" ? encoder.encode(value) : value;
-  return encodeHex(new Uint8Array(await crypto.subtle.digest("SHA-256", bytes)));
-}
-
-async function jsonBody(request, limit = 4096) {
-  requireValue(request.body, 400);
-  const reader = request.body.getReader();
-  const bytes = new Uint8Array(limit);
-  let length = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    if (length + value.length > limit) {
-      await reader.cancel();
-      throw new HttpError(413);
-    }
-    bytes.set(value, length);
-    length += value.length;
-  }
-  const raw = bytes.subarray(0, length);
-  let parsed;
-  try {
-    parsed = JSON.parse(decoder.decode(raw));
-  } catch {
-    throw new HttpError(400);
-  }
-  requireValue(parsed && typeof parsed === "object" && !Array.isArray(parsed));
-  return { parsed, raw };
-}
-
-function reply(value, status = 200) {
-  const headers = { "Cache-Control": "no-store" };
-  return status === 204
-    ? new Response(null, { status, headers })
-    : Response.json(value, { status, headers });
-}
 
 async function ownerAccount(db, request) {
   const token = /^Bearer ([0-9a-f]{64})$/.exec(request.headers.get("Authorization") ?? "")?.[1];
@@ -81,19 +17,59 @@ async function ownerAccount(db, request) {
   return account;
 }
 
-async function begin(db, request) {
-  const { parsed: { public_key, name } } = await jsonBody(request);
-  requireValue(typeof public_key === "string" && word.test(public_key) && /[1-9a-f]/.test(public_key));
+async function verifySignature(key, signed, signedProof) {
+  const publicKey = await crypto.subtle.importKey("raw", key, "Ed25519", false, ["verify"]);
+  return crypto.subtle.verify("Ed25519", publicKey, signedProof, signed);
+}
+
+async function peerIdentity(peer) {
+  requireValue(typeof peer === "string" && /^[0-9a-f]{514}$/.test(peer));
+  const certificate = decodeHex(peer);
+  const device = peer.slice(2, 66);
+  const key = peer.slice(66, 130);
+  const endpoint = peer.slice(130, 194);
+  const encryption = peer.slice(194, 258);
+  requireValue(certificate[0] === 1 && /[1-9a-f]/.test(device));
+  requireValue(new Set([key, endpoint, encryption]).size === 3 && /[1-9a-f]/.test(encryption));
+  const body = certificate.slice(0, 129);
+  const domain = encoder.encode("howl/manual-peer/v1\0");
+  const signed = new Uint8Array(domain.length + body.length);
+  signed.set(domain);
+  signed.set(body, domain.length);
+  requireValue(await verifySignature(decodeHex(key), signed, certificate.slice(129, 193)));
+  requireValue(await verifySignature(decodeHex(endpoint), signed, certificate.slice(193)));
+  return { key, device, fingerprint: await digest(body) };
+}
+
+async function begin(db, request, origin) {
+  const { parsed: { public_key, name, peer } } = await jsonBody(request);
   requireValue(typeof name === "string" && name.trim().length > 0 && Array.from(name.trim()).length <= 80 && !/\p{Cc}/u.test(name));
+  if (!origin) requireValue(typeof public_key === "string" && word.test(public_key) && /[1-9a-f]/.test(public_key));
+  const { key, device, fingerprint } = origin ? await peerIdentity(peer) : {
+    key: public_key,
+    device: await digest(JSON.stringify(["howl-d1-device-v1", public_key])),
+    fingerprint: await digest(decodeHex(public_key))
+  };
   const id = randomId();
   const secret = randomId();
-  const fingerprint = await digest(decodeHex(public_key));
-  const device = await digest(JSON.stringify(["howl-d1-device-v1", public_key]));
-  await db.prepare(`
-    INSERT INTO device_links (id, secret_digest, device, public_key, fingerprint, name, expires_at)
-    VALUES (?, ?, ?, ?, ?, ?, unixepoch() + 600)`)
-    .bind(id, await digest(secret), device, public_key, fingerprint, name.trim()).run();
-  return reply({ id, secret, device, fingerprint }, 201);
+  const created = await db.prepare(`
+    INSERT INTO device_links (id, secret_digest, device, public_key, fingerprint, name, peer, expires_at)
+    SELECT ?, ?, ?, ?, ?, ?, ?, unixepoch() + 600
+    WHERE (SELECT COUNT(*) FROM device_links WHERE account IS NULL AND expires_at > unixepoch()) < 4096`)
+    .bind(id, await digest(secret), device, key, fingerprint, name.trim(), origin ? peer : null).run();
+  requireValue(created.meta.changes === 1, 429);
+  const url = origin ? origin + "/link#" + secret : undefined;
+  return reply({ id, secret, device, fingerprint, url }, 201);
+}
+
+async function linkStatus(db, request) {
+  const { parsed: { secret } } = await jsonBody(request);
+  requireValue(typeof secret === "string" && word.test(secret));
+  const record = await db.prepare(`
+    SELECT state, CASE state WHEN 'approved' THEN account END AS account FROM device_links
+    WHERE secret_digest = ? AND (state = 'approved' OR expires_at > unixepoch())`).bind(await digest(secret)).first();
+  requireValue(record, 404);
+  return reply(record);
 }
 
 async function claim(db, request, account) {
@@ -153,8 +129,7 @@ async function deviceRequest(db, request, path, raw) {
     .bind(account, device).first("public_key");
   requireValue(key, 401);
   const message = encoder.encode(JSON.stringify(["howl-d1-proof-v1", path, account, device, nonce, expires, await digest(raw)]));
-  const publicKey = await crypto.subtle.importKey("raw", decodeHex(key), "Ed25519", false, ["verify"]);
-  requireValue(await crypto.subtle.verify("Ed25519", publicKey, decodeHex(proof), message), 401);
+  requireValue(await verifySignature(decodeHex(key), message, decodeHex(proof)), 401);
   const attempt = randomId();
   return {
     account, device, attempt,
@@ -250,23 +225,42 @@ async function acknowledge(db, caller, { cursor, message, digest }) {
   return reply(null, 204);
 }
 
+async function lookup(db, caller, { device }) {
+  requireValue(typeof device === "string" && word.test(device));
+  const [proof, found] = await db.batch([
+    caller.reserve,
+    db.prepare(`
+      SELECT peer FROM device_links WHERE account = ? AND device = ? AND state = 'approved'
+        AND peer IS NOT NULL AND ${hasProof}`).bind(caller.account, device, caller.attempt)
+  ]);
+  requireValue(proof.meta.changes === 1, 409);
+  requireValue(found.results.length === 1, 404);
+  return reply(found.results[0]);
+}
+
 const mailboxRoutes = new Map([
   ["/v1/mailbox/deposit", deposit],
   ["/v1/mailbox/fetch", fetchInbox],
-  ["/v1/mailbox/ack", acknowledge]
+  ["/v1/mailbox/ack", acknowledge],
+  ["/v1/devices/lookup", lookup]
 ]);
 
 export default {
-  async fetch(request, { DB: db }) {
+  async fetch(request, env) {
+    const { DB: db } = env;
     try {
       const { pathname } = new URL(request.url);
       const route = `${request.method} ${pathname}`;
+      const web = await webRoute(route, request, env);
+      if (web) return web;
+      const owner = () => env.WEB_ORIGIN ? authenticateOwner(request, env) : ownerAccount(db, request);
       switch (route) {
         case "GET /healthz": return reply(null, 204);
-        case "POST /v1/device-links": return await begin(db, request);
-        case "POST /api/device-links/claim": return await claim(db, request, await ownerAccount(db, request));
-        case "GET /api/devices": return await listDevices(db, await ownerAccount(db, request));
-        case "POST /api/devices/decide": return await decide(db, request, await ownerAccount(db, request));
+        case "POST /v1/device-links": return await begin(db, request, env.WEB_ORIGIN);
+        case "POST /v1/device-links/status": return await linkStatus(db, request);
+        case "POST /api/device-links/claim": return await claim(db, request, await owner());
+        case "GET /api/devices": return await listDevices(db, await owner());
+        case "POST /api/devices/decide": return await decide(db, request, await owner());
       }
       const mailbox = mailboxRoutes.get(pathname);
       requireValue(request.method === "POST" && mailbox, 404);
@@ -281,6 +275,8 @@ export default {
 
   async scheduled(_controller, { DB: db }) {
     await db.batch([
+      db.prepare("DELETE FROM web_logins WHERE expires_at <= unixepoch()"),
+      db.prepare("DELETE FROM web_sessions WHERE expires_at <= unixepoch()"),
       db.prepare("DELETE FROM envelopes WHERE expires_at <= unixepoch()"),
       db.prepare("DELETE FROM device_proofs WHERE expires_at <= unixepoch()"),
       db.prepare("DELETE FROM device_links WHERE state = 'pending' AND expires_at <= unixepoch()")
