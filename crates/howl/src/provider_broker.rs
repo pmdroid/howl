@@ -808,6 +808,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejects_native_delegation_on_a_chatgpt_subscription_with_the_reason() {
+        let broker = Broker::fixture(Provider::ChatGptPlan, "selected", 1);
+        let (frames, mut response) = mpsc::channel(4);
+        broker.exchange(Request {
+            id: 1, method: "POST".into(), path: "/v1/responses".into(),
+            body: serde_json::json!({"model":"selected","input":[{
+                "type":"agent_message", "id":"child-message", "author":"/root", "recipient":"/root/child",
+                "content":[{"type":"input_text","text":"Task"},{"type":"encrypted_content","encrypted_content":"opaque"}]
+            }]}).to_string()
+        }, &frames).await.unwrap();
+        let header: serde_json::Value =
+            serde_json::from_slice(&response.recv().await.unwrap()).unwrap();
+        assert_eq!(header["status"], 400);
+        let body: serde_json::Value =
+            serde_json::from_slice(&response.recv().await.unwrap()).unwrap();
+        let body: serde_json::Value =
+            serde_json::from_slice(&STANDARD.decode(body["chunk"].as_str().unwrap()).unwrap())
+                .unwrap();
+        assert_eq!(
+            body["error"]["message"],
+            "ChatGPT subscription sharing rejected the native sub-agent handoff."
+        );
+    }
+
+    #[tokio::test]
     async fn streams_the_fixed_upstream_and_cancels_an_open_request() {
         let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
         let origin = format!("http://{}", upstream.local_addr().unwrap());
