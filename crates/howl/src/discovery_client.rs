@@ -12,6 +12,10 @@ use crate::{
 
 pub async fn publish(state: &Path, address: SocketAddr) -> io::Result<()> {
     let client = ControlClient::open(state).await?;
+    publish_with(&client, address).await
+}
+
+pub(crate) async fn publish_with(client: &ControlClient, address: SocketAddr) -> io::Result<()> {
     let identity = client.identity();
     let hint = RouteHint::issue(identity, address, discovery::now()?)?;
     let body = [
@@ -35,12 +39,27 @@ pub async fn publish(state: &Path, address: SocketAddr) -> io::Result<()> {
 }
 
 pub async fn fetch(state: &Path, target: Id) -> io::Result<()> {
-    let peer = PeerTrust::open(state)?.pinned(&target)?;
     let client = ControlClient::open(state).await?;
+    if fetch_with(state, &client, target).await? {
+        Ok(())
+    } else {
+        Err(refused())
+    }
+}
+
+pub(crate) async fn fetch_with(
+    state: &Path,
+    client: &ControlClient,
+    target: Id,
+) -> io::Result<bool> {
+    let peer = PeerTrust::open(state)?.pinned(&target)?;
     let path = format!("/v1/discovery/hints/{}", hex::encode(target));
     let response = client
         .signed(Method::GET, &path, "discovery-read", &target, None)
         .await?;
+    if response.status() == StatusCode::UNAUTHORIZED {
+        return Ok(false);
+    }
     if response
         .headers()
         .get(header::CONTENT_TYPE)
@@ -54,7 +73,8 @@ pub async fn fetch(state: &Path, target: Id) -> io::Result<()> {
     if hint.address(&peer, discovery::now()?)?.is_none() {
         return Err(refused());
     }
-    node::import_hint(state, &hex::encode(hint.as_bytes()))
+    node::import_hint(state, &hex::encode(hint.as_bytes()))?;
+    Ok(true)
 }
 
 fn refused() -> io::Error {

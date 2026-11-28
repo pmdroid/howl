@@ -46,7 +46,6 @@ pub async fn run(state: &Path, listen: &str, relay: Option<&str>) -> io::Result<
 }
 
 pub async fn run_client(state: &Path, listen: &str, relay: Option<&str>) -> io::Result<()> {
-    LocalInteraction::new(state).require_enrolled()?;
     run_node(state, listen, relay, false).await
 }
 
@@ -59,6 +58,13 @@ async fn run_node(
     let identity = Arc::new(LocalIdentity::load_or_create(state)?);
     let local = identity.certificate();
     let directory = StateDirectory::open(state)?;
+    let hosted = crate::network_client::configured(state)?;
+    if hosted && Profile::account(state)?.is_none() {
+        crate::network_client::await_approval(state).await?;
+    }
+    if !accepts_wakes {
+        LocalInteraction::new(state).require_enrolled()?;
+    }
     let control = ControlServer::bind(state)?;
     let relay = relay.map(parse_relay).transpose()?;
     let bind = if listen == "-" {
@@ -86,6 +92,14 @@ async fn run_node(
     }
     println!("Ready {}", hex::encode(local.device_id()));
 
+    let mut discovery_task = JoinSet::new();
+    if hosted {
+        let state = state.to_owned();
+        let transport = Arc::clone(&transport);
+        discovery_task.spawn(async move {
+            crate::network_client::discover(&state, &transport, bind).await;
+        });
+    }
     let mut tick = interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut controls = JoinSet::new();
@@ -109,7 +123,7 @@ async fn run_node(
                     if !accepts_wakes && bytes.first() == Some(&b'G') {
                         return Err(forbidden("client-only device cannot grant inbound wake"));
                     }
-                    queue(state, &identity, &mut delivery, relay.is_some(), &bytes)
+                    queue(state, &identity, &mut delivery, relay.is_some() || hosted, &bytes)
                 });
                 replies.spawn(async move { local_control::reply(&mut link, queued).await });
             }
@@ -157,6 +171,7 @@ async fn run_node(
             }
         }
     };
+    discovery_task.shutdown().await;
     controls.shutdown().await;
     replies.shutdown().await;
     deliveries.shutdown().await;
@@ -436,7 +451,7 @@ fn queue(
     state: &Path,
     identity: &LocalIdentity,
     delivery: &mut DeliveryStore,
-    has_relay: bool,
+    can_resolve_route: bool,
     request: &[u8],
 ) -> io::Result<String> {
     let ([command], request) = request
@@ -468,7 +483,7 @@ fn queue(
             "channel posts use the current signed recipients and routes",
         ));
     }
-    if !post && route.is_none() && !has_relay {
+    if !post && route.is_none() && !can_resolve_route {
         let peer = PeerTrust::open(state)?.pinned(peer)?;
         if cached_address(delivery, &peer)?.is_none() {
             return Err(invalid(
