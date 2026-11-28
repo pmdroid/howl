@@ -36,49 +36,55 @@ docker compose -f deploy/private-beta/compose.yaml -f deploy/private-beta/compos
 
 ### Enable GitHub sign-in for the local beta
 
-Create a dedicated GitHub OAuth app with device flow enabled. Store its client ID and client secret in separate files named `client-id` and `client-secret` in `~/.local/share/howl/github-oauth`. Give the directory mode `0700` and both files mode `0600`. Howl uses the secret to revoke the GitHub grant after reading the account ID. [GitHub OAuth app setup](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/creating-an-oauth-app)
+Choose the HTTPS origin browsers and devices will use to reach the control plane. For a Tailscale beta, publish the local API URL printed by the Docker rehearsal. Set `HOWL_CONTROL_WEB_ORIGIN` to the HTTPS origin printed by Tailscale, including its port.
 
-Use the Compose environment and API URL printed by the kept rehearsal. The override mounts the two credential files in the API container.
+```sh
+tailscale serve --bg --https=8446 "$api_url"
+export HOWL_CONTROL_WEB_ORIGIN=https://control.example.ts.net:8446
+```
+
+Register a dedicated GitHub OAuth app. Use the control-plane origin as its homepage, append `/login/github/callback` for the authorization callback URL, and enable device flow for the CLI. Store the client ID and secret in separate files named `client-id` and `client-secret` in `~/.local/share/howl/github-oauth`. Give the directory mode `0700` and both files mode `0600`. [GitHub OAuth app setup](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/creating-an-oauth-app)
+
+Start the API with the GitHub override. Include it whenever you recreate the API.
 
 ```sh
 source "$beta_compose_environment"
 export HOWL_BETA_GITHUB_OAUTH_DIR="$HOME/.local/share/howl/github-oauth"
 docker compose -f deploy/private-beta/compose.yaml -f deploy/private-beta/compose.docker.yaml \
   -f deploy/private-beta/compose.github.yaml up -d --no-deps api
-export HOWL_CONTROL_URL="$api_url"
+```
+
+### Create your network and approve devices
+
+Open `/devices` at the control-plane origin and choose **Sign in with GitHub**. Your first web sign-in creates your account's network. Returning to the dashboard with the same GitHub account opens that network.
+
+On each device, set `HOWL_CONTROL_URL` to the same HTTPS origin. Use a fresh private state directory. Run the login command and enter the one-time code at the GitHub URL it prints. Sign in with the account that owns the network.
+
+```sh
 howl control login "$device_state"
+howl control devices "$device_state"
 ```
 
-The device prints a GitHub verification URL and one-time code. After consent it saves a Howl session bound to its signing key. Include the GitHub override when recreating this API.
+Compare the full certificate fingerprint printed on the device with the one under **Pending requests** on the dashboard. Select **Approve** or **Deny** for that fingerprint. The control plane records the decision even when every previously approved device is offline. Run `howl control devices "$device_state"` again on the requesting device to see its membership.
 
-### Connect your devices after GitHub sign-in
-
-Set `HOWL_CONTROL_URL` on each machine to the same HTTPS control-plane URL. Use a fresh private state directory on each machine. The first device to complete GitHub sign-in creates the network and holds its membership signing key. Its login prints the network ID and device ID. Save the founder’s sibling recovery directory on offline storage after setup. Set `HOWL_NETWORK_RECOVERY_DIR` before the first login to choose that location.
-
-On the second machine, run `howl control login "$device_state"` and sign in with the same GitHub account. To see its device ID and full certificate fingerprint again, run `howl control devices "$device_state"`.
-
-On the founder, open **Devices** in the Howl web UI. Compare the full fingerprint in the pending request with the one on the second machine. Select **Approve** to admit that device or **Deny** to close its request. The requesting device can check its membership with the same command.
-
-To use the founder's approval page over Tailscale, run these commands on the founder with its own tailnet hostname. Open the private link printed by `howl web` in your browser. Anyone with this link and tailnet access can make decisions as the founder. Restarting the web process rotates the link.
+Start the mesh on each approved device. Use the network ID shown on the dashboard and the recipient's device ID. The final dash selects the discovered iroh route.
 
 ```sh
-tailscale serve --bg --https=8447 http://127.0.0.1:18473
-HOWL_WEB_APPROVAL_ORIGIN=https://founder.example.ts.net:8447 howl web "$founder_state" 18473
+howl mesh run "$device_state" -
 ```
 
-For approval from the founder CLI, use the matched device ID.
+From another terminal on the sender, send a message. Read it on the recipient.
 
 ```sh
-howl control devices "$founder_state"
-howl control approve "$founder_state" "$second_device_id"
+printf '%s\n' 'hello from my first device' | howl send "$sender_state" "$network_id" "$recipient_device_id" -
+howl read "$recipient_state" "$network_id"
 ```
 
-Run `howl mesh run "$device_state" -` on each machine using its own state. The devices retrieve the signed channel membership and publish and fetch signed iroh addresses through the control plane. On the founder, send a message using the network ID printed at login. The final dash selects the discovered route.
+### Transfer an existing founder-managed network
 
-```sh
-printf '%s\n' 'hello from my first device' | howl send "$founder_state" "$network_id" "$second_device_id" -
-howl read "$device_state" "$network_id"
-```
+For a network created by an earlier device login, run `howl control transfer "$founder_state"` once on the founding machine using its original state directory and the HTTPS control-plane URL. After the transfer, sign in on the control-plane dashboard to manage that network.
+
+For a founder-managed network awaiting transfer, use `howl control devices "$founder_state"` and `howl control approve "$founder_state" "$device_id"`. The founder's local **Devices** page also accepts approval and denial decisions. Match the full certificate fingerprint with the requesting device before deciding.
 
 ### Verify the native API and mailbox
 
@@ -151,7 +157,7 @@ docker compose -f deploy/private-beta/compose.yaml up -d --wait
 bash deploy/private-beta/database.sh bootstrap
 ```
 
-Register a dedicated OAuth app and enable device flow. Put its client ID and client secret into the API service's private environment. Use the numeric GitHub account ID when approving enrollment. [GitHub OAuth app setup](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/creating-an-oauth-app)
+Configure the OAuth app's homepage with the HTTPS control-plane origin and its callback with the same origin followed by `/login/github/callback`. Enable device flow. Put the app's client ID and secret in the API service's private environment. [GitHub OAuth app setup](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/creating-an-oauth-app)
 
 Use shell assignments from a private service environment or secret manager. Run migrations before starting the API and on every release that changes the database schema.
 
@@ -160,6 +166,7 @@ owner_url="postgresql://howl_control_owner:$(<"$HOWL_BETA_PRIVATE_DIR/postgres-o
 runtime_url="postgresql://howl_control_runtime:$(<"$HOWL_BETA_PRIVATE_DIR/postgres-runtime")@127.0.0.1:$HOWL_BETA_POSTGRES_PORT/howl"
 HOWL_CONTROL_DATABASE_URL="$owner_url" howl-control-plane --migrate
 export HOWL_CONTROL_BIND=127.0.0.1:8080
+export HOWL_CONTROL_WEB_ORIGIN=https://howl.example.com
 export HOWL_CONTROL_AUDIENCE
 HOWL_CONTROL_AUDIENCE=$(<"$HOWL_BETA_PRIVATE_DIR/audience")
 export HOWL_CONTROL_STATE_KEY
