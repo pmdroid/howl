@@ -73,6 +73,7 @@ if [[ "$control" = --onboarding ]]; then
     run_fixture account_transfer_preserves_pins_and_disables_native_decisions
     run_fixture device_link_redeems_exact_owner_approval_once
     run_fixture native_device_joins_from_a_howl_browser_link
+    run_fixture named_device_details_stay_with_the_owner
     exit 0
 fi
 

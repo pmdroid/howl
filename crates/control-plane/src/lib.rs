@@ -15,6 +15,7 @@ use zeroize::Zeroizing;
 
 mod account_dashboard;
 mod account_network;
+mod device_details;
 mod discovery;
 mod enrollment;
 mod github;
@@ -117,6 +118,7 @@ impl ControlPlane {
             app = app
                 .merge(web_login::routes())
                 .merge(link::routes())
+                .merge(device_details::routes())
                 .merge(account_network::routes())
                 .merge(account_dashboard::routes());
         }
@@ -165,6 +167,8 @@ pub async fn migrate(pool: &Pool) -> Result<()> {
         .await?;
     tx.batch_execute(include_str!("../migrations/010_device_links.sql"))
         .await?;
+    tx.batch_execute(include_str!("../migrations/011_device_details.sql"))
+        .await?;
     tx.commit().await?;
     Ok(())
 }
@@ -186,12 +190,15 @@ struct AuthConfig {
     audience: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     browser_link_origin: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    device_names: Option<bool>,
 }
 
 async fn auth_config(State(control): State<Arc<ControlPlane>>) -> Json<AuthConfig> {
     Json(AuthConfig {
         audience: hex::encode(control.audience),
         browser_link_origin: control.web_origin.clone(),
+        device_names: control.web_origin.as_ref().map(|_| true),
     })
 }
 

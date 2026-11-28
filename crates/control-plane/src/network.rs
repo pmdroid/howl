@@ -266,6 +266,12 @@ async fn register(
             return Ok(StatusCode::NO_CONTENT);
         }
     }
+    if tx.query_opt(
+        "SELECT 1 FROM howl_control.device_details WHERE github_id=$1 AND device_id=$2 AND fingerprint<>$3",
+        &[&session.github_id, &&peer.device_id()[..], &&peer.fingerprint()[..]],
+    ).await?.is_some() {
+        return Err(Error::Conflict);
+    }
     let candidate = serde_json::to_value(candidate).map_err(|_| Error::Internal)?;
     tx.execute("DELETE FROM howl_control.network_requests WHERE github_id = $1 AND NOT denied AND expires_at <= clock_timestamp()", &[&session.github_id]).await?;
     if tx.execute("INSERT INTO howl_control.network_requests (github_id,device_id,candidate,expires_at)
@@ -362,6 +368,7 @@ pub(crate) async fn commit_member(
         return Err(Error::Unauthorized);
     }
     crate::enrollment::store(tx, &pin, &certificate, &material).await?;
+    crate::device_details::admitted(tx, github, &peer).await?;
     tx.execute(
         "DELETE FROM howl_control.network_requests WHERE github_id=$1 AND device_id=$2",
         &[&github, &&peer.device_id()[..]],

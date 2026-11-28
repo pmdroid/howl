@@ -459,7 +459,7 @@ async fn request_device(
     );
     (
         client,
-        json!({"id":hex::encode(peer.device_id()),"fingerprint":hex::encode(peer.fingerprint())}),
+        json!({"id":hex::encode(peer.device_id()),"fingerprint":hex::encode(peer.fingerprint()),"name":format!("Device {}",hex::encode(&peer.device_id()[..6]))}),
     )
 }
 
@@ -652,3 +652,6 @@ async fn account_transfer_preserves_pins_and_disables_native_decisions() {
 
 #[path = "device_links.rs"]
 mod device_links;
+
+#[path = "device_details.rs"]
+mod device_details;

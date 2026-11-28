@@ -34,6 +34,7 @@ pub(crate) fn routes() -> Router<Arc<ControlPlane>> {
 #[serde(deny_unknown_fields)]
 struct Start {
     peer: String,
+    name: Option<String>,
 }
 
 async fn start(
@@ -45,6 +46,11 @@ async fn start(
     if *peer.device_id() == [0; 32] {
         return Err(Error::Invalid);
     }
+    let name = input
+        .name
+        .as_deref()
+        .map(crate::device_details::name)
+        .transpose()?;
     let origin = control.web_origin.as_deref().ok_or(Error::NotFound)?;
     let link = random()?;
     let nonce = random()?;
@@ -60,9 +66,9 @@ async fn start(
     .await?;
     tx.execute("DELETE FROM howl_control.device_link_requests WHERE expires_at<=now() AND decision IS DISTINCT FROM 'denied'", &[]).await?;
     let inserted = tx.execute(
-        "INSERT INTO howl_control.device_links(id,secret_digest,peer,nonce,expires_at)
-         SELECT $1,$2,$3,$4,now()+interval '10 minutes' WHERE (SELECT count(*) FROM howl_control.device_links) < 4096",
-        &[&&link[..],&&proof::hash(&secret[..])[..],&&peer.as_bytes()[..],&&nonce[..]],
+        "INSERT INTO howl_control.device_links(id,secret_digest,peer,nonce,suggested_name,expires_at)
+         SELECT $1,$2,$3,$4,$5,now()+interval '10 minutes' WHERE (SELECT count(*) FROM howl_control.device_links) < 4096",
+        &[&&link[..],&&proof::hash(&secret[..])[..],&&peer.as_bytes()[..],&&nonce[..],&name],
     ).await?;
     if inserted != 1 {
         return Err(Error::Wait);
@@ -137,7 +143,7 @@ async fn view(
     let mut conn = control.pool.get().await?;
     let tx = conn.transaction().await?;
     let row = tx.query_opt(
-        "SELECT peer,github_id,channel,designation FROM howl_control.device_links WHERE secret_digest=$1
+        "SELECT peer,github_id,channel,designation,suggested_name FROM howl_control.device_links WHERE secret_digest=$1
          AND (github_id IS NULL OR github_id=$2) AND expires_at>now() FOR UPDATE",
         &[&&digest[..],&github],
     ).await?.ok_or(Error::NotFound)?;
@@ -194,10 +200,13 @@ async fn view(
     } else {
         check_target(&row, &network.channel, &designation)?;
     }
+    let label =
+        crate::device_details::claimed(&tx, github, &peer, row.get("suggested_name")).await?;
     let decision = decision(&tx, github, &peer).await?;
     tx.commit().await?;
     Ok(Json(json!({
         "device": hex::encode(peer.device_id()),
+        "name": label,
         "fingerprint": hex::encode(peer.fingerprint()),
         "network": hex::encode(network.channel),
         "state": decision.as_deref().unwrap_or("pending")
@@ -449,8 +458,13 @@ pub(crate) async fn queue_decision(
     match row.get::<_, Option<&str>>(0) {
         Some(previous) if previous != decision => return Err(Error::Conflict),
         None => {
-            tx.execute("UPDATE howl_control.device_link_requests SET decision=$3 WHERE github_id=$1 AND device_id=$2",
-          &[&github,&&device[..],&decision]).await?;
+            tx.execute(
+                "UPDATE howl_control.device_link_requests SET decision=$3,
+          approved_at=CASE WHEN $3='approved' THEN clock_timestamp() ELSE approved_at END
+          WHERE github_id=$1 AND device_id=$2",
+                &[&github, &&device[..], &decision],
+            )
+            .await?;
         }
         _ => {}
     }
