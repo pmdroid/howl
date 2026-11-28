@@ -61,10 +61,10 @@ impl TrustedDevice {
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct DeviceMaterial {
-    authority: Vec<String>,
-    designation: String,
-    certificate: String,
+pub(crate) struct DeviceMaterial {
+    pub(crate) authority: Vec<String>,
+    pub(crate) designation: String,
+    pub(crate) certificate: String,
 }
 
 pub async fn pin_enrollment(pool: &Pool, pin: EnrollmentPin) -> Result<()> {
@@ -166,6 +166,17 @@ async fn upload(
     }
     material.designation.make_ascii_lowercase();
     material.certificate.make_ascii_lowercase();
+    store(&tx, &pin, &certificate, &material).await?;
+    tx.commit().await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub(crate) async fn store(
+    tx: &Transaction<'_>,
+    pin: &EnrollmentPin,
+    certificate: &DeviceCertificate,
+    material: &DeviceMaterial,
+) -> Result<()> {
     let material = serde_json::to_value(material).map_err(|_| Error::Internal)?;
     let sequence = certificate.sequence.to_be_bytes();
     let changed = tx.execute(
@@ -179,14 +190,13 @@ async fn upload(
            sequence = EXCLUDED.sequence, records = EXCLUDED.records
          WHERE enrolled_devices.sequence < EXCLUDED.sequence
             OR (enrolled_devices.sequence = EXCLUDED.sequence AND enrolled_devices.records = EXCLUDED.records)",
-        &[&pin.github_id, &&device[..], &&signing[..], &&pin.authority_head[..],
+        &[&pin.github_id, &&certificate.device[..], &&certificate.signing[..], &&pin.authority_head[..],
             &&pin.designation_digest[..], &&sequence[..], &material],
     ).await?;
     if changed != 1 {
         return Err(Error::Unauthorized);
     }
-    tx.commit().await?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(())
 }
 
 async fn download(
@@ -260,7 +270,7 @@ async fn enrolled(tx: &Transaction<'_>, session: &PendingSession) -> Result<Trus
 }
 
 impl DeviceMaterial {
-    fn verify(&self, pin: &EnrollmentPin) -> Result<DeviceCertificate> {
+    pub(crate) fn verify(&self, pin: &EnrollmentPin) -> Result<DeviceCertificate> {
         if self.authority.is_empty() || self.authority.len() > 4096 {
             return Err(Error::Invalid);
         }

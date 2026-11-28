@@ -19,6 +19,7 @@ mod github;
 mod login;
 pub mod mailbox;
 mod mailbox_http;
+mod network;
 mod proof;
 mod sessions;
 
@@ -88,10 +89,12 @@ impl ControlPlane {
         Router::new()
             .route("/healthz", get(health))
             .merge(enrollment::routes())
+            .merge(network::routes())
             .merge(discovery::routes())
             .merge(mailbox_http::routes())
             .route("/v1/login/device", post(begin_login))
             .route("/v1/login/device/{id}/poll", post(poll_login))
+            .route("/v1/auth/config", get(auth_config))
             .route("/v1/auth/challenge", post(challenge))
             .route("/v1/auth/session", get(session))
             .route("/v1/auth/refresh", post(refresh))
@@ -116,6 +119,8 @@ pub async fn migrate(pool: &Pool) -> Result<()> {
         .map_err(|_| Error::Internal)?;
     tx.batch_execute(include_str!("../migrations/004_discovery.sql"))
         .await?;
+    tx.batch_execute(include_str!("../migrations/005_network.sql"))
+        .await?;
     tx.commit().await?;
     Ok(())
 }
@@ -130,6 +135,17 @@ fn id(row: &Row, column: usize) -> Result<Id> {
     row.try_get::<_, &[u8]>(column)?
         .try_into()
         .map_err(|_| Error::Internal)
+}
+
+#[derive(Serialize)]
+struct AuthConfig {
+    audience: String,
+}
+
+async fn auth_config(State(control): State<Arc<ControlPlane>>) -> Json<AuthConfig> {
+    Json(AuthConfig {
+        audience: hex::encode(control.audience),
+    })
 }
 
 async fn health(State(control): State<Arc<ControlPlane>>) -> StatusCode {

@@ -171,6 +171,7 @@ impl ControlPlane {
                 {
                     return Err(Error::Unauthorized);
                 }
+                crate::network::reserve(&tx, github_id, &device, &signing).await?;
                 let credentials = sessions::begin(&tx, github_id, device, signing).await?;
                 LoginStatus::Verified { credentials }
             }

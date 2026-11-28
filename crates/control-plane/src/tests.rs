@@ -1050,3 +1050,5 @@ async fn native_login_persists_private_credentials_and_enrolls_through_refresh()
         .unwrap();
     assert_eq!(row.get::<_, Value>(0), material);
 }
+
+mod network_api;
