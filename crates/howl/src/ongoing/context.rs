@@ -218,7 +218,11 @@ async fn summarize<F: Fn() -> io::Result<Harness>>(
             .await
             .map_err(io::Error::other)?,
         );
-        let result = prompt(session.as_ref().unwrap(), request, TURN_LIMIT).await;
+        let result = session
+            .as_ref()
+            .unwrap()
+            .prompt_text(request, TURN_LIMIT)
+            .await;
         close(&mut session).await;
         summary = result?;
         if summary.trim().is_empty() || tokens::count(&summary) > target {

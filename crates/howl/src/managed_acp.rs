@@ -1,6 +1,7 @@
 mod chatgpt;
 mod host;
 mod journal;
+mod reply;
 mod repository;
 mod repository_http;
 mod v2;
@@ -8,6 +9,7 @@ mod v2;
 pub use chatgpt::ChatGptPlanAuth;
 use host::HostAgent;
 pub use host::{HostClaude, HostCodex, HostGrok, HostOpenCode};
+use reply::TurnEvents;
 use repository::RepositoryEndpoint;
 use repository_http::RepositoryHttp;
 
@@ -395,7 +397,7 @@ impl ManagedSession {
         let (ready, initialized) = oneshot::channel();
         let driver = Driver {
             journal: Arc::new(journal),
-            events: events.clone(),
+            events: Arc::new(TurnEvents::new(events.clone())),
             restore: Restore::Fresh,
             channels: Arc::new(Mutex::new(Some((requests, ready)))),
             mode: ClientMode::V1,
@@ -593,7 +595,7 @@ impl ManagedSession {
         let (ready, initialized) = oneshot::channel();
         let client = Driver {
             journal: Arc::new(journal),
-            events: events.clone(),
+            events: Arc::new(TurnEvents::new(events.clone())),
             restore: restore.unwrap_or(Restore::Fresh),
             channels: Arc::new(Mutex::new(Some((requests, ready)))),
             mode: ClientMode::V1,
@@ -634,6 +636,36 @@ impl ManagedSession {
     }
 
     pub async fn prompt(&self, text: String, limit: Duration) -> Result<StopReason> {
+        self.run_prompt(text, limit, None).await
+    }
+
+    pub async fn prompt_text(&self, text: String, limit: Duration) -> io::Result<String> {
+        let (capture, output) = oneshot::channel();
+        let turn = async {
+            let reason = self
+                .run_prompt(text, limit, Some(capture))
+                .await
+                .map_err(io::Error::other)?;
+            if !matches!(reason, StopReason::EndTurn) {
+                return Err(io::Error::other("agent turn did not finish"));
+            }
+            Ok(())
+        };
+        let output = async {
+            output
+                .await
+                .map_err(|_| io::Error::other(Error::Disconnected))?
+        };
+        let ((), text) = tokio::try_join!(biased; turn, output)?;
+        Ok(text)
+    }
+
+    async fn run_prompt(
+        &self,
+        text: String,
+        limit: Duration,
+        capture: Option<oneshot::Sender<io::Result<String>>>,
+    ) -> Result<StopReason> {
         if text.is_empty()
             || text.len() > MAX_PROMPT
             || limit.is_zero()
@@ -641,12 +673,13 @@ impl ManagedSession {
         {
             return Err(Error::Prompt);
         }
-        self.request(|reply| Command::Prompt { text, limit, reply })
-            .await
-    }
-
-    pub async fn prompt_text(&self, text: String, limit: Duration) -> io::Result<String> {
-        crate::ongoing::prompt(self, text, limit).await
+        self.request(|reply| Command::Prompt {
+            text,
+            limit,
+            capture,
+            reply,
+        })
+        .await
     }
 
     pub async fn export_changes(&mut self) -> Result<serde_json::Value> {
@@ -711,6 +744,7 @@ enum Command {
     Prompt {
         text: String,
         limit: Duration,
+        capture: Option<oneshot::Sender<io::Result<String>>>,
         reply: oneshot::Sender<Result<StopReason>>,
     },
     Cancel(oneshot::Sender<Result<()>>),
@@ -902,7 +936,7 @@ type DriverChannels = (mpsc::Receiver<Command>, oneshot::Sender<Result<()>>);
 #[derive(Clone)]
 struct Driver {
     journal: Arc<Journal>,
-    events: broadcast::Sender<Event>,
+    events: Arc<TurnEvents>,
     restore: Restore,
     channels: Arc<Mutex<Option<DriverChannels>>>,
     mode: ClientMode,
@@ -953,6 +987,7 @@ async fn drive_v1(
     let notifications = journal.subscribe();
     let permission_state = journal.subscribe();
     let updates = events.clone();
+    let permissions = events.clone();
     let host_workspace = workspace.is_some();
     let editable = workspace.as_ref().is_some_and(|work| work.editable);
     let work_tools = workspace.as_ref().is_some_and(|work| work.work);
@@ -963,7 +998,7 @@ async fn drive_v1(
                 if notifications.borrow().remote_session.as_deref()
                     == Some(notification.session_id.0.as_ref())
                 {
-                    let _ = updates.send(Event::Update(Box::new(notification)));
+                    updates.send(Event::Update(Box::new(notification)));
                 }
                 Ok(())
             },
@@ -1031,7 +1066,7 @@ async fn drive_v1(
                         RequestPermissionOutcome::Cancelled,
                     )
                 };
-                let _ = events.send(Event::Permission {
+                permissions.send(Event::Permission {
                     offered: request
                         .options
                         .into_iter()
@@ -1059,6 +1094,7 @@ async fn drive_v1(
                                     session,
                                 },
                                 &journal,
+                                &events,
                                 requests,
                             )
                             .await;
@@ -1230,15 +1266,22 @@ impl SessionWire for V1Session<'_> {
 async fn serve_session(
     wire: &impl SessionWire,
     journal: &Journal,
+    events: &TurnEvents,
     mut requests: mpsc::Receiver<Command>,
 ) {
     while let Some(request) = requests.recv().await {
         match request {
-            Command::Prompt { text, limit, reply } => {
+            Command::Prompt {
+                text,
+                limit,
+                capture,
+                reply,
+            } => {
                 if let Err(error) = journal.update(|state| state.phase = Phase::Active) {
                     let _ = reply.send(Err(error));
                     return;
                 }
+                events.begin(capture);
                 let (result, keep_running) = drive_turn(wire, &mut requests, text, limit).await;
                 let phase = if keep_running {
                     Phase::Ready
@@ -1248,6 +1291,7 @@ async fn serve_session(
                 let stored = journal.update(|state| state.phase = phase);
                 let durable = stored.is_ok();
                 let _ = reply.send(stored.and(result));
+                events.finish();
                 if !keep_running || !durable {
                     return;
                 }
