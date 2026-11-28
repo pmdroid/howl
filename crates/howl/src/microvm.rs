@@ -4,6 +4,10 @@ use std::{
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::Stdio,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -93,6 +97,7 @@ pub(crate) struct Guest {
     process: Child,
     owner: Option<ChildStdin>,
     broker: Option<JoinHandle<io::Result<()>>>,
+    rejected_subagent: Option<Arc<AtomicBool>>,
 }
 
 impl Drop for Guest {
@@ -260,6 +265,9 @@ impl Guest {
             _ = process.wait() => return Err(io::Error::other("microVM exited during startup")),
         };
         directory.close()?;
+        let rejected_subagent = broker
+            .as_ref()
+            .map(|(broker, _)| broker.rejected_subagent.clone());
         let broker = broker.map(|(broker, link)| tokio::spawn(broker.serve_guest(link)));
         let session = ManagedSession::guest(&state.join("worker-acp"), commit, selection, link)
             .await
@@ -270,8 +278,28 @@ impl Guest {
             patch,
             process,
             owner: Some(owner),
+            rejected_subagent,
             broker,
         })
+    }
+
+    pub(crate) async fn prompt(&self, text: String, limit: Duration) -> io::Result<String> {
+        let reply = self.session.prompt_text(text, limit).await;
+        self.check_handoff()?;
+        reply
+    }
+
+    fn check_handoff(&self) -> io::Result<()> {
+        if self
+            .rejected_subagent
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
+        {
+            return Err(io::Error::other(
+                crate::provider_broker::Error::NativeSubagent,
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) async fn finish(mut self, run: &str) -> io::Result<Vec<u8>> {
@@ -279,6 +307,7 @@ impl Guest {
             .await
             .map_err(io::Error::other)?
             .map_err(io::Error::other)?;
+        self.check_handoff()?;
         let patch = timeout(Duration::from_secs(10), read_patch(&mut self.patch))
             .await
             .map_err(io::Error::other)??;
@@ -348,7 +377,7 @@ pub async fn run(state: &Path, repo: &Path, revision: &str, text: String) -> io:
     let snapshot = Snapshot::from_repository(repo, revision).map_err(io::Error::other)?;
     let guest = Guest::start(state, &profile, snapshot).await?;
     let id = guest.session.status().id;
-    let result = guest.session.prompt_text(text, RUN_LIMIT).await?;
+    let result = guest.prompt(text, RUN_LIMIT).await?;
     let patch = guest.finish(&id).await?;
     if !patch.is_empty() {
         let name = format!("{id}.patch");

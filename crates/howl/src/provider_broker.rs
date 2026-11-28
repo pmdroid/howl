@@ -1,4 +1,13 @@
-use std::{env, io, path::Path, process::Child, time::Duration};
+use std::{
+    env, io,
+    path::Path,
+    process::Child,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use futures_util::StreamExt;
@@ -57,6 +66,8 @@ impl Provider {
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("ChatGPT subscription sharing rejected the native sub-agent handoff.")]
+    NativeSubagent,
     #[error("set {0} in the host environment to enable this provider")]
     MissingKey(&'static str),
     #[error("sign in to ChatGPT from the host to use the ChatGPT plan")]
@@ -74,6 +85,7 @@ pub enum Error {
 }
 
 pub(crate) struct Broker {
+    pub(crate) rejected_subagent: Arc<AtomicBool>,
     provider: Provider,
     client: Client,
     key: Zeroizing<String>,
@@ -139,6 +151,7 @@ impl Broker {
         }
         let client = client.build().map_err(|_| Error::Client)?;
         Ok(Broker {
+            rejected_subagent: Arc::default(),
             provider,
             client,
             key,
@@ -150,6 +163,7 @@ impl Broker {
     #[cfg(test)]
     pub(crate) fn fixture(provider: Provider, model: &str, port: u16) -> Self {
         Self {
+            rejected_subagent: Arc::default(),
             provider,
             client: Client::builder()
                 .no_proxy()
@@ -257,6 +271,12 @@ impl Broker {
             "POST" => {
                 let Some(payload) = allowed_payload(&request.body, &self.model, self.provider)
                 else {
+                    if self.provider == Provider::ChatGptPlan
+                        && requests_native_handoff(&request.body, &self.model)
+                    {
+                        self.rejected_subagent.store(true, Ordering::Release);
+                        return send_error(response, 400, &Error::NativeSubagent.to_string()).await;
+                    }
                     return send_error(response, 403, "provider request denied").await;
                 };
                 self.client
@@ -317,6 +337,16 @@ impl Broker {
         }
         send_frame(response, &End { end: true }).await
     }
+}
+
+fn requests_native_handoff(body: &str, model: &str) -> bool {
+    let Ok(request) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    request["model"] == model
+        && request["input"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| item["type"] == "agent_message"))
 }
 
 fn allowed_payload(body: &str, model: &str, provider: Provider) -> Option<String> {
@@ -808,9 +838,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejects_native_delegation_on_a_chatgpt_subscription_with_the_reason() {
+        let broker = Broker::fixture(Provider::ChatGptPlan, "selected", 1);
+        let (frames, mut response) = mpsc::channel(4);
+        broker.exchange(Request {
+            id: 1, method: "POST".into(), path: "/v1/responses".into(),
+            body: serde_json::json!({"model":"selected","input":[{
+                "type":"agent_message", "id":"child-message", "author":"/root", "recipient":"/root/child",
+                "content":[{"type":"input_text","text":"Task"},{"type":"encrypted_content","encrypted_content":"opaque"}]
+            }]}).to_string()
+        }, &frames).await.unwrap();
+        let header: serde_json::Value =
+            serde_json::from_slice(&response.recv().await.unwrap()).unwrap();
+        assert_eq!(header["status"], 400);
+        assert!(broker.rejected_subagent.load(Ordering::Acquire));
+        let body: serde_json::Value =
+            serde_json::from_slice(&response.recv().await.unwrap()).unwrap();
+        let body: serde_json::Value =
+            serde_json::from_slice(&STANDARD.decode(body["chunk"].as_str().unwrap()).unwrap())
+                .unwrap();
+        assert_eq!(
+            body["error"]["message"],
+            "ChatGPT subscription sharing rejected the native sub-agent handoff."
+        );
+    }
+
+    #[tokio::test]
     async fn streams_the_fixed_upstream_and_cancels_an_open_request() {
         let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
-        let origin = format!("http://{}", upstream.local_addr().unwrap());
+        let broker = Broker::fixture(
+            Provider::OpenAi,
+            "selected",
+            upstream.local_addr().unwrap().port(),
+        );
         let (opened, opening) = tokio::sync::oneshot::channel();
         let upstream = std::thread::spawn(move || {
             let mut first = accept(&upstream);
@@ -829,17 +889,7 @@ mod tests {
             )
             .unwrap();
         });
-        let broker = Broker {
-            provider: Provider::OpenAi,
-            client: Client::builder()
-                .no_proxy()
-                .redirect(Policy::none())
-                .build()
-                .unwrap(),
-            key: Zeroizing::new("fixture-host-key".to_owned()),
-            origin,
-            model: "selected".to_owned(),
-        };
+
         let (guest, host) = duplex(32 * 1024);
         let (host_read, host_write) = split(host);
         let (guest_read, mut guest_write) = split(guest);
