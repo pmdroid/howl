@@ -126,6 +126,12 @@ async fn status(client: &ControlClient) -> io::Result<Status> {
     let response = client
         .signed(Method::GET, "/v1/network", "network-read", &[], None)
         .await?;
+    if response.status() == StatusCode::CONFLICT {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "Sign in to your Howl control plane in a browser to create your network, then run howl control devices with this state directory.",
+        ));
+    }
     if response.status() == StatusCode::NOT_FOUND {
         return Ok(Status {
             state: Membership::Legacy,
