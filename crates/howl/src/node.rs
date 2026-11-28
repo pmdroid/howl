@@ -75,6 +75,7 @@ async fn run_node(
     let network = match (&relay, bind) {
         (Some(relay), None) => Network::RelayOnly(relay.clone()),
         (Some(relay), Some(_)) => Network::Automatic(relay.clone()),
+        (None, _) if hosted => Network::Hosted,
         (None, _) => Network::Direct,
     };
     let transport =
@@ -151,7 +152,7 @@ async fn run_node(
                 let slots = DELIVERY_WORKERS - deliveries.len();
                 let attempts = delivery.claim_due(None, unix_time()?, slots).map_err(io::Error::other)?;
                 for attempt in attempts {
-                    match target_address(state, &identity, &delivery, relay.as_ref(), &attempt) {
+                    match target_address(state, &identity, &delivery, &transport, relay.as_ref(), &attempt) {
                         Ok(destination) => {
                             let transport = Arc::clone(&transport);
                             let identity = Arc::clone(&identity);
@@ -210,6 +211,25 @@ pub fn import_hint(state: &Path, encoded: &str) -> io::Result<()> {
     if !delivery.import_hint(&hint).map_err(io::Error::other)? {
         return Err(invalid(
             "address hint is older than or conflicts with the saved hint",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn import_routes(state: &Path, target: &Id, bytes: &[u8]) -> io::Result<()> {
+    let peer = PeerTrust::open(state)?.pinned(target)?;
+    if discovery::read_routes(bytes, &peer, discovery::now()?)?.is_none() {
+        return Err(invalid("signed route set expired"));
+    }
+    let identity = LocalIdentity::load_or_create(state)?;
+    let directory = StateDirectory::open(state)?;
+    let delivery = open_delivery(state, &directory, &identity.certificate())?;
+    if !delivery
+        .import_routes(target, bytes)
+        .map_err(io::Error::other)?
+    {
+        return Err(invalid(
+            "route set is older than or conflicts with the saved route set",
         ));
     }
     Ok(())
@@ -898,6 +918,7 @@ fn target_address(
     state: &Path,
     identity: &LocalIdentity,
     delivery: &DeliveryStore,
+    transport: &Transport,
     relay: Option<&RelayUrl>,
     attempt: &crate::delivery::Attempt,
 ) -> io::Result<EndpointAddr> {
@@ -909,24 +930,35 @@ fn target_address(
         ));
     }
     let explicit = parse_route(attempt.route.as_deref().unwrap_or("-").as_bytes())?;
-    let address = match explicit {
-        Some(address) => Some(address),
-        None => match cached_address(delivery, &peer) {
-            Ok(address) => address,
-            Err(_) if relay.is_some() => None,
-            Err(error) => return Err(error),
-        },
-    };
     let mut destination = EndpointAddr::new(peer.endpoint());
-    if let Some(address) = address {
+    if let Some(address) = explicit {
         destination = destination.with_ip_addr(address);
-    } else if relay.is_none() {
-        return Err(invalid(
-            "peer address, signed address hint, or relay is required",
-        ));
+    } else if let Some(signed) = delivery
+        .peer_routes(peer.device_id())
+        .map_err(io::Error::other)?
+        && let Some(routes) = discovery::read_routes(&signed, &peer, discovery::now()?)?
+    {
+        destination =
+            destination.with_addrs(routes.addresses.into_iter().map(iroh::TransportAddr::Ip));
+        if let Some(url) = routes.relay.filter(|url| transport.allows_relay(url)) {
+            destination = destination.with_relay_url(url);
+        }
+    }
+    if destination.is_empty() {
+        match cached_address(delivery, &peer) {
+            Ok(Some(address)) => destination = destination.with_ip_addr(address),
+            Ok(None) => {}
+            Err(_) if relay.is_some() => {}
+            Err(error) => return Err(error),
+        }
     }
     if let Some(url) = relay {
         destination = destination.with_relay_url(url.clone());
+    }
+    if destination.is_empty() {
+        return Err(invalid(
+            "peer address, signed address hint, or relay is required",
+        ));
     }
     Ok(destination)
 }

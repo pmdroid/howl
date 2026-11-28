@@ -1366,6 +1366,7 @@ dependencies = [
  "hpke",
  "iroh",
  "iroh-base",
+ "netdev",
  "rand_chacha",
  "rand_core 0.9.5",
  "ratatui",

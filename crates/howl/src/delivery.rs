@@ -303,6 +303,27 @@ impl DeliveryStore {
         Ok(bytes.map(RouteHint::from_bytes))
     }
 
+    pub(crate) fn import_routes(&self, device: &Id, signed: &[u8]) -> Result<bool> {
+        let changed = self.connection.execute(
+            "INSERT INTO peer_route_sets (device, issued, payload) VALUES (?1, ?2, ?3)
+             ON CONFLICT(device) DO UPDATE SET issued = excluded.issued, payload = excluded.payload
+             WHERE peer_route_sets.issued < excluded.issued OR peer_route_sets.payload = excluded.payload",
+            params![device, &signed[65..73], signed],
+        )?;
+        Ok(changed > 0)
+    }
+
+    pub(crate) fn peer_routes(&self, device: &Id) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT payload FROM peer_route_sets WHERE device = ?1",
+                [device],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
     pub fn presence(&mut self) -> crate::presence::Presence<'_> {
         crate::presence::Presence::new(&mut self.connection)
     }

@@ -5,7 +5,7 @@ use reqwest::{Method, StatusCode, header};
 use crate::{
     control_client::{ControlClient, read_response},
     delivery::Id,
-    discovery::{self, HINT_LEN, RouteHint},
+    discovery::{self, HINT_LEN, MAX_ROUTE_SET_LEN, RouteHint, Routes},
     identity::PeerTrust,
     node,
     transport::Transport,
@@ -43,24 +43,42 @@ pub async fn publish(state: &Path, address: SocketAddr) -> io::Result<()> {
 pub(crate) async fn publish_with(client: &ControlClient, address: SocketAddr) -> io::Result<()> {
     let identity = client.identity();
     let hint = RouteHint::issue(identity, address, discovery::now()?)?;
-    let body = [
-        identity.certificate().as_bytes().as_slice(),
-        hint.as_bytes(),
-    ]
-    .concat();
-    let response = client
+    if publish_hint(client, "/v1/discovery/hints", hint.as_bytes()).await? != StatusCode::NO_CONTENT
+    {
+        return Err(refused());
+    }
+    Ok(())
+}
+
+pub(crate) async fn publish_routes(client: &ControlClient, routes: &Routes) -> io::Result<()> {
+    let payload = discovery::sign_routes(client.identity(), routes, discovery::now()?)?;
+    let status = publish_hint(client, "/v2/discovery/hints", &payload).await?;
+    if !matches!(status, StatusCode::NO_CONTENT | StatusCode::NOT_FOUND) {
+        return Err(refused());
+    }
+    if let Some(address) = routes.addresses.first() {
+        publish_with(client, *address).await?;
+    }
+    Ok(())
+}
+
+async fn publish_hint(
+    client: &ControlClient,
+    path: &str,
+    payload: &[u8],
+) -> io::Result<StatusCode> {
+    let certificate = client.identity().certificate();
+    let body = [certificate.as_bytes().as_slice(), payload].concat();
+    Ok(client
         .signed(
             Method::POST,
-            "/v1/discovery/hints",
+            path,
             "discovery-write",
             &body,
             Some(("application/octet-stream", &body)),
         )
-        .await?;
-    if response.status() != StatusCode::NO_CONTENT {
-        return Err(refused());
-    }
-    Ok(())
+        .await?
+        .status())
 }
 
 pub async fn fetch(state: &Path, target: Id) -> io::Result<()> {
@@ -78,12 +96,44 @@ pub(crate) async fn fetch_with(
     target: Id,
 ) -> io::Result<bool> {
     let peer = PeerTrust::open(state)?.pinned(&target)?;
-    let path = format!("/v1/discovery/hints/{}", hex::encode(target));
-    let response = client
-        .signed(Method::GET, &path, "discovery-read", &target, None)
-        .await?;
-    if response.status() == StatusCode::UNAUTHORIZED {
+    let Some(bytes) = fetch_hint(client, 1, &target, HINT_LEN).await? else {
         return Ok(false);
+    };
+    let hint = RouteHint::from_bytes(bytes.as_slice().try_into().map_err(|_| refused())?);
+    if hint.address(&peer, discovery::now()?)?.is_none() {
+        return Err(refused());
+    }
+    node::import_hint(state, &hex::encode(hint.as_bytes()))?;
+    Ok(true)
+}
+
+pub(crate) async fn fetch_routes(
+    state: &Path,
+    client: &ControlClient,
+    target: Id,
+) -> io::Result<bool> {
+    if let Some(bytes) = fetch_hint(client, 2, &target, MAX_ROUTE_SET_LEN).await? {
+        node::import_routes(state, &target, &bytes)?;
+        return Ok(true);
+    }
+    fetch_with(state, client, target).await
+}
+
+async fn fetch_hint(
+    client: &ControlClient,
+    version: u8,
+    target: &Id,
+    max_len: usize,
+) -> io::Result<Option<zeroize::Zeroizing<Vec<u8>>>> {
+    let path = format!("/v{version}/discovery/hints/{}", hex::encode(target));
+    let response = client
+        .signed(Method::GET, &path, "discovery-read", target, None)
+        .await?;
+    if matches!(
+        response.status(),
+        StatusCode::UNAUTHORIZED | StatusCode::NOT_FOUND
+    ) {
+        return Ok(None);
     }
     if response
         .headers()
@@ -93,13 +143,7 @@ pub(crate) async fn fetch_with(
     {
         return Err(refused());
     }
-    let bytes = read_response(response, HINT_LEN).await?;
-    let hint = RouteHint::from_bytes(bytes.as_slice().try_into().map_err(|_| refused())?);
-    if hint.address(&peer, discovery::now()?)?.is_none() {
-        return Err(refused());
-    }
-    node::import_hint(state, &hex::encode(hint.as_bytes()))?;
-    Ok(true)
+    Ok(Some(read_response(response, max_len).await?))
 }
 
 fn refused() -> io::Error {

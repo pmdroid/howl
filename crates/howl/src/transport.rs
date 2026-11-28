@@ -2,16 +2,17 @@ use std::{
     collections::{BTreeSet, VecDeque},
     future::Future,
     io,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     sync::Arc,
     time::Duration,
 };
 
 use iroh::{
-    Endpoint, EndpointId, RelayConfig,
+    Endpoint, EndpointId, RelayConfig, RelayMap,
     endpoint::{Connection, QuicTransportConfig, RelayMode, WeakConnectionHandle, presets},
 };
 pub use iroh::{EndpointAddr, RelayUrl};
+use netdev::ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 use tokio::{
     sync::{Mutex, Semaphore, mpsc},
@@ -28,10 +29,12 @@ const CONNECTION_LIMIT: usize = 32;
 pub const MAX_REPORTED_PATHS: usize = 2 * CONNECTION_LIMIT;
 const RECEIVE_QUEUE_LEN: usize = 32;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+const LAN_HEAD_START: Duration = Duration::from_millis(750);
 const STREAM_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub enum Network {
     Direct,
+    Hosted,
     Automatic(RelayUrl),
     RelayOnly(RelayUrl),
 }
@@ -112,6 +115,7 @@ impl ReceivedFrame {
 
 pub struct Transport {
     endpoint: Endpoint,
+    relays: RelayMap,
     device_id: [u8; 32],
     trust: Arc<PeerTrust>,
     active: Arc<ActiveConnections>,
@@ -161,11 +165,10 @@ impl Transport {
             .secret_key(identity.transport_key().clone())
             .alpns(vec![ALPN.to_vec()])
             .transport_config(config);
-        match network {
-            Network::Direct => {}
-            Network::Automatic(url) => {
-                builder = builder.relay_mode(RelayMode::custom([url]));
-            }
+        let relay_mode = match network {
+            Network::Direct => RelayMode::Disabled,
+            Network::Hosted => iroh::endpoint::default_relay_mode(),
+            Network::Automatic(url) => RelayMode::custom([url]),
             Network::RelayOnly(url) => {
                 if bind_address.is_some() {
                     return Err(invalid_input(
@@ -173,11 +176,12 @@ impl Transport {
                     ));
                 }
                 let relay = RelayConfig::new(url, None);
-                builder = builder
-                    .relay_mode(RelayMode::Custom([relay].into_iter().collect()))
-                    .clear_ip_transports();
+                builder = builder.clear_ip_transports();
+                RelayMode::Custom([relay].into_iter().collect())
             }
-        }
+        };
+        let relays = relay_mode.relay_map();
+        builder = builder.relay_mode(relay_mode);
         if let Some(address) = bind_address {
             builder = builder
                 .clear_ip_transports()
@@ -198,6 +202,7 @@ impl Transport {
         ));
         Ok(Self {
             endpoint,
+            relays,
             device_id,
             trust,
             active,
@@ -218,6 +223,35 @@ impl Transport {
             .filter(|address| address.ip().is_loopback())
             .map(iroh::TransportAddr::Ip);
         address.with_addrs(loopback)
+    }
+
+    pub(crate) fn allows_relay(&self, relay: &RelayUrl) -> bool {
+        self.relays.contains(relay)
+    }
+
+    pub(crate) fn lan_networks(&self) -> Vec<IpNet> {
+        let sockets = self.endpoint.bound_sockets();
+        netdev::get_interfaces()
+            .into_iter()
+            .filter(|interface| {
+                interface.is_up() && !interface.is_loopback() && !interface.is_point_to_point()
+            })
+            .flat_map(|interface| {
+                interface
+                    .ipv4
+                    .into_iter()
+                    .map(IpNet::V4)
+                    .chain(interface.ipv6.into_iter().map(IpNet::V6))
+            })
+            .filter(|network| {
+                let ip = network.addr();
+                !tailnet_address(ip)
+                    && sockets.iter().any(|socket| {
+                        socket.ip() == ip
+                            || (socket.ip().is_unspecified() && socket.is_ipv4() == ip.is_ipv4())
+                    })
+            })
+            .collect()
     }
 
     pub async fn wait_for_relay(&self) -> io::Result<()> {
@@ -314,11 +348,7 @@ impl Transport {
         }
 
         let connection = within(CONNECT_TIMEOUT, async {
-            let connection = self
-                .endpoint
-                .connect(address, ALPN)
-                .await
-                .map_err(io::Error::other)?;
+            let connection = self.dial(address).await?;
             let (mut send, mut receive) = connection.open_bi().await.map_err(io::Error::other)?;
             send.write_all(&self.device_id)
                 .await
@@ -348,6 +378,41 @@ impl Transport {
             receiving,
         });
         Ok(connection)
+    }
+
+    async fn dial(&self, address: EndpointAddr) -> io::Result<Connection> {
+        if address.relay_urls().next().is_some() && address.ip_addrs().next().is_some() {
+            let networks = self.lan_networks();
+            let local = EndpointAddr::from_parts(
+                address.id,
+                address
+                    .ip_addrs()
+                    .filter(|address| on_link(&networks, address.ip()))
+                    .copied()
+                    .map(iroh::TransportAddr::Ip),
+            );
+            if !local.is_empty()
+                && let Ok(Ok(connection)) =
+                    timeout(LAN_HEAD_START, self.endpoint.connect(local, ALPN)).await
+            {
+                return Ok(connection);
+            }
+        }
+        self.endpoint
+            .connect(address, ALPN)
+            .await
+            .map_err(io::Error::other)
+    }
+}
+
+pub(crate) fn on_link(networks: &[IpNet], ip: IpAddr) -> bool {
+    !tailnet_address(ip) && networks.iter().any(|network| network.contains(&ip))
+}
+
+pub(crate) fn tailnet_address(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => ip.octets()[0] == 100 && ip.octets()[1] >> 6 == 1,
+        IpAddr::V6(ip) => ip.segments()[..3] == [0xfd7a, 0x115c, 0xa1e0],
     }
 }
 
