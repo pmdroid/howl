@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { Miniflare } from "miniflare";
@@ -44,6 +44,16 @@ async function expectStatus(response, status) {
   return raw ? JSON.parse(raw) : undefined;
 }
 
+async function migrate(runtime) {
+  const db = await runtime.getD1Database("DB");
+  const migrations = new URL("./migrations/", import.meta.url);
+  for (const file of (await readdir(migrations)).sort()) {
+    const schema = await readFile(new URL(file, migrations), "utf8");
+    await db.batch(schema.split(";").filter(sql => sql.trim()).map(sql => db.prepare(sql)));
+  }
+  return db;
+}
+
 test("Cloudflare Worker with D1", async t => {
   const runtime = new Miniflare({
     modules: true,
@@ -54,9 +64,7 @@ test("Cloudflare Worker with D1", async t => {
   });
   t.after(() => runtime.dispose());
 
-  const db = await runtime.getD1Database("DB");
-  const schema = await readFile(new URL("./migrations/0001_control_plane.sql", import.meta.url), "utf8");
-  await db.batch(schema.split(";").filter(sql => sql.trim()).map(sql => db.prepare(sql)));
+  const db = await migrate(runtime);
 
   function request(path, data, headers) {
     return runtime.dispatchFetch(origin + path, {
@@ -247,4 +255,118 @@ test("Cloudflare Worker with D1", async t => {
     const page = await expectStatus(signed(recipient, fetchPath, { after: 4, limit: 1 }), 200);
     assert.equal(page.envelopes[0].ciphertext, ciphertext);
   });
+});
+
+test("GitHub owner login and native device enrollment", async t => {
+  let githubId = 42;
+  let challenge;
+  let exchanges = 0;
+  let revocations = 0;
+  const runtime = new Miniflare({
+    modules: true,
+    scriptPath: fileURLToPath(new URL("./worker.mjs", import.meta.url)),
+    compatibilityDate: "2026-07-30",
+    d1Databases: { DB: "00000000-0000-4000-8000-000000000002" },
+    bindings: { WEB_ORIGIN: origin, GITHUB_CLIENT_ID: "test-app", GITHUB_CLIENT_SECRET: "fixture", GITHUB_OWNER_ID: "42" },
+    outboundService: async request => {
+      const url = new URL(request.url);
+      switch (url.href) {
+        case "https://github.com/login/oauth/access_token": {
+          ++exchanges;
+          const params = new URLSearchParams(await request.text());
+          assert.equal(params.get("redirect_uri"), origin + "/login/github/callback");
+          const pkce = Buffer.from(await digest(encoder.encode(params.get("code_verifier"))), "hex").toString("base64url");
+          assert.equal(pkce, challenge);
+          return Response.json({ access_token: "fixture-access-token" });
+        }
+        case "https://api.github.com/user":
+          assert.equal(request.headers.get("Authorization"), "Bearer fixture-access-token");
+          return Response.json({ id: githubId });
+        case "https://api.github.com/applications/test-app/token":
+          ++revocations;
+          assert.equal(request.method, "DELETE");
+          assert.deepEqual(await request.json(), { access_token: "fixture-access-token" });
+          return new Response(null, { status: 204 });
+        default:
+          throw new Error("unexpected upstream " + url);
+      }
+    }
+  });
+  t.after(() => runtime.dispose());
+  await migrate(runtime);
+
+  function request(path, data, headers = {}) {
+    return runtime.dispatchFetch(origin + path, {
+      redirect: "manual",
+      method: data === undefined ? "GET" : "POST",
+      headers: { "Content-Type": "application/json", ...headers },
+      body: data === undefined ? undefined : JSON.stringify(data)
+    });
+  }
+
+  async function startLogin() {
+    const start = await request("/login/github");
+    assert.equal(start.status, 303);
+    const location = new URL(start.headers.get("Location"));
+    assert.equal(location.origin, "https://github.com");
+    assert.equal(location.searchParams.get("code_challenge_method"), "S256");
+    challenge = location.searchParams.get("code_challenge");
+    const state = location.searchParams.get("state");
+    return {
+      callback: "/login/github/callback?code=fixture-code&state=" + state,
+      verifier: start.headers.get("Set-Cookie").split(";")[0]
+    };
+  }
+
+  const login = await startLogin();
+  await expectStatus(request(login.callback), 401);
+  await expectStatus(request(login.callback, undefined, { Cookie: "__Host-howl-login=" + randomId() }), 401);
+  assert.equal(exchanges, 0);
+  const authenticated = await request(login.callback, undefined, { Cookie: login.verifier });
+  assert.equal(authenticated.status, 303);
+  const session = authenticated.headers.getSetCookie().find(value => value.startsWith("__Host-howl-owner="));
+  assert.match(session, /Secure; HttpOnly; SameSite=Strict/);
+  const cookie = session.split(";")[0];
+  await expectStatus(request(login.callback, undefined, { Cookie: login.verifier }), 401);
+  assert.equal(exchanges, 1);
+  assert.equal(revocations, 1);
+  const { account } = await expectStatus(request("/api/session", undefined, { Cookie: cookie }), 200);
+
+  githubId = 43;
+  const stranger = await startLogin();
+  await expectStatus(request(stranger.callback, undefined, { Cookie: stranger.verifier }), 403);
+  assert.equal(revocations, 2);
+  await expectStatus(request("/api/devices"), 401);
+
+  const signing = await crypto.subtle.generateKey("Ed25519", true, ["sign", "verify"]);
+  const endpoint = await crypto.subtle.generateKey("Ed25519", true, ["sign", "verify"]);
+  const rawSigning = Buffer.from(await crypto.subtle.exportKey("raw", signing.publicKey));
+  const rawEndpoint = Buffer.from(await crypto.subtle.exportKey("raw", endpoint.publicKey));
+  const receiver = await crypto.subtle.generateKey("X25519", true, ["deriveBits"]);
+  const rawReceiver = Buffer.from(await crypto.subtle.exportKey("raw", receiver.publicKey));
+  const device = randomId();
+  const body = Buffer.concat([Buffer.from([1]), Buffer.from(device, "hex"), rawSigning, rawEndpoint, rawReceiver]);
+  const scope = Buffer.concat([Buffer.from("howl/manual-peer/v1\0"), body]);
+  const sign = async key => Buffer.from(await crypto.subtle.sign("Ed25519", key, scope));
+  const peer = Buffer.concat([body, await sign(signing.privateKey), await sign(endpoint.privateKey)]).toString("hex");
+  const name = "Native device";
+  await expectStatus(request("/v1/device-links", { name, peer: peer.slice(0, -2) + (peer.endsWith("ff") ? "00" : "ff") }), 400);
+  const pending = await expectStatus(request("/v1/device-links", { peer, name }), 201);
+  assert.equal(pending.device, device);
+  assert.equal(pending.fingerprint, await digest(body));
+  assert.equal(pending.url, origin + "/link#" + pending.secret);
+  await expectStatus(request("/api/device-links/claim", { secret: pending.secret }, { Cookie: cookie, Origin: "https://elsewhere.test" }), 403);
+  const headers = { Cookie: cookie, Origin: origin };
+  await expectStatus(request("/api/device-links/claim", { secret: pending.secret }, headers), 200);
+  const { state, account: pendingAccount } = await expectStatus(request("/v1/device-links/status", { secret: pending.secret }), 200);
+  assert.deepEqual({ state, pendingAccount }, { state: "pending", pendingAccount: null });
+
+  const path = "/v1/devices/lookup";
+  const signed = async () => request(path, { device }, await proof({ device, account, signingKey: signing.privateKey }, path, { device }));
+  await expectStatus(signed(), 401);
+  await expectStatus(request("/api/devices/decide", { device, fingerprint: pending.fingerprint, decision: "approve" }, headers), 200);
+  assert.deepEqual(await expectStatus(request("/v1/device-links/status", { secret: pending.secret }), 200), { state: "approved", account });
+  assert.deepEqual(await expectStatus(signed(), 200), { peer });
+  assert.equal((await request("/logout", {}, headers)).status, 303);
+  await expectStatus(request("/api/session", undefined, { Cookie: cookie }), 401);
 });
