@@ -286,7 +286,7 @@ async fn native_device_joins_from_a_howl_browser_link() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("device");
     let mut login = cli
-        .command(&["control", "login"], &path, &[])
+        .command(&["control", "login", "--name", "Lab notebook"], &path, &[])
         .env("HOWL_NO_BROWSER", "1")
         .stdout(Stdio::piped())
         .spawn()
@@ -321,6 +321,7 @@ async fn native_device_joins_from_a_howl_browser_link() {
     )
     .await;
     assert_eq!(view["fingerprint"], fingerprint);
+    assert_eq!(view["name"], "Lab notebook");
     let choice = json!({"secret":secret,"device":view["device"],"fingerprint":fingerprint,"decision":"approve"});
     assert_eq!(
         request("decide")
@@ -341,6 +342,20 @@ async fn native_device_joins_from_a_howl_browser_link() {
     let confirmed = success_text(cli.run(&["control", "devices"], &path, &[]).await);
     assert_eq!(field(&confirmed, "Membership "), "approved");
     assert_eq!(field(&confirmed, "Device "), string(&view, "device"));
+    let detail = success(
+        http.get(format!(
+            "{}/api/devices/{}",
+            server.url,
+            string(&view, "device")
+        ))
+        .header("cookie", &owner.cookie)
+        .send()
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(detail["name"], "Lab notebook");
+    assert_eq!(detail["state"], "approved");
     let again = success_text(cli.run(&["control", "login"], &path, &[]).await);
     assert!(!again.contains("/link#"));
 }
