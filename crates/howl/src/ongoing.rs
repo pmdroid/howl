@@ -3,7 +3,7 @@ mod github;
 mod tokens;
 mod work;
 
-pub(crate) use work::WorkTools;
+pub(crate) use work::{WorkTools, is_worker_command};
 
 use std::{
     collections::HashSet,
