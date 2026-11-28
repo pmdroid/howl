@@ -108,6 +108,79 @@ impl GitHub {
         Ok(result)
     }
 
+    pub(crate) fn authorize_url(
+        &self,
+        redirect: &str,
+        state: &str,
+        challenge: &str,
+    ) -> Result<String> {
+        let mut target = reqwest::Url::parse(&format!("{}/oauth/authorize", self.login))
+            .map_err(|_| Error::Configuration)?;
+        target.query_pairs_mut().extend_pairs([
+            ("client_id", self.client_id.as_str()),
+            ("redirect_uri", redirect),
+            ("state", state),
+            ("code_challenge", challenge),
+            ("code_challenge_method", "S256"),
+            ("prompt", "select_account"),
+            ("scope", ""),
+        ]);
+        Ok(target.into())
+    }
+
+    pub(crate) async fn web_user(&self, code: &str, redirect: &str, verifier: &str) -> Result<i64> {
+        let token: TokenResponse = json(
+            self.http
+                .post(format!("{}/oauth/access_token", self.login))
+                .header("accept", "application/json")
+                .form(&[
+                    ("client_id", self.client_id.as_str()),
+                    ("client_secret", self.client_secret.as_str()),
+                    ("redirect_uri", redirect),
+                    ("code_verifier", verifier),
+                    ("code", code),
+                ]),
+        )
+        .await?;
+        if token.error.is_some() {
+            return Err(Error::Unauthorized);
+        }
+        let token = Zeroizing::new(token.access_token.ok_or(Error::Upstream)?);
+        self.verified_user(&token).await
+    }
+
+    async fn verified_user(&self, token: &str) -> Result<i64> {
+        let user: Result<User> = json(
+            self.http
+                .get(format!("{}/user", self.api))
+                .bearer_auth(token)
+                .header("accept", "application/vnd.github+json")
+                .header("x-github-api-version", "2026-03-10"),
+        )
+        .await;
+        let revoked = self
+            .http
+            .delete(format!(
+                "{}/applications/{}/grant",
+                self.api, self.client_id
+            ))
+            .basic_auth(&self.client_id, Some(&*self.client_secret))
+            .header("accept", "application/vnd.github+json")
+            .header("x-github-api-version", "2026-03-10")
+            .json(&serde_json::json!({ "access_token": token }))
+            .send()
+            .await
+            .map_err(|_| Error::Upstream)?;
+        if revoked.status() != StatusCode::NO_CONTENT {
+            return Err(Error::Upstream);
+        }
+        let id = user?.id;
+        if id <= 0 {
+            return Err(Error::Upstream);
+        }
+        Ok(id)
+    }
+
     pub(crate) async fn poll(&self, device_code: &str) -> Result<Poll> {
         let token: TokenResponse = json(
             self.http
@@ -124,37 +197,7 @@ impl GitHub {
             token.access_token.map(Zeroizing::new),
             token.error.as_deref(),
         ) {
-            (Some(token), None) => {
-                let user: Result<User> = json(
-                    self.http
-                        .get(format!("{}/user", self.api))
-                        .bearer_auth(&*token)
-                        .header("accept", "application/vnd.github+json")
-                        .header("x-github-api-version", "2026-03-10"),
-                )
-                .await;
-                let revoked = self
-                    .http
-                    .delete(format!(
-                        "{}/applications/{}/grant",
-                        self.api, self.client_id
-                    ))
-                    .basic_auth(&self.client_id, Some(&*self.client_secret))
-                    .header("accept", "application/vnd.github+json")
-                    .header("x-github-api-version", "2026-03-10")
-                    .json(&serde_json::json!({ "access_token": &*token }))
-                    .send()
-                    .await
-                    .map_err(|_| Error::Upstream)?;
-                if revoked.status() != StatusCode::NO_CONTENT {
-                    return Err(Error::Upstream);
-                }
-                let id = user?.id;
-                if id <= 0 {
-                    return Err(Error::Upstream);
-                }
-                Ok(Poll::Verified(id))
-            }
+            (Some(token), None) => Ok(Poll::Verified(self.verified_user(&token).await?)),
             (None, Some("authorization_pending")) => Ok(Poll::Pending),
             (None, Some("slow_down")) => Ok(Poll::SlowDown(token.interval)),
             (

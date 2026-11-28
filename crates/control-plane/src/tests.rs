@@ -1,4 +1,5 @@
 mod network_cli;
+mod web_login;
 
 use std::sync::{
     Arc,
