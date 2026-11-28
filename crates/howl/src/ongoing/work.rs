@@ -359,7 +359,7 @@ async fn execute(
             break result?;
         }
     };
-    Ok((reply, guest.finish().await?))
+    Ok((reply, guest.finish(&hex::encode(work.id)).await?))
 }
 
 fn control(

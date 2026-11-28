@@ -1,3 +1,5 @@
+mod patch;
+
 use std::{
     collections::BTreeMap,
     fs::{self, OpenOptions},
@@ -21,6 +23,7 @@ const MAX_FILE: usize = 2 * 1024 * 1024;
 const MAX_SNAPSHOT: usize = 16 * 1024 * 1024;
 
 pub struct Snapshot {
+    repository: PathBuf,
     pub(super) directory: TempDir,
     commit: String,
     selection: [u8; 32],
@@ -103,6 +106,7 @@ impl Snapshot {
         }
         let selection = selection.finalize().into();
         Ok(Self {
+            repository,
             directory,
             commit,
             selection,

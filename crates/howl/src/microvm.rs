@@ -24,7 +24,7 @@ use crate::{
 
 const BOOT: Duration = Duration::from_secs(60);
 const RUN_LIMIT: Duration = Duration::from_secs(900);
-const PATCH_LIMIT: usize = 4 * 1024 * 1024;
+pub(crate) const PATCH_LIMIT: usize = 4 * 1024 * 1024;
 const WATCH_OWNER: &str = r#"
 exec 3<&0
 "$@" </dev/null 3<&- &
@@ -82,6 +82,7 @@ impl Profile {
 }
 
 pub(crate) struct Guest {
+    snapshot: Snapshot,
     pub session: ManagedSession,
     patch: UnixStream,
     process: Child,
@@ -244,6 +245,7 @@ impl Guest {
             .await
             .map_err(io::Error::other)?;
         Ok(Self {
+            snapshot,
             session,
             patch,
             process,
@@ -253,14 +255,17 @@ impl Guest {
         })
     }
 
-    pub(crate) async fn finish(mut self) -> io::Result<Vec<u8>> {
+    pub(crate) async fn finish(mut self, run: &str) -> io::Result<Vec<u8>> {
         timeout(Duration::from_secs(10), self.session.close())
             .await
             .map_err(io::Error::other)?
             .map_err(io::Error::other)?;
-        timeout(Duration::from_secs(10), read_patch(&mut self.patch))
+        let patch = timeout(Duration::from_secs(10), read_patch(&mut self.patch))
             .await
-            .map_err(io::Error::other)?
+            .map_err(io::Error::other)??;
+        self.snapshot
+            .verify_worker_patch(run, &patch)
+            .map_err(io::Error::other)
     }
 }
 
@@ -305,7 +310,7 @@ pub async fn run(state: &Path, repo: &Path, revision: &str, text: String) -> io:
     let guest = Guest::start(state, &profile, snapshot).await?;
     let id = guest.session.status().id;
     let result = crate::ongoing::prompt(&guest.session, text, RUN_LIMIT).await?;
-    let patch = guest.finish().await?;
+    let patch = guest.finish(&id).await?;
     if !patch.is_empty() {
         let name = format!("{id}.patch");
         if !StateDirectory::open(&state.join("worker-patches"))?.write(&name, &patch)? {
