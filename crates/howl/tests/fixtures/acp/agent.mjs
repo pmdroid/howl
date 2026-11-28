@@ -1,6 +1,8 @@
 import { readFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 
+import { burst } from "./reply-burst.mjs";
+
 const lines = createInterface({ input: process.stdin });
 const minimal = process.argv.includes("--minimal");
 const sessionId = "synthetic-session";
@@ -30,6 +32,11 @@ lines.on("line", (line) => {
     reply(id);
   } else if (method === "session/prompt") {
     const text = params.prompt[0].text;
+    if (text === "burst") {
+      burst((update) => send({ method: "session/update", params: { sessionId, update } }), false);
+      reply(id, { stopReason: "end_turn" });
+      return;
+    }
     if (text === "crash") process.exit(43);
     if (text === "oversize") {
       process.stdout.write("a".repeat(270000));

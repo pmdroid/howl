@@ -106,6 +106,49 @@ fn fixture_v2(script: &str, args: &[&str]) -> Harness {
 
 #[tokio::test]
 #[ignore = "requires a local Linux engine and disposable ACP fixture image"]
+async fn returns_the_entire_turn_when_the_event_subscriber_lags() {
+    let repo = repository();
+    let root = tempfile::tempdir().unwrap();
+    let chunks: String = (0..160).map(|index| format!("{index}/")).collect();
+    for (harness, expected) in [
+        (fixture(false), chunks.clone()),
+        (
+            fixture_v2("/fixture/agent-v2.mjs", &[]),
+            format!("{chunks}\nrun-42"),
+        ),
+    ] {
+        let session = ManagedSession::start(
+            &root.path().join("journal"),
+            &provider(),
+            snapshot(repo.path(), "tracked.txt"),
+            harness,
+        )
+        .await
+        .unwrap();
+        let mut stream = session.subscribe();
+        let turn = session.prompt_text("burst".into(), LIMIT);
+        tokio::pin!(turn);
+        assert!(futures_util::poll!(turn.as_mut()).is_pending());
+        timeout(LIMIT, async {
+            while stream.len() <= 64 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(turn.await.unwrap(), expected);
+        assert!(matches!(
+            stream.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_))
+        ));
+        let next = session.prompt_text("hello".into(), LIMIT).await.unwrap();
+        assert!(next == "fixture reply" || next == "v2 fixture reply");
+        session.close().await.unwrap();
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires a local Linux engine and disposable ACP fixture image"]
 async fn negotiates_v2_and_handles_authoritative_turn_completion() {
     use agent_client_protocol::{schema::ProtocolVersion, v2::schema};
 

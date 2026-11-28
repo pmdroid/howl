@@ -348,7 +348,7 @@ pub async fn run(state: &Path, repo: &Path, revision: &str, text: String) -> io:
     let snapshot = Snapshot::from_repository(repo, revision).map_err(io::Error::other)?;
     let guest = Guest::start(state, &profile, snapshot).await?;
     let id = guest.session.status().id;
-    let result = crate::ongoing::prompt(&guest.session, text, RUN_LIMIT).await?;
+    let result = guest.session.prompt_text(text, RUN_LIMIT).await?;
     let patch = guest.finish(&id).await?;
     if !patch.is_empty() {
         let name = format!("{id}.patch");
