@@ -42,7 +42,11 @@ pub(crate) enum LoginStatus {
 }
 
 impl ControlPlane {
-    pub(crate) async fn begin_login(&self, candidate: Candidate) -> Result<Login> {
+    pub(crate) async fn begin_login(
+        &self,
+        candidate: Candidate,
+        join_network: bool,
+    ) -> Result<Login> {
         let device = proof::decode(&candidate.device_id)?;
         let signing = proof::decode(&candidate.signing_key)?;
         proof::key(signing)?;
@@ -62,9 +66,9 @@ impl ControlPlane {
         .await?;
         tx.execute(
             "INSERT INTO howl_control.pending_logins
-             (id, device_id, signing_key, provider_code, expires_at, next_poll, poll_interval)
+             (id, device_id, signing_key, provider_code, expires_at, next_poll, poll_interval, join_network)
              VALUES ($1, $2, $3, $4, clock_timestamp() + $5::integer * interval '1 second',
-                     clock_timestamp() + $6::integer * interval '1 second', $6)",
+                     clock_timestamp() + $6::integer * interval '1 second', $6, $7)",
             &[
                 &&login[..],
                 &&device[..],
@@ -72,6 +76,7 @@ impl ControlPlane {
                 &encrypted,
                 &upstream.expires_in,
                 &upstream.interval,
+                &join_network,
             ],
         )
         .await?;
@@ -160,18 +165,14 @@ impl ControlPlane {
         let tx = connection.transaction().await?;
         let status = match upstream {
             Ok(Poll::Verified(github_id)) => {
-                if tx
-                    .execute(
-                        "DELETE FROM howl_control.pending_logins WHERE id = $1
-                     AND poll_attempt = $2 AND expires_at > clock_timestamp()",
-                        &[&&login[..], &&attempt[..]],
-                    )
-                    .await?
-                    != 1
-                {
-                    return Err(Error::Unauthorized);
+                let row = tx.query_opt(
+                    "DELETE FROM howl_control.pending_logins WHERE id = $1 AND poll_attempt = $2
+                     AND expires_at > clock_timestamp() RETURNING join_network",
+                    &[&&login[..], &&attempt[..]],
+                ).await?.ok_or(Error::Unauthorized)?;
+                if row.get::<_, bool>(0) {
+                    crate::network::reserve(&tx, github_id, &device, &signing).await?;
                 }
-                crate::network::reserve(&tx, github_id, &device, &signing).await?;
                 let credentials = sessions::begin(&tx, github_id, device, signing).await?;
                 LoginStatus::Verified { credentials }
             }

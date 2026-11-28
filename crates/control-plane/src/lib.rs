@@ -93,6 +93,7 @@ impl ControlPlane {
             .merge(discovery::routes())
             .merge(mailbox_http::routes())
             .route("/v1/login/device", post(begin_login))
+            .route("/v1/network/login/device", post(begin_network_login))
             .route("/v1/login/device/{id}/poll", post(poll_login))
             .route("/v1/auth/config", get(auth_config))
             .route("/v1/auth/challenge", post(challenge))
@@ -120,6 +121,8 @@ pub async fn migrate(pool: &Pool) -> Result<()> {
     tx.batch_execute(include_str!("../migrations/004_discovery.sql"))
         .await?;
     tx.batch_execute(include_str!("../migrations/005_network.sql"))
+        .await?;
+    tx.batch_execute(include_str!("../migrations/006_network_login.sql"))
         .await?;
     tx.commit().await?;
     Ok(())
@@ -169,7 +172,14 @@ async fn begin_login(
     State(control): State<Arc<ControlPlane>>,
     Json(candidate): Json<login::Candidate>,
 ) -> Result<Json<login::Login>> {
-    control.begin_login(candidate).await.map(Json)
+    control.begin_login(candidate, false).await.map(Json)
+}
+
+async fn begin_network_login(
+    State(control): State<Arc<ControlPlane>>,
+    Json(candidate): Json<login::Candidate>,
+) -> Result<Json<login::Login>> {
+    control.begin_login(candidate, true).await.map(Json)
 }
 
 async fn poll_login(
