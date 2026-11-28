@@ -56,7 +56,7 @@ impl ControlPlane {
         let mut upstream = self.github.begin().await?;
         let login = random()?;
         let code = upstream.take_code();
-        let encrypted = self.seal_code(&login, code.as_bytes())?;
+        let encrypted = self.seal(&login, code.as_bytes())?;
         let mut connection = self.pool.get().await?;
         let tx = connection.transaction().await?;
         tx.execute(
@@ -154,7 +154,7 @@ impl ControlPlane {
         {
             return Err(Error::Wait);
         }
-        let code = self.open_code(&login, row.get::<_, &[u8]>(2))?;
+        let code = self.open_sealed(&login, row.get::<_, &[u8]>(2))?;
         tx.commit().await?;
         drop(connection);
         let upstream = self
@@ -170,7 +170,7 @@ impl ControlPlane {
                      AND expires_at > clock_timestamp() RETURNING join_network",
                     &[&&login[..], &&attempt[..]],
                 ).await?.ok_or(Error::Unauthorized)?;
-                if row.get::<_, bool>(0) {
+                if row.get::<_, bool>(0) && self.web_origin.is_none() {
                     crate::network::reserve(&tx, github_id, &device, &signing).await?;
                 }
                 let credentials = sessions::begin(&tx, github_id, device, signing).await?;
@@ -213,7 +213,7 @@ impl ControlPlane {
         Ok(status)
     }
 
-    fn seal_code(&self, login: &Id, code: &[u8]) -> Result<Vec<u8>> {
+    pub(crate) fn seal(&self, context: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
         let mut nonce = [0; 12];
         getrandom::fill(&mut nonce).map_err(|_| Error::Internal)?;
         let cipher = ChaCha20Poly1305::new((&*self.state_key).into());
@@ -221,15 +221,15 @@ impl ControlPlane {
             .encrypt(
                 Nonce::from_slice(&nonce),
                 Payload {
-                    msg: code,
-                    aad: login,
+                    msg: plaintext,
+                    aad: context,
                 },
             )
             .map_err(|_| Error::Internal)?;
         Ok([nonce.as_slice(), &sealed].concat())
     }
 
-    fn open_code(&self, login: &Id, sealed: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+    pub(crate) fn open_sealed(&self, context: &[u8], sealed: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
         let (nonce, body) = sealed.split_at_checked(12).ok_or(Error::Internal)?;
         let cipher = ChaCha20Poly1305::new((&*self.state_key).into());
         cipher
@@ -237,7 +237,7 @@ impl ControlPlane {
                 Nonce::from_slice(nonce),
                 Payload {
                     msg: body,
-                    aad: login,
+                    aad: context,
                 },
             )
             .map(Zeroizing::new)

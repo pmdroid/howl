@@ -346,3 +346,306 @@ async fn approvals_bind_the_registered_device_and_isolate_other_accounts() {
     .unwrap();
     assert_eq!(outsider.view(&server).await["state"], "legacy");
 }
+
+const WEB_ORIGIN: &str = "https://howl.test";
+
+struct Owner {
+    cookie: String,
+    http: Client,
+}
+
+impl Owner {
+    async fn sign_in(control: &ControlPlane, account: i64) -> Self {
+        let mut conn = control.pool.get().await.unwrap();
+        let tx = conn.transaction().await.unwrap();
+        crate::account_network::ensure(control, &tx, account)
+            .await
+            .unwrap();
+        let secret = crate::random().unwrap();
+        tx.execute(
+            "INSERT INTO howl_control.web_sessions (token_digest,github_id,expires_at)
+            VALUES ($1,$2,now()+interval '1 hour')",
+            &[&&proof::hash(&secret)[..], &account],
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        Self {
+            cookie: format!("__Host-howl-owner={}", hex::encode(secret)),
+            http: Client::new(),
+        }
+    }
+
+    async fn view(&self, server: &Server) -> Value {
+        success(
+            self.http
+                .get(format!("{}/api/devices", server.url))
+                .header("cookie", &self.cookie)
+                .send()
+                .await
+                .unwrap(),
+        )
+        .await
+    }
+
+    async fn decide(&self, server: &Server, action: &str, device: &Value) -> StatusCode {
+        self.http
+            .post(format!("{}/api/devices/{action}", server.url))
+            .header("origin", WEB_ORIGIN)
+            .header("cookie", &self.cookie)
+            .json(&json!({"device":device["id"],"fingerprint":device["fingerprint"]}))
+            .send()
+            .await
+            .unwrap()
+            .status()
+    }
+}
+
+async fn account_control() -> (Arc<ControlPlane>, Server, i64) {
+    migrate(&pool("HOWL_TEST_CONTROL_DATABASE_OWNER"))
+        .await
+        .unwrap();
+    let control = Arc::new(
+        ControlPlane::new(
+            pool("HOWL_TEST_CONTROL_DATABASE_RUNTIME"),
+            GitHub::new("fixtureapp".into(), Zeroizing::new("fixture_secret".into())).unwrap(),
+            AUDIENCE,
+            Zeroizing::new([3; 32]),
+        )
+        .unwrap()
+        .with_web_origin(WEB_ORIGIN)
+        .unwrap(),
+    );
+    let server = serve(control.clone().router()).await;
+    let account = (i64::from_be_bytes(crate::random().unwrap()[..8].try_into().unwrap())
+        & (i64::MAX - 1))
+        .max(2);
+    (control, server, account)
+}
+
+async fn request_device(
+    control: &ControlPlane,
+    server: &Server,
+    account: i64,
+    path: &std::path::Path,
+    seeds: [u8; 4],
+) -> (Device, Value) {
+    let peer = enrollment_identity(path, seeds).certificate();
+    let client = Device::login(
+        &control.pool,
+        account,
+        *peer.device_id(),
+        SigningKey::from_bytes(&[seeds[1]; 32]),
+    )
+    .await;
+    let view = client.view(server).await;
+    assert_eq!(view["state"], "pending");
+    let candidate = hosted::candidate(
+        path,
+        &serde_json::from_value::<Vec<String>>(view["authority"].clone()).unwrap(),
+        string(&view, "designation"),
+    )
+    .unwrap();
+    assert_eq!(
+        client
+            .post(
+                server,
+                "/v1/network/devices",
+                "network-register",
+                &candidate
+            )
+            .await,
+        StatusCode::NO_CONTENT
+    );
+    (
+        client,
+        json!({"id":hex::encode(peer.device_id()),"fingerprint":hex::encode(peer.fingerprint())}),
+    )
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL instance with owner and runtime fixture roles"]
+async fn account_owner_decides_devices_with_all_native_agents_offline() {
+    let (control, server, account) = account_control().await;
+    let (owner, again) = tokio::join!(
+        Owner::sign_in(&control, account),
+        Owner::sign_in(&control, account)
+    );
+    let outsider = Owner::sign_in(&control, account + 1).await;
+    let empty = owner.view(&server).await;
+    assert_eq!(empty["approved"], json!([]));
+    assert_eq!(empty["pending"], json!([]));
+    assert_eq!(empty["account_managed"], true);
+    assert_ne!(empty["network"], outsider.view(&server).await["network"]);
+    assert_eq!(empty, again.view(&server).await);
+    let states = tempfile::tempdir().unwrap();
+    let (first, first_id) = request_device(
+        &control,
+        &server,
+        account,
+        &states.path().join("first"),
+        [61, 62, 63, 64],
+    )
+    .await;
+    assert_eq!(
+        owner.decide(&server, "approve", &first_id).await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(first.view(&server).await["state"], "approved");
+    drop(first);
+    std::fs::remove_dir_all(states.path().join("first")).unwrap();
+    let (second, second_id) = request_device(
+        &control,
+        &server,
+        account,
+        &states.path().join("second"),
+        [71, 72, 73, 74],
+    )
+    .await;
+    let (rejected, rejected_id) = request_device(
+        &control,
+        &server,
+        account,
+        &states.path().join("rejected"),
+        [81, 82, 83, 84],
+    )
+    .await;
+    let pending = owner.view(&server).await;
+    assert!(pending["pending"].as_array().unwrap().contains(&second_id));
+    assert!(
+        pending["pending"]
+            .as_array()
+            .unwrap()
+            .contains(&rejected_id)
+    );
+    let unseen = outsider.view(&server).await;
+    assert_eq!(unseen["pending"], json!([]));
+    assert_eq!(unseen["approved"], json!([]));
+    let mut stale = second_id.clone();
+    stale["fingerprint"] = rejected_id["fingerprint"].clone();
+    for action in ["approve", "deny"] {
+        assert_eq!(
+            outsider.decide(&server, action, &second_id).await,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            owner.decide(&server, action, &stale).await,
+            StatusCode::NOT_FOUND
+        );
+    }
+    let (approved, denied) = tokio::join!(
+        owner.decide(&server, "approve", &second_id),
+        again.decide(&server, "deny", &rejected_id)
+    );
+    assert_eq!(
+        (approved, denied),
+        (StatusCode::NO_CONTENT, StatusCode::NO_CONTENT)
+    );
+    assert_eq!(
+        owner.decide(&server, "approve", &second_id).await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        owner.decide(&server, "deny", &rejected_id).await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        owner.decide(&server, "approve", &rejected_id).await,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(second.view(&server).await["state"], "approved");
+    assert_eq!(rejected.view(&server).await["state"], "denied");
+    let final_view = owner.view(&server).await;
+    assert_eq!(final_view["pending"], json!([]));
+    assert_eq!(final_view["approved"], json!([first_id, second_id]));
+    assert_eq!(unseen, outsider.view(&server).await);
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL instance with owner and runtime fixture roles"]
+async fn account_transfer_preserves_pins_and_disables_native_decisions() {
+    let (control, server, account) = account_control().await;
+    let states = tempfile::tempdir().unwrap();
+    let state = states.path().join("founder");
+    let peer = enrollment_identity(&state, [11, 12, 13, 14]).certificate();
+    let founder = Device::login(
+        &control.pool,
+        account,
+        *peer.device_id(),
+        SigningKey::from_bytes(&[12; 32]),
+    )
+    .await;
+    let channel = proof::decode(string(&founder.view(&server).await, "network")).unwrap();
+    let genesis = hosted::bootstrap(&state, channel).unwrap();
+    assert_eq!(
+        founder
+            .post(&server, "/v1/network/approve", "network-approve", &genesis)
+            .await,
+        StatusCode::NO_CONTENT
+    );
+    let owner = Owner::sign_in(&control, account).await;
+    let before = owner.view(&server).await;
+    assert_eq!(before["account_managed"], false);
+    let (pending, request) = request_device(
+        &control,
+        &server,
+        account,
+        &states.path().join("second"),
+        [21, 22, 23, 24],
+    )
+    .await;
+    let transfer = "/v1/network/transfer";
+    let op = "network-transfer";
+    let signed =
+        json!({"signer":hex::encode(std::fs::read(state.join("enrollment-signer-key")).unwrap())});
+    assert_eq!(
+        founder
+            .post(&server, transfer, op, &json!({"signer":"00".repeat(32)}))
+            .await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        pending.post(&server, transfer, op, &signed).await,
+        StatusCode::UNAUTHORIZED
+    );
+    for _ in 0..2 {
+        assert_eq!(
+            founder.post(&server, transfer, op, &signed).await,
+            StatusCode::NO_CONTENT
+        );
+    }
+    let after = owner.view(&server).await;
+    assert_eq!(after["account_managed"], true);
+    assert_eq!(after["network"], before["network"]);
+    assert_eq!(after["approved"], before["approved"]);
+    assert_eq!(after["pending"], json!([request]));
+    assert_eq!(
+        founder
+            .post(&server, "/v1/network/approve", "network-approve", &genesis)
+            .await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        founder
+            .post(
+                &server,
+                "/v1/network/deny",
+                "network-deny",
+                &json!({"device":request["id"],"fingerprint":request["fingerprint"]})
+            )
+            .await,
+        StatusCode::UNAUTHORIZED
+    );
+    drop(founder);
+    std::fs::remove_dir_all(state).unwrap();
+    assert_eq!(
+        owner.decide(&server, "approve", &request).await,
+        StatusCode::NO_CONTENT
+    );
+    let view = pending.view(&server).await;
+    assert_eq!(view["state"], "approved");
+    let next: hosted::Network = serde_json::from_value(view["snapshot"].clone()).unwrap();
+    assert_eq!(genesis.pin().unwrap(), next.pin().unwrap());
+    assert!(next.rosters.starts_with(&genesis.rosters));
+    next.verify(channel).unwrap();
+}

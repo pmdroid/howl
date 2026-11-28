@@ -114,6 +114,16 @@ async fn browser_login_binds_callback_and_revokes_owner_session() {
             StatusCode::UNAUTHORIZED
         );
     }
+    let db = admin.get().await.unwrap();
+    assert!(
+        db.query_opt(
+            "SELECT 1 FROM howl_control.networks WHERE github_id=$1",
+            &[&id]
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
     let logged_in = http
         .get(&callback)
         .header(header::COOKIE, &binding)
@@ -133,6 +143,23 @@ async fn browser_login_binds_callback_and_revokes_owner_session() {
                 .to_str()
                 .unwrap()
                 .contains("Secure; HttpOnly; SameSite=Strict"))
+    );
+    let dashboard = success(
+        http.get(format!("{}/api/devices", server.url))
+            .header(header::COOKIE, &session)
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(dashboard["account_managed"], true);
+    assert_eq!(dashboard["pending"], json!([]));
+    assert_eq!(dashboard["approved"], json!([]));
+    assert_eq!(
+        hex::decode(dashboard["network"].as_str().unwrap())
+            .unwrap()
+            .len(),
+        32
     );
     let mut headers = HeaderMap::new();
     headers.insert(header::COOKIE, HeaderValue::from_str(&session).unwrap());
