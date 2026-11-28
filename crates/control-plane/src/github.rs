@@ -39,8 +39,9 @@ struct TokenResponse {
 }
 
 #[derive(Deserialize)]
-struct User {
-    id: i64,
+pub(crate) struct User {
+    pub(crate) id: i64,
+    pub(crate) login: String,
 }
 
 pub(crate) enum Poll {
@@ -128,7 +129,12 @@ impl GitHub {
         Ok(target.into())
     }
 
-    pub(crate) async fn web_user(&self, code: &str, redirect: &str, verifier: &str) -> Result<i64> {
+    pub(crate) async fn web_user(
+        &self,
+        code: &str,
+        redirect: &str,
+        verifier: &str,
+    ) -> Result<User> {
         let token: TokenResponse = json(
             self.http
                 .post(format!("{}/oauth/access_token", self.login))
@@ -149,7 +155,7 @@ impl GitHub {
         self.verified_user(&token).await
     }
 
-    async fn verified_user(&self, token: &str) -> Result<i64> {
+    async fn verified_user(&self, token: &str) -> Result<User> {
         let user: Result<User> = json(
             self.http
                 .get(format!("{}/user", self.api))
@@ -174,11 +180,11 @@ impl GitHub {
         if revoked.status() != StatusCode::NO_CONTENT {
             return Err(Error::Upstream);
         }
-        let id = user?.id;
-        if id <= 0 {
+        let user = user?;
+        if user.id <= 0 {
             return Err(Error::Upstream);
         }
-        Ok(id)
+        Ok(user)
     }
 
     pub(crate) async fn poll(&self, device_code: &str) -> Result<Poll> {
@@ -197,7 +203,7 @@ impl GitHub {
             token.access_token.map(Zeroizing::new),
             token.error.as_deref(),
         ) {
-            (Some(token), None) => Ok(Poll::Verified(self.verified_user(&token).await?)),
+            (Some(token), None) => Ok(Poll::Verified(self.verified_user(&token).await?.id)),
             (None, Some("authorization_pending")) => Ok(Poll::Pending),
             (None, Some("slow_down")) => Ok(Poll::SlowDown(token.interval)),
             (

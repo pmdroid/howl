@@ -141,10 +141,17 @@ async fn callback(
         set_cookie(&mut response, LOGIN, "", 0)?;
         return Ok(response);
     };
-    let github_id = control.github.web_user(&code, &redirect, verifier).await?;
+    let user = control.github.web_user(&code, &redirect, verifier).await?;
+    let github_id = user.id;
     let mut connection = control.pool.get().await?;
     let tx = connection.transaction().await?;
     account_network::ensure(&control, &tx, github_id).await?;
+    tx.execute(
+        "UPDATE howl_control.networks SET github_login=$2
+         WHERE github_id=$1 AND github_login IS DISTINCT FROM $2",
+        &[&github_id, &user.login],
+    )
+    .await?;
     if let Ok(old) = session_digest(&headers) {
         tx.execute(
             "DELETE FROM howl_control.web_sessions WHERE token_digest=$1",

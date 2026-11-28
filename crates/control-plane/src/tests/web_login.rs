@@ -133,6 +133,16 @@ async fn browser_login_binds_callback_and_revokes_owner_session() {
     assert_eq!(logged_in.status(), StatusCode::SEE_OTHER);
     assert_eq!(logged_in.headers()[header::LOCATION], "/devices");
     assert_eq!(policy.revoked.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        db.query_one(
+            "SELECT github_login FROM howl_control.networks WHERE github_id=$1",
+            &[&id],
+        )
+        .await
+        .unwrap()
+        .get::<_, String>(0),
+        "fixture-renameable"
+    );
     let session = cookie_pair(&logged_in, "__Host-howl-owner");
     assert!(
         logged_in

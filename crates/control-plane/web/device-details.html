@@ -35,14 +35,33 @@
       <p>Sign in to the GitHub account that owns this device.</p>
       <a class="primary button" href="/login/github">Sign in with GitHub</a>
     </section>
-    <dl id="details" hidden>
-      <div><dt>Membership</dt><dd id="state"></dd></div>
-      <div><dt>Fingerprint</dt><dd class="fingerprint"><code></code></dd></div>
-      <div><dt>Device ID</dt><dd class="device-id"><code></code></dd></div>
-      <div id="requested" hidden><dt>Requested</dt><dd><time></time></dd></div>
-      <div id="admitted" hidden><dt>Approved</dt><dd><time></time></dd></div>
-      <div id="last-route" hidden><dt>Last address update</dt><dd><time></time></dd></div>
-    </dl>
+    <div id="details" hidden>
+      <dl class="detail-list">
+        <div><dt>Membership</dt><dd id="state"></dd></div>
+        <div><dt>Fingerprint</dt><dd class="fingerprint"><code></code></dd></div>
+        <div><dt>Device ID</dt><dd class="device-id"><code></code></dd></div>
+        <div id="requested" hidden><dt>Requested</dt><dd><time></time></dd></div>
+        <div id="admitted" hidden><dt>Approved</dt><dd><time></time></dd></div>
+      </dl>
+      <section class="detail-section">
+        <h2>Howl network</h2>
+        <dl class="detail-list">
+          <div id="network-name-row" hidden><dt>Network name</dt><dd id="network-name" dir="auto"></dd></div>
+          <div><dt>Network ID</dt><dd><code id="network-id"></code></dd></div>
+        </dl>
+      </section>
+      <section class="detail-section">
+        <h2>Iroh connection</h2>
+        <dl class="detail-list">
+          <div><dt>Endpoint ID</dt><dd><code id="endpoint-id"></code></dd></div>
+          <div id="route-status-row"><dt>Discovery address</dt><dd id="route-status"></dd></div>
+          <div id="route-ip-row" hidden><dt>Advertised IP</dt><dd><code id="route-ip"></code></dd></div>
+          <div id="route-port-row" hidden><dt>UDP port</dt><dd><code id="route-port"></code></dd></div>
+          <div id="last-route" hidden><dt>Last address update</dt><dd><time></time></dd></div>
+          <div id="route-expires" hidden><dt>Address expires</dt><dd><time></time></dd></div>
+        </dl>
+      </section>
+    </div>
   </main>
 </body>
 </html>

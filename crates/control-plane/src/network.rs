@@ -62,6 +62,7 @@ struct View {
 pub(crate) struct Hosted {
     pub(crate) signer: Option<Vec<u8>>,
     pub(crate) channel: Id,
+    pub(crate) github_login: Option<String>,
     founder: Id,
     founder_signing: Id,
     pub(crate) snapshot: Option<Network>,
@@ -70,7 +71,8 @@ pub(crate) struct Hosted {
 pub(crate) async fn hosted(tx: &Transaction<'_>, github: i64) -> Result<Option<Hosted>> {
     let row = tx
         .query_opt(
-            "SELECT n.channel,n.founder,n.founder_signing,n.snapshot,n.account_signer FROM howl_control.networks n
+            "SELECT n.channel,n.founder,n.founder_signing,n.snapshot,n.account_signer,n.github_login
+         FROM howl_control.networks n
          LEFT JOIN howl_control.enrollment_pins p ON p.github_id = n.github_id
          WHERE n.github_id = $1 AND
             (p.account_id,p.authority_head,p.designation_digest) IS NOT DISTINCT FROM
@@ -83,6 +85,7 @@ pub(crate) async fn hosted(tx: &Transaction<'_>, github: i64) -> Result<Option<H
         Ok(Hosted {
             signer: row.get(4),
             channel: id(&row, 0)?,
+            github_login: row.get(5),
             founder: id(&row, 1)?,
             founder_signing: id(&row, 2)?,
             snapshot: row
