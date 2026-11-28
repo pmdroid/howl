@@ -57,11 +57,11 @@
         <dl class="detail-list">
           <div><dt>Endpoint ID</dt><dd><code id="endpoint-id"></code></dd></div>
           <div><dt>Peer connections</dt><dd><p id="peer-status"></p><ul id="peer-connections"></ul></dd></div>
-          <div id="route-status-row"><dt>Discovery address</dt><dd id="route-status"></dd></div>
-          <div id="route-ip-row" hidden><dt>Advertised IP</dt><dd><code id="route-ip"></code></dd></div>
-          <div id="route-port-row" hidden><dt>UDP port</dt><dd><code id="route-port"></code></dd></div>
+          <div><dt id="published-addresses-label">Published UDP addresses</dt><dd><p id="route-status"></p><ul id="published-addresses" role="list" aria-labelledby="published-addresses-label"></ul></dd></div>
+          <div id="published-relay-row" hidden><dt>Published relay</dt><dd><code id="published-relay" dir="ltr"></code><span id="published-relay-connected" class="relay-connected" hidden>Connected</span></dd></div>
+          <div id="home-relay-row" hidden><dt>Connected home relay</dt><dd><code id="home-relay" dir="ltr"></code></dd></div>
           <div id="last-route" hidden><dt>Last address update</dt><dd><time></time></dd></div>
-          <div id="route-expires" hidden><dt>Address expires</dt><dd><time></time></dd></div>
+          <div id="route-expires" hidden><dt>Routes expire</dt><dd><time></time></dd></div>
         </dl>
       </section>
     </div>

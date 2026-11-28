@@ -4,6 +4,7 @@ import styles from "./web/devices.css";
 import deviceScript from "./.build/ui/devices.txt";
 import detailsScript from "./.build/ui/device-details.txt";
 import { decodeHex, digest, jsonBody, reply, requireValue } from "./http.ts";
+import { decodeDiscovery, type MeshPath } from "./native-discovery.ts";
 import { ownerGitHub } from "./native-network.ts";
 
 const assets = new Map<string, [string, string]>([
@@ -41,21 +42,10 @@ type DeviceRow = {
   requested_at: number | null;
   approved_at: number | null;
 };
+type RouteRow = { payload: number[]; issued_at: number; expires_at: number };
 
 function timestamp(seconds: number | null | undefined) {
   return seconds == null ? undefined : new Date(seconds * 1000).toISOString();
-}
-
-function address(bytes: number[]) {
-  const hint = Uint8Array.from(bytes);
-  const port = new DataView(hint.buffer).getUint16(98);
-  const ip =
-    hint[81] === 4
-      ? hint.slice(82, 86).join(".")
-      : Array.from({ length: 8 }, (_, index) =>
-          new DataView(hint.buffer).getUint16(82 + 2 * index).toString(16),
-        ).join(":");
-  return { ip, port };
 }
 
 export async function accountDevices(env: Env, account: string) {
@@ -100,7 +90,7 @@ export async function accountDevices(env: Env, account: string) {
 
 async function details(env: Env, account: string, device: string) {
   const github = await ownerGitHub(env, account);
-  const [member, link, profile, hint, status] = await Promise.all([
+  const [member, link, profile, hint, routeSet, status] = await Promise.all([
     env.DB.prepare(
       "SELECT *, 'approved' AS state FROM control_members WHERE github_id = ? AND device = ?",
     )
@@ -122,18 +112,23 @@ async function details(env: Env, account: string, device: string) {
       "SELECT payload, issued_at, expires_at FROM control_route_hints WHERE github_id = ? AND device = ?",
     )
       .bind(github, device)
-      .first<{ payload: number[]; issued_at: number; expires_at: number }>(),
+      .first<RouteRow>(),
     env.DB.prepare(
-      "SELECT seen_at, paths FROM control_mesh_status WHERE github_id = ? AND device = ?",
+      "SELECT payload, issued_at, expires_at FROM control_route_sets WHERE github_id = ? AND device = ?",
     )
       .bind(github, device)
-      .first<{ seen_at: number; paths: string }>(),
+      .first<RouteRow>(),
+    env.DB.prepare(
+      "SELECT seen_at, paths, home_relay FROM control_mesh_status WHERE github_id = ? AND device = ?",
+    )
+      .bind(github, device)
+      .first<{ seen_at: number; paths: string; home_relay: string | null }>(),
   ]);
   const row = member ?? link;
   requireValue(row && profile, 404);
-  const online = status ? Date.now() < (status.seen_at + 35) * 1000 : undefined;
-  const paths: { device: string; kind: "direct" | "relay" }[] =
-    online && status ? JSON.parse(status.paths) : [];
+  const now = Date.now();
+  const online = status ? now < (status.seen_at + 35) * 1000 : undefined;
+  const paths: MeshPath[] = online && status ? JSON.parse(status.paths) : [];
   const { results: peers } = await env.DB.prepare(
     "SELECT device, name FROM control_members WHERE github_id = ?",
   )
@@ -146,6 +141,12 @@ async function details(env: Env, account: string, device: string) {
       ...path,
       name: names.get(path.device),
     }));
+  const legacyDiscovery = hint && hint.expires_at > now ? decodeDiscovery(hint.payload) : undefined;
+  const route = legacyDiscovery?.addresses[0];
+  const discovery =
+    routeSet && routeSet.expires_at > now ? decodeDiscovery(routeSet.payload) : undefined;
+  const current = discovery ? routeSet : legacyDiscovery ? hint : null;
+  const last = current ?? routeSet ?? hint;
   return {
     id: device,
     fingerprint: await digest(decodeHex(row.peer.slice(0, 258))),
@@ -158,12 +159,13 @@ async function details(env: Env, account: string, device: string) {
     approved_at: timestamp(row.approved_at ?? link?.approved_at),
     online,
     last_seen_at: timestamp(status?.seen_at),
+    home_relay: online ? (status?.home_relay ?? undefined) : undefined,
     connections,
-    last_route_at: timestamp(hint && hint.issued_at / 1000),
-    route:
-      hint && Date.now() < hint.expires_at
-        ? { ...address(hint.payload), expires_at: timestamp(hint.expires_at / 1000) }
-        : undefined,
+    last_route_at: timestamp(last && last.issued_at / 1000),
+    route: route && hint ? { ...route, expires_at: timestamp(hint.expires_at / 1000) } : undefined,
+    discovery: current
+      ? { ...(discovery ?? legacyDiscovery), expires_at: timestamp(current.expires_at / 1000) }
+      : undefined,
   };
 }
 
